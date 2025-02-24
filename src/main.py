@@ -21,16 +21,29 @@ logger = logging.getLogger(__name__)
 
 class PlaylistCLI:
     def __init__(self):
-        load_dotenv('config/.env')
+        # Get the project root directory
+        project_root = Path(__file__).parent.parent
+        load_dotenv(project_root / 'config' / '.env')
+        
         logger.info("Initializing database and Spotify managers...")
         self.db = DatabaseManager()
+        all_songs = self.db.get_all_songs()
+        logger.info(f"Loaded {len(all_songs)} songs from database")
+        if not all_songs:
+            logger.error("Database is empty! Check data directory for existing files.")
+            logger.error("Expected database files in: " + str(self.db.embeddings_dir))
+        
         self.spotify = SpotifyManager()
         self._rotation_managers = {}  # Cache for rotation managers
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
         if playlist_name not in self._rotation_managers:
-            self._rotation_managers[playlist_name] = RotationManager(playlist_name)
+            self._rotation_managers[playlist_name] = RotationManager(
+                playlist_name=playlist_name,
+                db=self.db,
+                spotify=self.spotify
+            )
         return self._rotation_managers[playlist_name]
 
     def import_songs(self, file_path: str):
@@ -92,26 +105,27 @@ class PlaylistCLI:
         try:
             rm = self._get_rotation_manager(playlist_name)
             
-            # Select songs with progress bar
-            logger.info("Selecting songs...")
+            # Select songs
+            logger.info(f"Selecting {song_count} songs...")
             songs = rm.select_songs_for_today(count=song_count)
             
-            # Update with progress bar
+            # Update playlist
             logger.info("Updating playlist...")
-            with tqdm(total=len(songs), desc="Adding tracks") as pbar:
-                rm.update_playlist(songs, progress_callback=lambda x: pbar.update(1))
-            
-            # Show detailed stats
-            stats = rm.get_rotation_stats()
-            logger.info("\nPlaylist Update Stats:")
-            logger.info(f"Total songs in database: {stats.total_songs}")
-            logger.info(f"Songs used so far: {stats.unique_songs_used}")
-            logger.info(f"Songs never used: {stats.songs_never_used}")
-            logger.info(f"Total generations: {stats.generations_count}")
-            logger.info(f"Complete rotation achieved: {stats.complete_rotation_achieved}")
+            if rm.update_playlist(songs):
+                # Show detailed stats
+                stats = rm.get_rotation_stats()
+                logger.info("\nPlaylist Update Stats:")
+                logger.info(f"Total songs in database: {stats.total_songs}")
+                logger.info(f"Songs used so far: {stats.unique_songs_used}")
+                logger.info(f"Songs never used: {stats.songs_never_used}")
+                logger.info(f"Total generations: {stats.generations_count}")
+                logger.info(f"Complete rotation achieved: {stats.complete_rotation_achieved}")
+            else:
+                logger.error("Failed to update playlist")
             
         except Exception as e:
             logger.error(f"Error updating playlist: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
 
     def _show_detailed_stats(self, rm: RotationManager):
         """Show detailed statistics about the playlist"""

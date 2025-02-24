@@ -11,14 +11,40 @@ class DatabaseManager:
     """Manages the song database and embeddings using numpy for similarity search"""
     
     def __init__(self, data_dir: str = "data"):
-        self.data_dir = Path(data_dir)
+        # Convert relative path to absolute path relative to the project root
+        if not os.path.isabs(data_dir):
+            # Get the directory where the script is located
+            script_dir = Path(__file__).parent.parent  # Go up one level from src/
+            self.data_dir = script_dir / data_dir
+        else:
+            self.data_dir = Path(data_dir)
+        
         self.embeddings_dir = self.data_dir / "embeddings"
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
         
-        print("Initializing embedding model...")
+        print(f"Checking data directories:")
+        print(f"- Data dir: {self.data_dir.absolute()}")
+        print(f"- Embeddings dir: {self.embeddings_dir.absolute()}")
+        
+        # Check if files exist
+        songs_path = self.embeddings_dir / "songs.pkl"
+        embeddings_path = self.embeddings_dir / "embeddings.npy"
+        print(f"\nChecking files:")
+        print(f"- songs.pkl exists: {songs_path.exists()}")
+        print(f"- embeddings.npy exists: {embeddings_path.exists()}")
+        
+        if not songs_path.exists() or not embeddings_path.exists():
+            print(f"\nWARNING: Expected database files in: {self.embeddings_dir}")
+            print(f"Current directory: {os.getcwd()}")
+        
+        print("\nInitializing embedding model...")
         self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        
         self.songs = self._load_songs()
+        print(f"\nLoaded {len(self.songs)} songs from database")
+        
         self.embeddings = self._load_embeddings()
+        print(f"Loaded embeddings shape: {self.embeddings.shape if len(self.embeddings) > 0 else 'empty'}")
 
     def _load_songs(self) -> dict:
         """Load song database from disk"""

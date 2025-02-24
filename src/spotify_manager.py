@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from difflib import SequenceMatcher
 from tqdm import tqdm
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +15,8 @@ class SpotifyManager:
     """Manages Spotify playlist operations"""
     
     def __init__(self):
+        # Initialize once and cache the token
         self.sp = self._initialize_spotify()
-        
         self.user_id = self.sp.current_user()['id']
         self.playlists: Dict[str, str] = {}  # name -> id mapping
         self._load_playlists()
@@ -29,18 +30,28 @@ class SpotifyManager:
             'user-library-read'
         ]
         
+        # Create cache directory if it doesn't exist
+        cache_dir = Path(".spotify_cache")
+        cache_dir.mkdir(exist_ok=True)
+        cache_path = cache_dir / ".spotify_cache"
+        
         return spotipy.Spotify(auth_manager=SpotifyOAuth(
             scope=' '.join(scopes),
             redirect_uri=os.getenv('SPOTIFY_REDIRECT_URI'),
             client_id=os.getenv('SPOTIFY_CLIENT_ID'),
-            client_secret=os.getenv('SPOTIFY_CLIENT_SECRET')
+            client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
+            cache_path=str(cache_path)
         ))
 
     def _load_playlists(self):
-        """Load user's playlists"""
-        results = self.sp.current_user_playlists()
-        for item in results['items']:
-            self.playlists[item['name']] = item['id']
+        """Load user's playlists into cache"""
+        try:
+            playlists = self.sp.current_user_playlists()
+            for playlist in playlists['items']:
+                if playlist['owner']['id'] == self.user_id:
+                    self.playlists[playlist['name']] = playlist['id']
+        except Exception as e:
+            logger.error(f"Error loading playlists: {str(e)}")
 
     def create_playlist(self, name: str, description: str = "") -> str:
         """Create a new playlist"""
@@ -197,67 +208,22 @@ class SpotifyManager:
             return None
 
     def refresh_playlist(self, name: str, songs: List[Song], sync_mode: bool = False) -> bool:
-        """Refresh a playlist with songs. In sync mode, only adds missing songs."""
+        """Refresh a playlist with new songs"""
         try:
-            # Get or create playlist
-            if name not in self.playlists:
-                self.create_playlist(name)
-            playlist_id = self.playlists[name]
+            playlist_id = self.create_playlist(name)
+            if not playlist_id:
+                return False
             
-            # Get existing tracks if in sync mode
-            existing_tracks = {}  # key -> uri mapping for unique tracks
-            if sync_mode:
-                logger.info("Getting existing playlist tracks...")
-                current_tracks = self.get_playlist_tracks(name)
-                
-                # First pass: keep only the first occurrence of each song
-                seen_songs = {}  # key -> uri mapping for first occurrence
-                duplicates_to_remove = []
-                
-                for track in current_tracks:
-                    key = f"{track['name'].lower()}|||{track['artist'].lower()}"
-                    if key not in seen_songs:
-                        seen_songs[key] = track['uri']
-                        existing_tracks[key] = track['uri']
-                    else:
-                        duplicates_to_remove.append(track['uri'])
-                
-                # Remove duplicates in batches if found
-                if duplicates_to_remove:
-                    logger.info(f"Found {len(duplicates_to_remove)} duplicate tracks, removing in batches...")
-                    batch_size = 50
-                    for i in range(0, len(duplicates_to_remove), batch_size):
-                        batch = duplicates_to_remove[i:i + batch_size]
-                        try:
-                            self.sp.playlist_remove_all_occurrences_of_items(playlist_id, batch)
-                            logger.info(f"Removed batch of {len(batch)} duplicates")
-                        except Exception as e:
-                            logger.error(f"Error removing duplicate batch: {str(e)}")
-            else:
-                # Clear existing tracks in non-sync mode
-                logger.info("Clearing existing tracks...")
-                self.sp.playlist_replace_items(playlist_id, [])
+            logger.info("Clearing existing tracks...")
+            self.sp.playlist_replace_items(playlist_id, [])
             
-            # Find new songs to add
-            songs_to_process = []
-            seen_songs = set()
-            for song in songs:
-                key = f"{song.name.lower()}|||{song.artist.lower()}"
-                if key not in seen_songs and (not sync_mode or key not in existing_tracks):
-                    songs_to_process.append(song)
-                    seen_songs.add(key)
-            
-            if not songs_to_process:
-                logger.info("No new songs to add to playlist")
-                return True
-            
-            # Search and add new tracks
+            # Process new tracks
             track_uris = []
             failed_songs = set()
             
-            logger.info(f"Processing {len(songs_to_process)} new tracks...")
-            with tqdm(total=len(songs_to_process), desc="Processing tracks") as pbar:
-                for song in songs_to_process:
+            logger.info(f"Processing {len(songs)} new tracks...")
+            with tqdm(total=len(songs), desc="Processing tracks") as pbar:
+                for song in songs:
                     uri = None
                     try:
                         if song.spotify_uri:
@@ -293,16 +259,20 @@ class SpotifyManager:
             if failed_songs:
                 logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
             
-            summary = []
-            if duplicates_to_remove:
-                summary.append(f"removed {len(duplicates_to_remove)} duplicates")
-            if track_uris:
-                summary.append(f"added {len(track_uris)} new tracks")
-            
-            logger.info(f"Successfully updated playlist '{name}': {', '.join(summary)}")
+            logger.info(f"Successfully updated playlist '{name}': added {len(track_uris)} new tracks")
             return True
             
         except Exception as e:
             logger.error(f"Error refreshing playlist '{name}': {str(e)}")
             logger.debug("Full error:", exc_info=True)
-            return False 
+            return False
+
+    def get_playlist_id(self, name: str) -> Optional[str]:
+        """Get playlist ID by name"""
+        # Check cache first
+        if name in self.playlists:
+            return self.playlists[name]
+        
+        # Load playlists if not cached
+        self._load_playlists()
+        return self.playlists.get(name)
