@@ -63,49 +63,83 @@ class SpotifyManager:
     def search_song(self, song: Song) -> Optional[str]:
         """Search for a song on Spotify and return its URI"""
         try:
-            # Step 1: Try exact match first
-            query = f"track:{song.name} artist:{song.artist}"
-            results = self.sp.search(query, type='track', limit=3)
+            # Clean up search terms
+            song_name = song.name.strip()
+            artist_name = song.artist.strip()
+            
+            # Remove common features/remix indicators for initial search
+            search_name = song_name
+            for pattern in [' - remix', ' (remix)', ' feat.', ' ft.', ' (ft', ' (feat']:
+                if pattern in search_name:
+                    search_name = search_name[:search_name.index(pattern)]
+            
+            # Step 1: Try exact artist search first (most reliable)
+            query = f"artist:{artist_name} track:{search_name}"
+            results = self.sp.search(query, type='track', limit=5)
             
             if results['tracks']['items']:
-                # Check first result for exact match
-                track = results['tracks']['items'][0]
-                if (track['name'].lower() == song.name.lower() and 
-                    track['artists'][0]['name'].lower() == song.artist.lower()):
-                    logger.debug(f"Found exact match for: {song.name} by {song.artist}")
-                    return track['uri']
+                for track in results['tracks']['items']:
+                    track_name = track['name'].lower()
+                    artist_name_spotify = track['artists'][0]['name'].lower()
+                    
+                    # Check for exact artist match first
+                    if artist_name_spotify == artist_name:
+                        # Then check for song name similarity
+                        name_score = SequenceMatcher(None, track_name, song_name).ratio()
+                        if name_score > 0.85:  # Lowered threshold for name if artist matches exactly
+                            logger.info(f"Found match with exact artist: '{song_name} by {artist_name}' => "
+                                      f"'{track_name} by {artist_name_spotify}' (Score: {name_score:.2f})")
+                            return track['uri']
             
-            # Step 2: Try fuzzy matching with higher threshold (0.95)
-            query = f"{song.name} {song.artist}"
-            results = self.sp.search(query, type='track', limit=5)
+            # Step 2: Try general search with both terms
+            query = f"{search_name} {artist_name}"
+            results = self.sp.search(query, type='track', limit=10)
             
             best_match = None
             best_score = 0
             
             for track in results['tracks']['items']:
-                # Calculate similarity scores
-                name_score = SequenceMatcher(None, track['name'].lower(), song.name.lower()).ratio()
-                artist_score = SequenceMatcher(None, track['artists'][0]['name'].lower(), song.artist.lower()).ratio()
+                track_name = track['name'].lower()
+                artist_name_spotify = track['artists'][0]['name'].lower()
+                
+                # Calculate base similarity scores
+                name_score = SequenceMatcher(None, track_name, song_name).ratio()
+                artist_score = SequenceMatcher(None, artist_name_spotify, artist_name).ratio()
+                
+                # Check if the artist name is contained within the other
+                artist_contained = (artist_name in artist_name_spotify or 
+                                  artist_name_spotify in artist_name)
+                
+                # Boost artist score if names are contained within each other
+                if artist_contained:
+                    artist_score = max(artist_score, 0.9)
                 
                 # Combined score (weighted towards artist matching)
                 combined_score = (name_score * 0.4) + (artist_score * 0.6)
                 
-                if combined_score > best_score and combined_score > 0.95:  # Increased threshold to 95%
+                # Additional checks for remixes and features
+                if 'remix' in song_name and 'remix' in track_name:
+                    combined_score += 0.1
+                if ('feat.' in song_name or 'ft.' in song_name) and \
+                   ('feat.' in track_name or 'ft.' in track_name):
+                    combined_score += 0.1
+                
+                if combined_score > best_score and combined_score > 0.8:  # Lowered threshold
                     best_score = combined_score
                     best_match = track
-                    
+            
             if best_match:
-                logger.info(f"Found fuzzy match for '{song.name} by {song.artist}' => "
-                           f"'{best_match['name']} by {best_match['artists'][0]['name']}' "
+                logger.info(f"Found fuzzy match for '{song_name} by {artist_name}' => "
+                           f"'{best_match['name'].lower()} by {best_match['artists'][0]['name'].lower()}' "
                            f"(Score: {best_score:.2f})")
                 return best_match['uri']
             
-            # If no high-confidence match found, log and skip
-            logger.warning(f"No high-confidence match found for: {song.name} by {song.artist}")
+            # If no match found, log and skip
+            logger.warning(f"No high-confidence match found for: {song_name} by {artist_name}")
             return None
             
         except Exception as e:
-            logger.error(f"Error searching for song {song.name}: {str(e)}")
+            logger.error(f"Error searching for song {song_name}: {str(e)}")
             return None
 
     def get_playlist_tracks(self, name: str) -> List[Dict]:
