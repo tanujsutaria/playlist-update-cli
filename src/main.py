@@ -87,7 +87,7 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
-    def update_playlist(self, playlist_name: str, song_count: int = 30):
+    def update_playlist(self, playlist_name: str, song_count: int = 10):
         """Update a playlist with new songs"""
         try:
             rm = self._get_rotation_manager(playlist_name)
@@ -285,7 +285,7 @@ def main():
     # Update command
     update_parser = subparsers.add_parser('update', help='Update a playlist')
     update_parser.add_argument('playlist', help='Name of the playlist')
-    update_parser.add_argument('--count', type=int, default=30, help='Number of songs to include')
+    update_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
 
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show statistics')
