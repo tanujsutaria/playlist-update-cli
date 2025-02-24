@@ -25,16 +25,26 @@ class PlaylistCLI:
         project_root = Path(__file__).parent.parent
         load_dotenv(project_root / 'config' / '.env')
         
-        logger.info("Initializing database and Spotify managers...")
-        self.db = DatabaseManager()
-        all_songs = self.db.get_all_songs()
-        logger.info(f"Loaded {len(all_songs)} songs from database")
-        if not all_songs:
-            logger.error("Database is empty! Check data directory for existing files.")
-            logger.error("Expected database files in: " + str(self.db.embeddings_dir))
-        
-        self.spotify = SpotifyManager()
-        self._rotation_managers = {}  # Cache for rotation managers
+        # Initialize managers as needed
+        self._db = None
+        self._spotify = None
+        self._rotation_managers = {}
+
+    @property
+    def db(self) -> DatabaseManager:
+        """Lazy initialization of DatabaseManager"""
+        if self._db is None:
+            logger.info("Initializing database manager...")
+            self._db = DatabaseManager()
+            logger.info(f"Loaded {len(self._db.get_all_songs())} songs from database")
+        return self._db
+
+    @property
+    def spotify(self) -> SpotifyManager:
+        """Lazy initialization of SpotifyManager"""
+        if self._spotify is None:
+            self._spotify = SpotifyManager()
+        return self._spotify
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
@@ -160,8 +170,9 @@ class PlaylistCLI:
                       tablefmt="grid"))
 
     def view_playlist(self, playlist_name: str):
-        """View current playlist contents"""
+        """View current playlist contents - only needs Spotify"""
         try:
+            # Only initialize Spotify manager
             tracks = self.spotify.get_playlist_tracks(playlist_name)
             
             logger.info(f"\n=== Current Playlist: {playlist_name} ===")

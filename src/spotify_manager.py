@@ -15,33 +15,46 @@ class SpotifyManager:
     """Manages Spotify playlist operations"""
     
     def __init__(self):
-        # Initialize once and cache the token
-        self.sp = self._initialize_spotify()
-        self.user_id = self.sp.current_user()['id']
-        self.playlists: Dict[str, str] = {}  # name -> id mapping
-        self._load_playlists()
-
-    def _initialize_spotify(self) -> spotipy.Spotify:
-        """Initialize Spotify client with proper scopes"""
-        scopes = [
-            'playlist-modify-public',
-            'playlist-modify-private',
-            'playlist-read-private',
-            'user-library-read'
-        ]
+        # Create cache directory in project root
+        self.cache_dir = Path(__file__).parent.parent / ".spotify_cache"
+        self.cache_dir.mkdir(exist_ok=True, mode=0o700)  # Ensure proper permissions
+        self.cache_path = self.cache_dir / ".spotify_token"
         
-        # Create cache directory if it doesn't exist
-        cache_dir = Path(".spotify_cache")
-        cache_dir.mkdir(exist_ok=True)
-        cache_path = cache_dir / ".spotify_cache"
+        # Create custom cache handler with proper permissions
+        cache_handler = spotipy.cache_handler.CacheFileHandler(
+            cache_path=str(self.cache_path),
+            username='default'  # Use a fixed username instead of client_id
+        )
         
-        return spotipy.Spotify(auth_manager=SpotifyOAuth(
-            scope=' '.join(scopes),
+        # Initialize auth manager with proper settings
+        auth_manager = SpotifyOAuth(
+            scope=' '.join([
+                'playlist-modify-public',
+                'playlist-modify-private',
+                'playlist-read-private',
+                'user-library-read'
+            ]),
             redirect_uri=os.getenv('SPOTIFY_REDIRECT_URI'),
             client_id=os.getenv('SPOTIFY_CLIENT_ID'),
             client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
-            cache_path=str(cache_path)
-        ))
+            cache_handler=cache_handler,
+            open_browser=True,
+            show_dialog=False
+        )
+        
+        # Initialize Spotify client with auth manager
+        self.sp = spotipy.Spotify(auth_manager=auth_manager)
+        
+        # Test the connection and token
+        try:
+            self.user_id = self.sp.current_user()['id']
+            logger.debug("Successfully authenticated with Spotify")
+        except Exception as e:
+            logger.error(f"Failed to authenticate: {e}")
+            raise
+        
+        self.playlists: Dict[str, str] = {}
+        self._load_playlists()
 
     def _load_playlists(self):
         """Load user's playlists into cache"""
