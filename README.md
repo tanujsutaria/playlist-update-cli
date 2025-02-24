@@ -34,10 +34,28 @@ A Python script to manage Spotify playlists through the command line, featuring 
 ## Usage
 
 ### Import Songs
-Import songs from a CSV file (format: name,artist):
-
+Import songs from a file (supports both .txt and .csv formats):
 ```bash
 python src/main.py import songs.csv
+# or
+python src/main.py import songs.txt
+```
+
+## Input File Format
+Songs should be in a text file (.txt or .csv) with the following format:
+```
+song_name,artist_name
+Dancing Queen,ABBA
+Bohemian Rhapsody,Queen
+```
+
+Comments and empty lines are ignored:
+```
+# My favorite songs
+Dancing Queen,ABBA
+
+# Rock section
+Bohemian Rhapsody,Queen
 ```
 
 ### Update Playlist

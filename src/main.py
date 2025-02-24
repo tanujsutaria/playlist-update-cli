@@ -34,11 +34,19 @@ class PlaylistCLI:
         return self._rotation_managers[playlist_name]
 
     def import_songs(self, file_path: str):
-        """Import songs from a file into the database"""
+        """Import songs from a file into the database
+        
+        Supports both .txt and .csv files with format: song_name,artist_name
+        Lines starting with # are treated as comments
+        """
         path = Path(file_path)
         if not path.exists():
             logger.error(f"File not found: {file_path}")
             return
+        
+        if not path.suffix.lower() in ['.txt', '.csv']:
+            logger.warning(f"File extension {path.suffix} not recognized. Expected .txt or .csv")
+            logger.warning("Attempting to process file anyway...")
 
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -241,6 +249,37 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error syncing playlist: {str(e)}")
 
+    def extract_playlist(self, playlist_name: str, output_file: str = None):
+        """Extract playlist contents to a CSV file"""
+        try:
+            # Get tracks from playlist
+            tracks = self.spotify.get_playlist_tracks(playlist_name)
+            
+            if not tracks:
+                logger.error(f"No tracks found in playlist '{playlist_name}'")
+                return False
+            
+            # Generate output filename if not provided
+            if output_file is None:
+                output_file = f"{playlist_name}_songs.csv"
+            
+            # Ensure file extension is .csv
+            if not output_file.endswith('.csv'):
+                output_file += '.csv'
+            
+            # Write to file
+            logger.info(f"Writing {len(tracks)} tracks to {output_file}")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for track in tracks:
+                    f.write(f"{track['name']},{track['artist']}\n")
+            
+            logger.info(f"Successfully exported playlist to {output_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error extracting playlist: {str(e)}")
+            return False
+
 def main():
     parser = argparse.ArgumentParser(description="Spotify Playlist Manager CLI")
     subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -266,6 +305,11 @@ def main():
     sync_parser = subparsers.add_parser('sync', help='Sync entire database to a playlist')
     sync_parser.add_argument('playlist', help='Name of the playlist')
 
+    # Add extract command
+    extract_parser = subparsers.add_parser('extract', help='Extract playlist contents to a CSV file')
+    extract_parser.add_argument('playlist', help='Name of the playlist')
+    extract_parser.add_argument('--output', help='Output file path (optional)', default=None)
+
     args = parser.parse_args()
     cli = PlaylistCLI()
 
@@ -280,6 +324,8 @@ def main():
             cli.view_playlist(args.playlist)
         elif args.command == 'sync':
             cli.sync_playlist(args.playlist)
+        elif args.command == 'extract':
+            cli.extract_playlist(args.playlist, args.output)
         else:
             parser.print_help()
     except Exception as e:
