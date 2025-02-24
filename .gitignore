@@ -37,6 +37,7 @@ htmlcov/
 *.tmp
 *.temp
 .cache
+.spotify_cache
 
 # System Files
 .DS_Store
