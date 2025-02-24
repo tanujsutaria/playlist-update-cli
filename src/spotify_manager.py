@@ -6,6 +6,7 @@ from models import Song
 import logging
 from datetime import datetime
 from difflib import SequenceMatcher
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -148,55 +149,123 @@ class SpotifyManager:
             logger.debug("Full error:", exc_info=True)
             return []
 
-    def refresh_playlist(self, name: str, songs: List[Song], progress_callback: Optional[callable] = None) -> bool:
-        """Completely refresh a playlist with new songs"""
+    def get_track_info(self, uri: str) -> Optional[Dict]:
+        """Get track info from URI"""
+        try:
+            track = self.sp.track(uri)
+            return {
+                'name': track['name'].lower(),
+                'artist': track['artists'][0]['name'].lower(),
+                'uri': track['uri']
+            }
+        except Exception as e:
+            logger.error(f"Error getting track info for {uri}: {str(e)}")
+            return None
+
+    def refresh_playlist(self, name: str, songs: List[Song], sync_mode: bool = False) -> bool:
+        """Refresh a playlist with songs. In sync mode, only adds missing songs."""
         try:
             # Get or create playlist
             if name not in self.playlists:
                 self.create_playlist(name)
             playlist_id = self.playlists[name]
             
-            # Clear existing tracks
-            logger.info("Clearing existing tracks...")
-            self.sp.playlist_replace_items(playlist_id, [])
+            # Get existing tracks if in sync mode
+            existing_tracks = {}  # key -> uri mapping for unique tracks
+            if sync_mode:
+                logger.info("Getting existing playlist tracks...")
+                current_tracks = self.get_playlist_tracks(name)
+                
+                # First pass: keep only the first occurrence of each song
+                seen_songs = {}  # key -> uri mapping for first occurrence
+                duplicates_to_remove = []
+                
+                for track in current_tracks:
+                    key = f"{track['name'].lower()}|||{track['artist'].lower()}"
+                    if key not in seen_songs:
+                        seen_songs[key] = track['uri']
+                        existing_tracks[key] = track['uri']
+                    else:
+                        duplicates_to_remove.append(track['uri'])
+                
+                # Remove duplicates in batches if found
+                if duplicates_to_remove:
+                    logger.info(f"Found {len(duplicates_to_remove)} duplicate tracks, removing in batches...")
+                    batch_size = 50
+                    for i in range(0, len(duplicates_to_remove), batch_size):
+                        batch = duplicates_to_remove[i:i + batch_size]
+                        try:
+                            self.sp.playlist_remove_all_occurrences_of_items(playlist_id, batch)
+                            logger.info(f"Removed batch of {len(batch)} duplicates")
+                        except Exception as e:
+                            logger.error(f"Error removing duplicate batch: {str(e)}")
+            else:
+                # Clear existing tracks in non-sync mode
+                logger.info("Clearing existing tracks...")
+                self.sp.playlist_replace_items(playlist_id, [])
+            
+            # Find new songs to add
+            songs_to_process = []
+            seen_songs = set()
+            for song in songs:
+                key = f"{song.name.lower()}|||{song.artist.lower()}"
+                if key not in seen_songs and (not sync_mode or key not in existing_tracks):
+                    songs_to_process.append(song)
+                    seen_songs.add(key)
+            
+            if not songs_to_process:
+                logger.info("No new songs to add to playlist")
+                return True
             
             # Search and add new tracks
             track_uris = []
-            failed_songs = []
+            failed_songs = set()
             
-            logger.info("Searching for tracks...")
-            for song in songs:
-                try:
-                    if song.spotify_uri:
-                        track_uris.append(song.spotify_uri)
-                    else:
-                        uri = self.search_song(song)
-                        if uri:
-                            song.spotify_uri = uri
-                            track_uris.append(uri)
+            logger.info(f"Processing {len(songs_to_process)} new tracks...")
+            with tqdm(total=len(songs_to_process), desc="Processing tracks") as pbar:
+                for song in songs_to_process:
+                    uri = None
+                    try:
+                        if song.spotify_uri:
+                            uri = song.spotify_uri
                         else:
-                            failed_songs.append(song)
+                            uri = self.search_song(song)
+                            if uri:
+                                song.spotify_uri = uri
+                    except Exception as e:
+                        logger.warning(f"Failed to process song {song.name}: {str(e)}")
+                        failed_songs.add(song.name)
+                    finally:
+                        pbar.update(1)
                     
-                    if progress_callback:
-                        progress_callback(1)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to process song {song.name}: {str(e)}")
-                    failed_songs.append(song)
+                    if uri:
+                        track_uris.append(uri)
+                    else:
+                        failed_songs.add(song.name)
             
-            # Add tracks in batches
+            # Add new tracks in batches
             if track_uris:
-                logger.info(f"Adding {len(track_uris)} tracks to playlist...")
-                batch_size = 100
+                logger.info(f"Adding {len(track_uris)} new tracks...")
+                batch_size = 50
                 for i in range(0, len(track_uris), batch_size):
                     batch = track_uris[i:i + batch_size]
-                    self.sp.playlist_add_items(playlist_id, batch)
+                    try:
+                        self.sp.playlist_add_items(playlist_id, batch)
+                        logger.info(f"Added batch of {len(batch)} tracks")
+                    except Exception as e:
+                        logger.error(f"Error adding track batch: {str(e)}")
             
             # Report results
             if failed_songs:
-                logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(s.name for s in failed_songs)}")
+                logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
             
-            logger.info(f"Successfully refreshed playlist '{name}' with {len(track_uris)} tracks")
+            summary = []
+            if duplicates_to_remove:
+                summary.append(f"removed {len(duplicates_to_remove)} duplicates")
+            if track_uris:
+                summary.append(f"added {len(track_uris)} new tracks")
+            
+            logger.info(f"Successfully updated playlist '{name}': {', '.join(summary)}")
             return True
             
         except Exception as e:

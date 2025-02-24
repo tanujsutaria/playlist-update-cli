@@ -223,9 +223,8 @@ class PlaylistCLI:
 
     def sync_playlist(self, playlist_name: str):
         """Sync a playlist with all songs in the database"""
-        
         try:
-            logger.info(f"Starting full database sync with playlist '{playlist_name}'...")
+            logger.info(f"Starting database sync with playlist '{playlist_name}'...")
             
             # Get all songs from database
             all_songs = self.db.get_all_songs()
@@ -235,15 +234,10 @@ class PlaylistCLI:
             
             logger.info(f"Found {len(all_songs)} songs in database")
             
-            # Update with progress bar
-            logger.info("Updating playlist...")
-            with tqdm(total=len(all_songs), desc="Adding tracks") as pbar:
-                success = self.spotify.refresh_playlist(playlist_name, all_songs, 
-                                                      progress_callback=lambda x: pbar.update(1))
+            # Update playlist in sync mode
+            success = self.spotify.refresh_playlist(playlist_name, all_songs, sync_mode=True)
             
-            if success:
-                logger.info(f"Successfully synced playlist with all {len(all_songs)} songs")
-            else:
+            if not success:
                 logger.error("Failed to sync playlist")
             
         except Exception as e:
