@@ -1,12 +1,10 @@
-import argparse
 import logging
 from pathlib import Path
-from typing import List, Optional
-from datetime import datetime
-from tqdm import tqdm
-from tabulate import tabulate
 from dotenv import load_dotenv
+from typing import Optional, Dict, List
+from tabulate import tabulate
 
+from arg_parse import parse_args
 from models import Song
 from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager
@@ -300,53 +298,25 @@ class PlaylistCLI:
             return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Spotify Playlist Manager CLI")
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
-
-    # Import command
-    import_parser = subparsers.add_parser('import', help='Import songs from a file')
-    import_parser.add_argument('file', help='Path to the input file')
-
-    # Update command
-    update_parser = subparsers.add_parser('update', help='Update a playlist')
-    update_parser.add_argument('playlist', help='Name of the playlist')
-    update_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
-
-    # Stats command
-    stats_parser = subparsers.add_parser('stats', help='Show statistics')
-    stats_parser.add_argument('--playlist', help='Playlist name (optional)', default=None)
-
-    # New view command
-    view_parser = subparsers.add_parser('view', help='View current playlist contents')
-    view_parser.add_argument('playlist', help='Name of the playlist')
-
-    # New sync command
-    sync_parser = subparsers.add_parser('sync', help='Sync entire database to a playlist')
-    sync_parser.add_argument('playlist', help='Name of the playlist')
-
-    # Add extract command
-    extract_parser = subparsers.add_parser('extract', help='Extract playlist contents to a CSV file')
-    extract_parser.add_argument('playlist', help='Name of the playlist')
-    extract_parser.add_argument('--output', help='Output file path (optional)', default=None)
-
-    args = parser.parse_args()
     cli = PlaylistCLI()
+    command, args = parse_args()
+    
+    if not command:
+        return 1
 
     try:
-        if args.command == 'import':
+        if command == 'import':
             cli.import_songs(args.file)
-        elif args.command == 'update':
+        elif command == 'update':
             cli.update_playlist(args.playlist, args.count)
-        elif args.command == 'stats':
+        elif command == 'stats':
             cli.show_stats(args.playlist)
-        elif args.command == 'view':
+        elif command == 'view':
             cli.view_playlist(args.playlist)
-        elif args.command == 'sync':
+        elif command == 'sync':
             cli.sync_playlist(args.playlist)
-        elif args.command == 'extract':
+        elif command == 'extract':
             cli.extract_playlist(args.playlist, args.output)
-        else:
-            parser.print_help()
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
