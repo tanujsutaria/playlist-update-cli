@@ -39,8 +39,8 @@ class DatabaseManager:
         
         print("\nInitializing embedding model...")
         self.model = TfidfVectorizer(stop_words='english')
-        # Initialize the model with an empty list to fit the vectorizer
-        self.model.fit([""])
+        # Initialize the model with sample text to ensure non-empty vocabulary
+        self.model.fit(["song artist music playlist track album"])
         
         self.songs = self._load_songs()
         print(f"\nLoaded {len(self.songs)} songs from database")
@@ -76,9 +76,21 @@ class DatabaseManager:
     def generate_embedding(self, song: Song) -> np.ndarray:
         """Generate embedding for a song"""
         text = f"{song.name} {song.artist}"
-        # Transform the text to a sparse matrix, then convert to dense array
-        sparse_vector = self.model.transform([text])
-        return sparse_vector.toarray()[0]
+        try:
+            # Transform the text to a sparse matrix, then convert to dense array
+            sparse_vector = self.model.transform([text])
+            return sparse_vector.toarray()[0]
+        except ValueError as e:
+            # If vocabulary is empty, fit and transform in one step
+            if "empty vocabulary" in str(e):
+                print("Rebuilding vocabulary with current text...")
+                # Create a new vectorizer and fit it with the current text
+                self.model = TfidfVectorizer(stop_words='english')
+                self.model.fit([text, "song artist music playlist track album"])
+                sparse_vector = self.model.transform([text])
+                return sparse_vector.toarray()[0]
+            else:
+                raise
 
     def add_song(self, song: Song) -> bool:
         """Add a song to the database"""
