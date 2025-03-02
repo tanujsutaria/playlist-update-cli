@@ -3,8 +3,8 @@ import pickle
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Set
+from sklearn.feature_extraction.text import TfidfVectorizer
 from models import Song
 
 class DatabaseManager:
@@ -38,7 +38,9 @@ class DatabaseManager:
             print(f"Current directory: {os.getcwd()}")
         
         print("\nInitializing embedding model...")
-        self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        self.model = TfidfVectorizer(stop_words='english')
+        # Initialize the model with an empty list to fit the vectorizer
+        self.model.fit([""])
         
         self.songs = self._load_songs()
         print(f"\nLoaded {len(self.songs)} songs from database")
@@ -74,7 +76,9 @@ class DatabaseManager:
     def generate_embedding(self, song: Song) -> np.ndarray:
         """Generate embedding for a song"""
         text = f"{song.name} {song.artist}"
-        return self.model.encode([text])[0]
+        # Transform the text to a sparse matrix, then convert to dense array
+        sparse_vector = self.model.transform([text])
+        return sparse_vector.toarray()[0]
 
     def add_song(self, song: Song) -> bool:
         """Add a song to the database"""
@@ -116,8 +120,17 @@ class DatabaseManager:
 
         # Calculate cosine similarity
         query_embedding = song.embedding.reshape(1, -1)
+        # Handle zero vectors to avoid division by zero
+        norms1 = np.linalg.norm(self.embeddings, axis=1)
+        norms2 = np.linalg.norm(query_embedding)
+        
+        # Replace zero norms with a small value to avoid division by zero
+        norms1[norms1 == 0] = 1e-10
+        if norms2 == 0:
+            norms2 = 1e-10
+            
         similarities = np.dot(self.embeddings, query_embedding.T).flatten()
-        similarities = similarities / (np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(query_embedding))
+        similarities = similarities / (norms1 * norms2)
         
         # Get top k similar songs above threshold
         similar_indices = np.where(similarities > threshold)[0]
