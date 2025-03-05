@@ -49,3 +49,4 @@ imports/
 
 # old scripts
 spotify.py
+.aider*
