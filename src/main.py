@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from typing import Optional, Dict, List
 from tabulate import tabulate
