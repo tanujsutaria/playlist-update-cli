@@ -61,13 +61,21 @@ Bohemian Rhapsody,Queen
 ### Update Playlist
 Update a playlist with new songs using smart rotation:
 ```bash
-python src/main.py update playlist_name
+python src/main.py update playlist_name --count 10 --fresh-days 30
 ```
 
-### View Playlist Statistics
-View detailed statistics about a playlist:
+### View Playlist
+View current contents of a playlist:
 ```bash
-python src/main.py stats playlist_name
+python src/main.py view playlist_name
+```
+
+### View Statistics
+View detailed statistics about the database and optionally a specific playlist:
+```bash
+python src/main.py stats
+# or for a specific playlist
+python src/main.py stats --playlist playlist_name
 ```
 
 ### Sync Playlist
@@ -76,14 +84,18 @@ Sync the entire song database to a playlist:
 python src/main.py sync playlist_name
 ```
 
-### Track Playlist Progress
-Track the progress of song rotation in a playlist:
-```bash
-python src/main.py track playlist_name
-```
-
 ### Extract Playlist Contents
-Extract playlist contents to a file:
+Extract playlist contents to a CSV file:
 ```bash
 python src/main.py extract playlist_name
-``` 
+# or specify output file
+python src/main.py extract playlist_name --output songs.csv
+```
+
+### Clean Database
+Clean the database by removing songs that no longer exist in Spotify:
+```bash
+python src/main.py clean
+# or do a dry run first
+python src/main.py clean --dry-run
+```
