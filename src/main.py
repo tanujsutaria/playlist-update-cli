@@ -321,7 +321,7 @@ class PlaylistCLI:
             logger.error(f"Error showing stats: {str(e)}")
 
     def sync_playlist(self, playlist_name: str):
-        """Sync a playlist with all songs in the database by appending only new songs"""
+        """Sync a playlist with all songs in the database by adding new songs and removing songs no longer in the database"""
         try:
             logger.info(f"Starting database sync with playlist '{playlist_name}'...")
             
@@ -347,30 +347,50 @@ class PlaylistCLI:
             
             logger.info(f"Found {len(existing_uris)} existing tracks in playlist")
             
-            # Find songs that need to be added (not already in the playlist)
+            # Create a set of database URIs for quick lookup
+            database_uris = set()
             songs_to_add = []
+            
             for song in all_songs:
                 # If song doesn't have a URI yet, try to find it
                 if not song.spotify_uri:
                     song.spotify_uri = self.spotify.search_song(song)
                     
-                # Only add songs with URIs that aren't already in the playlist
-                if song.spotify_uri and song.spotify_uri not in existing_uris:
-                    songs_to_add.append(song)
+                if song.spotify_uri:
+                    database_uris.add(song.spotify_uri)
+                    
+                    # Only add songs with URIs that aren't already in the playlist
+                    if song.spotify_uri not in existing_uris:
+                        songs_to_add.append(song)
+            
+            # Find tracks to remove (in playlist but not in database)
+            uris_to_remove = existing_uris - database_uris
             
             logger.info(f"Found {len(songs_to_add)} new songs to add to playlist")
+            logger.info(f"Found {len(uris_to_remove)} songs to remove from playlist")
             
-            if not songs_to_add:
-                logger.info("No new songs to add. Playlist is already up to date.")
-                return
-            
-            # Add the new songs to the playlist
-            success = self.spotify.append_to_playlist(playlist_name, songs_to_add)
-            
-            if success:
-                logger.info(f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'")
+            # Add new songs if needed
+            if songs_to_add:
+                add_success = self.spotify.append_to_playlist(playlist_name, songs_to_add)
+                if add_success:
+                    logger.info(f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'")
+                else:
+                    logger.error("Failed to add new songs to playlist")
             else:
-                logger.error("Failed to sync playlist")
+                logger.info("No new songs to add")
+            
+            # Remove songs if needed
+            if uris_to_remove:
+                remove_success = self.spotify.remove_from_playlist(playlist_name, list(uris_to_remove))
+                if remove_success:
+                    logger.info(f"Successfully removed {len(uris_to_remove)} songs from playlist '{playlist_name}'")
+                else:
+                    logger.error("Failed to remove songs from playlist")
+            else:
+                logger.info("No songs to remove")
+                
+            if not songs_to_add and not uris_to_remove:
+                logger.info("Playlist is already in sync with the database")
             
         except Exception as e:
             logger.error(f"Error syncing playlist: {str(e)}")

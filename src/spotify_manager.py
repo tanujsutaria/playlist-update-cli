@@ -341,6 +341,42 @@ class SpotifyManager:
             logger.debug("Full error:", exc_info=True)
             return False
             
+    def remove_from_playlist(self, name: str, track_uris: List[str]) -> bool:
+        """Remove tracks from a playlist by URI"""
+        try:
+            # Get playlist ID
+            playlist_id = self.get_playlist_id(name)
+            if not playlist_id:
+                logger.error(f"Playlist '{name}' not found")
+                return False
+            
+            if not track_uris:
+                logger.info("No tracks to remove")
+                return True
+            
+            logger.info(f"Removing {len(track_uris)} tracks from playlist '{name}'...")
+            
+            # Remove tracks in batches
+            batch_size = 50
+            for i in range(0, len(track_uris), batch_size):
+                batch = track_uris[i:i + batch_size]
+                try:
+                    # Format tracks for removal
+                    tracks_to_remove = [{"uri": uri} for uri in batch]
+                    self.sp.playlist_remove_all_occurrences_of_items(playlist_id, batch)
+                    logger.info(f"Removed batch of {len(batch)} tracks")
+                except Exception as e:
+                    logger.error(f"Error removing track batch: {str(e)}")
+                    return False
+            
+            logger.info(f"Successfully removed tracks from playlist '{name}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error removing tracks from playlist '{name}': {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            return False
+            
     def get_playlist_id(self, name: str) -> Optional[str]:
         """Get playlist ID by name"""
         # Check cache first
