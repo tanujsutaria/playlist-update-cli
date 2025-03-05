@@ -76,21 +76,81 @@ class DatabaseManager:
     def generate_embedding(self, song: Song) -> np.ndarray:
         """Generate embedding for a song"""
         text = f"{song.name} {song.artist}"
-        try:
-            # Transform the text to a sparse matrix, then convert to dense array
-            sparse_vector = self.model.transform([text])
-            return sparse_vector.toarray()[0]
-        except ValueError as e:
-            # If vocabulary is empty, fit and transform in one step
-            if "empty vocabulary" in str(e):
-                print("Rebuilding vocabulary with current text...")
-                # Create a new vectorizer and fit it with the current text
-                self.model = TfidfVectorizer(stop_words='english')
-                self.model.fit([text, "song artist music playlist track album"])
+        
+        # Check if we have existing embeddings to match dimensions
+        if len(self.embeddings) > 0:
+            expected_dim = self.embeddings.shape[1]
+            
+            try:
+                # Transform the text to a sparse matrix, then convert to dense array
+                sparse_vector = self.model.transform([text])
+                vector = sparse_vector.toarray()[0]
+                
+                # Check if dimensions match
+                if len(vector) != expected_dim:
+                    print(f"Dimension mismatch: got {len(vector)}, expected {expected_dim}")
+                    # We need to rebuild the model to match existing dimensions
+                    # Load a sample of existing songs to rebuild vocabulary
+                    sample_texts = []
+                    for i, song_id in enumerate(list(self.songs.keys())[:10]):
+                        s = self.songs[song_id]
+                        sample_texts.append(f"{s.name} {s.artist}")
+                    
+                    # Add current text
+                    sample_texts.append(text)
+                    
+                    # Rebuild model with sample texts
+                    self.model = TfidfVectorizer(stop_words='english')
+                    self.model.fit(sample_texts)
+                    
+                    # Transform again
+                    sparse_vector = self.model.transform([text])
+                    vector = sparse_vector.toarray()[0]
+                    
+                    # If still mismatched, pad or truncate
+                    if len(vector) != expected_dim:
+                        if len(vector) < expected_dim:
+                            # Pad with zeros
+                            vector = np.pad(vector, (0, expected_dim - len(vector)))
+                        else:
+                            # Truncate
+                            vector = vector[:expected_dim]
+                
+                return vector
+                
+            except ValueError as e:
+                # If vocabulary is empty, fit and transform in one step
+                if "empty vocabulary" in str(e):
+                    print("Rebuilding vocabulary with current text...")
+                    # Create a new vectorizer and fit it with the current text
+                    self.model = TfidfVectorizer(stop_words='english')
+                    self.model.fit([text, "song artist music playlist track album"])
+                    sparse_vector = self.model.transform([text])
+                    vector = sparse_vector.toarray()[0]
+                    
+                    # Ensure dimensions match
+                    if len(vector) < expected_dim:
+                        vector = np.pad(vector, (0, expected_dim - len(vector)))
+                    elif len(vector) > expected_dim:
+                        vector = vector[:expected_dim]
+                    
+                    return vector
+                else:
+                    raise
+        else:
+            # No existing embeddings, just return what we get
+            try:
                 sparse_vector = self.model.transform([text])
                 return sparse_vector.toarray()[0]
-            else:
-                raise
+            except ValueError as e:
+                if "empty vocabulary" in str(e):
+                    print("Rebuilding vocabulary with current text...")
+                    self.model = TfidfVectorizer(stop_words='english')
+                    self.model.fit([text, "song artist music playlist track album"])
+                    sparse_vector = self.model.transform([text])
+                    return sparse_vector.toarray()[0]
+                else:
+                    raise
 
     def add_song(self, song: Song) -> bool:
         """Add a song to the database"""

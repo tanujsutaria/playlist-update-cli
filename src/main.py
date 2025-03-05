@@ -136,8 +136,11 @@ class PlaylistCLI:
                         artist_id = track['artists'][0]['id']
                         artist_info = spotify.sp.artist(artist_id)
                         
-                        if artist_info['followers']['total'] >= 1000000:
-                            logger.warning(f"Line {line_num}: Artist too popular ({artist_info['followers']['total']} followers): {artist}")
+                        # Get follower count
+                        follower_count = artist_info['followers']['total']
+                        
+                        if follower_count >= 1000000:
+                            logger.warning(f"Line {line_num}: Artist too popular ({follower_count:,} followers): {artist}")
                             stats["popular_artist"] += 1
                             continue
                         
