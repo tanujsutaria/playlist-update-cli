@@ -149,7 +149,8 @@ class PlaylistCLI:
                             id=f"{artist}|||{name}",
                             name=name,
                             artist=artist,
-                            spotify_uri=track_uri
+                            spotify_uri=track_uri,
+                            first_added=datetime.now()
                         )
                         
                         if self.db.add_song(song):

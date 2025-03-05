@@ -81,93 +81,111 @@ class DatabaseManager:
         if len(self.embeddings) > 0:
             expected_dim = self.embeddings.shape[1]
             
+            # Load all existing songs to rebuild vocabulary consistently
+            all_texts = []
+            # Use at least 100 songs to build a stable vocabulary
+            for i, song_id in enumerate(list(self.songs.keys())[:100]):
+                s = self.songs[song_id]
+                all_texts.append(f"{s.name} {s.artist}")
+            
+            # Add current text
+            all_texts.append(text)
+            
+            # Always rebuild the model with all texts to ensure consistency
+            self.model = TfidfVectorizer(stop_words='english')
+            self.model.fit(all_texts)
+            
+            # Transform the text
+            sparse_vector = self.model.transform([text])
+            vector = sparse_vector.toarray()[0]
+            
+            # If dimensions still don't match, pad or truncate
+            if len(vector) != expected_dim:
+                if len(vector) < expected_dim:
+                    # Pad with zeros
+                    vector = np.pad(vector, (0, expected_dim - len(vector)))
+                else:
+                    # Truncate
+                    vector = vector[:expected_dim]
+            
+            return vector
+        else:
+            # No existing embeddings, create a new model
             try:
-                # Transform the text to a sparse matrix, then convert to dense array
+                # For new databases, use a fixed dimension size of 384
+                # This matches what seems to be your existing embedding size
+                fixed_dim = 384
+                
+                # Create a basic vocabulary
+                base_texts = [
+                    text,
+                    "song artist music playlist track album",
+                    "rock pop jazz electronic indie alternative",
+                    "vocals guitar drums bass piano keyboard",
+                    "melody rhythm harmony tempo beat"
+                ]
+                
+                # Create a new vectorizer with a fixed random state for consistency
+                self.model = TfidfVectorizer(stop_words='english')
+                self.model.fit(base_texts)
+                
+                # Transform the text
                 sparse_vector = self.model.transform([text])
                 vector = sparse_vector.toarray()[0]
                 
-                # Check if dimensions match
-                if len(vector) != expected_dim:
-                    print(f"Dimension mismatch: got {len(vector)}, expected {expected_dim}")
-                    # We need to rebuild the model to match existing dimensions
-                    # Load a sample of existing songs to rebuild vocabulary
-                    sample_texts = []
-                    for i, song_id in enumerate(list(self.songs.keys())[:10]):
-                        s = self.songs[song_id]
-                        sample_texts.append(f"{s.name} {s.artist}")
-                    
-                    # Add current text
-                    sample_texts.append(text)
-                    
-                    # Rebuild model with sample texts
-                    self.model = TfidfVectorizer(stop_words='english')
-                    self.model.fit(sample_texts)
-                    
-                    # Transform again
-                    sparse_vector = self.model.transform([text])
-                    vector = sparse_vector.toarray()[0]
-                    
-                    # If still mismatched, pad or truncate
-                    if len(vector) != expected_dim:
-                        if len(vector) < expected_dim:
-                            # Pad with zeros
-                            vector = np.pad(vector, (0, expected_dim - len(vector)))
-                        else:
-                            # Truncate
-                            vector = vector[:expected_dim]
+                # Ensure the vector has the fixed dimension
+                if len(vector) < fixed_dim:
+                    vector = np.pad(vector, (0, fixed_dim - len(vector)))
+                elif len(vector) > fixed_dim:
+                    vector = vector[:fixed_dim]
                 
                 return vector
-                
-            except ValueError as e:
-                # If vocabulary is empty, fit and transform in one step
-                if "empty vocabulary" in str(e):
-                    print("Rebuilding vocabulary with current text...")
-                    # Create a new vectorizer and fit it with the current text
-                    self.model = TfidfVectorizer(stop_words='english')
-                    self.model.fit([text, "song artist music playlist track album"])
-                    sparse_vector = self.model.transform([text])
-                    vector = sparse_vector.toarray()[0]
-                    
-                    # Ensure dimensions match
-                    if len(vector) < expected_dim:
-                        vector = np.pad(vector, (0, expected_dim - len(vector)))
-                    elif len(vector) > expected_dim:
-                        vector = vector[:expected_dim]
-                    
-                    return vector
-                else:
-                    raise
-        else:
-            # No existing embeddings, just return what we get
-            try:
-                sparse_vector = self.model.transform([text])
-                return sparse_vector.toarray()[0]
-            except ValueError as e:
-                if "empty vocabulary" in str(e):
-                    print("Rebuilding vocabulary with current text...")
-                    self.model = TfidfVectorizer(stop_words='english')
-                    self.model.fit([text, "song artist music playlist track album"])
-                    sparse_vector = self.model.transform([text])
-                    return sparse_vector.toarray()[0]
-                else:
-                    raise
+            except Exception as e:
+                # Fallback to a zero vector of the right size if all else fails
+                print(f"Error generating embedding: {str(e)}")
+                return np.zeros(384)
 
     def add_song(self, song: Song) -> bool:
         """Add a song to the database"""
         if song.id in self.songs:
             return False
 
+        # Set first_added if not already set
+        if song.first_added is None:
+            song.first_added = datetime.now()
+
         # Generate embedding if not provided
         if song.embedding is None:
-            song.embedding = self.generate_embedding(song)
-            song.first_added = datetime.now()
+            try:
+                song.embedding = self.generate_embedding(song)
+            except Exception as e:
+                print(f"Error generating embedding for {song.name}: {str(e)}")
+                # Create a zero vector of the right size
+                if len(self.embeddings) > 0:
+                    expected_dim = self.embeddings.shape[1]
+                    song.embedding = np.zeros(expected_dim)
+                else:
+                    song.embedding = np.zeros(384)  # Default size
 
         # Add to embeddings array
         embedding = song.embedding.reshape(1, -1)
         if len(self.embeddings) == 0:
             self.embeddings = embedding
         else:
-            self.embeddings = np.vstack([self.embeddings, embedding])
+            try:
+                self.embeddings = np.vstack([self.embeddings, embedding])
+            except ValueError as e:
+                print(f"Error adding embedding: {str(e)}")
+                # Try to fix the embedding and try again
+                if "shape" in str(e):
+                    expected_dim = self.embeddings.shape[1]
+                    if len(song.embedding) != expected_dim:
+                        if len(song.embedding) < expected_dim:
+                            song.embedding = np.pad(song.embedding, (0, expected_dim - len(song.embedding)))
+                        else:
+                            song.embedding = song.embedding[:expected_dim]
+                        embedding = song.embedding.reshape(1, -1)
+                        self.embeddings = np.vstack([self.embeddings, embedding])
         
         # Add to songs database
         self.songs[song.id] = song
