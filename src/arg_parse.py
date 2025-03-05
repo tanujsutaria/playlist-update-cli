@@ -33,6 +33,10 @@ def setup_parsers() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser('extract', help='Extract playlist contents to a CSV file')
     extract_parser.add_argument('playlist', help='Name of the playlist')
     extract_parser.add_argument('--output', help='Output file path (optional)', default=None)
+    
+    # Clean command
+    clean_parser = subparsers.add_parser('clean', help='Clean database by removing songs that no longer exist in Spotify')
+    clean_parser.add_argument('--dry-run', action='store_true', help='Show what would be removed without actually removing')
 
     return parser
 

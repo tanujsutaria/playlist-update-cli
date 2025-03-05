@@ -235,6 +235,30 @@ class DatabaseManager:
         
         return similar_songs
 
+    def remove_song(self, song_id: str) -> bool:
+        """Remove a song from the database"""
+        if song_id not in self.songs:
+            return False
+            
+        # Get the index of the song in the embeddings array
+        song_ids = list(self.songs.keys())
+        if song_id in song_ids:
+            idx = song_ids.index(song_id)
+            
+            # Remove from embeddings array
+            if len(self.embeddings) > 0 and idx < len(self.embeddings):
+                # Create a new array without the song's embedding
+                self.embeddings = np.delete(self.embeddings, idx, axis=0)
+            
+            # Remove from songs dictionary
+            del self.songs[song_id]
+            
+            # Save changes
+            self._save_state()
+            return True
+        
+        return False
+        
     def get_stats(self):
         """Get database statistics"""
         return {

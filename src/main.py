@@ -406,6 +406,98 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error extracting playlist: {str(e)}")
             return False
+            
+    def clean_database(self, dry_run: bool = False):
+        """Clean database by removing songs that no longer exist in Spotify
+        
+        Args:
+            dry_run: If True, only show what would be removed without actually removing
+        """
+        try:
+            logger.info("Starting database cleaning process...")
+            
+            # Get all songs from database
+            all_songs = self.db.get_all_songs()
+            if not all_songs:
+                logger.info("No songs found in database")
+                return
+            
+            logger.info(f"Checking {len(all_songs)} songs in database")
+            
+            # Initialize Spotify for validation
+            spotify = self.spotify
+            
+            # Track statistics
+            stats = {
+                "total": len(all_songs),
+                "checked": 0,
+                "not_found": 0,
+                "kept": 0
+            }
+            
+            # Songs to remove
+            songs_to_remove = []
+            
+            # Check each song
+            from tqdm import tqdm
+            for song in tqdm(all_songs, desc="Checking songs"):
+                stats["checked"] += 1
+                
+                # Skip songs that already have a Spotify URI (optimization)
+                if song.spotify_uri:
+                    # Verify the URI still works
+                    try:
+                        track_info = spotify.get_track_info(song.spotify_uri)
+                        if track_info:
+                            stats["kept"] += 1
+                            continue
+                    except Exception:
+                        # URI no longer valid, continue with search
+                        pass
+                
+                # Search for the song on Spotify
+                query = f"track:{song.name} artist:{song.artist}"
+                results = spotify.sp.search(query, type='track', limit=1)
+                
+                if not results['tracks']['items']:
+                    # Song not found in Spotify
+                    logger.warning(f"Song not found in Spotify: {song.name} by {song.artist}")
+                    songs_to_remove.append(song)
+                    stats["not_found"] += 1
+                else:
+                    # Song found, update URI if needed
+                    if not song.spotify_uri:
+                        song.spotify_uri = results['tracks']['items'][0]['uri']
+                        self.db._save_state()  # Save the updated URI
+                    stats["kept"] += 1
+            
+            # Remove songs if not in dry run mode
+            if songs_to_remove:
+                if dry_run:
+                    logger.info(f"DRY RUN: Would remove {len(songs_to_remove)} songs")
+                    for song in songs_to_remove:
+                        logger.info(f"  - {song.name} by {song.artist}")
+                else:
+                    logger.info(f"Removing {len(songs_to_remove)} songs from database")
+                    for song in songs_to_remove:
+                        logger.info(f"Removing: {song.name} by {song.artist}")
+                        self.db.remove_song(song.id)
+            
+            # Display cleaning statistics
+            logger.info("\n=== Database Cleaning Results ===")
+            logger.info(f"Total songs checked: {stats['checked']}")
+            logger.info(f"Songs kept: {stats['kept']}")
+            logger.info(f"Songs not found in Spotify: {stats['not_found']}")
+            if dry_run and songs_to_remove:
+                logger.info(f"DRY RUN: No songs were actually removed")
+            elif songs_to_remove:
+                logger.info(f"Songs removed: {len(songs_to_remove)}")
+            else:
+                logger.info("No songs needed to be removed")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning database: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
 
 def main():
     cli = PlaylistCLI()
@@ -427,6 +519,8 @@ def main():
             cli.sync_playlist(args.playlist)
         elif command == 'extract':
             cli.extract_playlist(args.playlist, args.output)
+        elif command == 'clean':
+            cli.clean_database(args.dry_run)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
