@@ -315,7 +315,7 @@ class PlaylistCLI:
             logger.error(f"Error showing stats: {str(e)}")
 
     def sync_playlist(self, playlist_name: str):
-        """Sync a playlist with all songs in the database"""
+        """Sync a playlist with all songs in the database by appending only new songs"""
         try:
             logger.info(f"Starting database sync with playlist '{playlist_name}'...")
             
@@ -327,14 +327,48 @@ class PlaylistCLI:
             
             logger.info(f"Found {len(all_songs)} songs in database")
             
-            # Update playlist in sync mode
-            success = self.spotify.refresh_playlist(playlist_name, all_songs, sync_mode=True)
+            # Get existing tracks in the playlist
+            existing_tracks = self.spotify.get_playlist_tracks(playlist_name)
+            if existing_tracks is None:
+                logger.error(f"Failed to retrieve tracks from playlist '{playlist_name}'")
+                return
+                
+            # Create a set of existing URIs for quick lookup
+            existing_uris = set()
+            for track in existing_tracks:
+                if 'uri' in track:
+                    existing_uris.add(track['uri'])
             
-            if not success:
+            logger.info(f"Found {len(existing_uris)} existing tracks in playlist")
+            
+            # Find songs that need to be added (not already in the playlist)
+            songs_to_add = []
+            for song in all_songs:
+                # If song doesn't have a URI yet, try to find it
+                if not song.spotify_uri:
+                    song.spotify_uri = self.spotify.search_song(song)
+                    
+                # Only add songs with URIs that aren't already in the playlist
+                if song.spotify_uri and song.spotify_uri not in existing_uris:
+                    songs_to_add.append(song)
+            
+            logger.info(f"Found {len(songs_to_add)} new songs to add to playlist")
+            
+            if not songs_to_add:
+                logger.info("No new songs to add. Playlist is already up to date.")
+                return
+            
+            # Add the new songs to the playlist
+            success = self.spotify.append_to_playlist(playlist_name, songs_to_add)
+            
+            if success:
+                logger.info(f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'")
+            else:
                 logger.error("Failed to sync playlist")
             
         except Exception as e:
             logger.error(f"Error syncing playlist: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
 
     def extract_playlist(self, playlist_name: str, output_file: str = None):
         """Extract playlist contents to a CSV file"""

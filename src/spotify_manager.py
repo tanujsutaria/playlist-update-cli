@@ -280,6 +280,67 @@ class SpotifyManager:
             logger.debug("Full error:", exc_info=True)
             return False
 
+    def append_to_playlist(self, name: str, songs: List[Song]) -> bool:
+        """Append songs to an existing playlist without removing current tracks"""
+        try:
+            # Get playlist ID
+            playlist_id = self.get_playlist_id(name)
+            if not playlist_id:
+                playlist_id = self.create_playlist(name)
+                if not playlist_id:
+                    logger.error(f"Failed to create playlist '{name}'")
+                    return False
+            
+            # Process tracks to add
+            track_uris = []
+            failed_songs = set()
+            
+            logger.info(f"Processing {len(songs)} tracks to append...")
+            with tqdm(total=len(songs), desc="Processing tracks") as pbar:
+                for song in songs:
+                    uri = None
+                    try:
+                        if song.spotify_uri:
+                            uri = song.spotify_uri
+                        else:
+                            uri = self.search_song(song)
+                            if uri:
+                                song.spotify_uri = uri
+                    except Exception as e:
+                        logger.warning(f"Failed to process song {song.name}: {str(e)}")
+                        failed_songs.add(song.name)
+                    finally:
+                        pbar.update(1)
+                    
+                    if uri:
+                        track_uris.append(uri)
+                    else:
+                        failed_songs.add(song.name)
+            
+            # Add tracks in batches
+            if track_uris:
+                logger.info(f"Appending {len(track_uris)} new tracks...")
+                batch_size = 50
+                for i in range(0, len(track_uris), batch_size):
+                    batch = track_uris[i:i + batch_size]
+                    try:
+                        self.sp.playlist_add_items(playlist_id, batch)
+                        logger.info(f"Added batch of {len(batch)} tracks")
+                    except Exception as e:
+                        logger.error(f"Error adding track batch: {str(e)}")
+            
+            # Report results
+            if failed_songs:
+                logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
+            
+            logger.info(f"Successfully appended tracks to playlist '{name}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error appending to playlist '{name}': {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            return False
+            
     def get_playlist_id(self, name: str) -> Optional[str]:
         """Get playlist ID by name"""
         # Check cache first
