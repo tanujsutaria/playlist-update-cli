@@ -83,7 +83,7 @@ class RotationManager:
             current_strategy="similarity-based"
         )
 
-    def select_songs_for_today(self, count: int = 30, fresh_days: int = 60) -> List[Song]:
+    def select_songs_for_today(self, count: int = 10, fresh_days: int = 30) -> List[Song]:
         """Select songs for today's playlist, prioritizing songs not listened to recently
         
         Args:
@@ -149,6 +149,26 @@ class RotationManager:
         candidates = [s for s in all_songs if s.id not in selected_ids]
         
         similar_songs = self.db.find_similar_songs(seed_song, k=remaining_count, threshold=0.7)
+        
+        # If we still don't have enough songs, add random ones from the remaining pool
+        if len(selected) + len(similar_songs) < count and candidates:
+            import random
+            remaining_needed = count - (len(selected) + len(similar_songs))
+            logger.info(f"Still need {remaining_needed} more songs, adding random selections")
+            
+            # Shuffle the candidates to get random selections
+            random_candidates = list(candidates)
+            random.shuffle(random_candidates)
+            
+            # Add random songs, avoiding any that are already in similar_songs
+            similar_song_ids = {s.id for s in similar_songs}
+            random_selections = []
+            for song in random_candidates:
+                if song.id not in similar_song_ids and len(random_selections) < remaining_needed:
+                    random_selections.append(song)
+            
+            # Combine all selections
+            return selected + similar_songs + random_selections
         
         return selected + similar_songs[:remaining_count]
 

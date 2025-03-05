@@ -178,7 +178,7 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
-    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 60):
+    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 30):
         """Update a playlist with new songs, prioritizing songs not listened to recently
         
         Args:
