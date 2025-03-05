@@ -14,6 +14,8 @@ def setup_parsers() -> argparse.ArgumentParser:
     update_parser = subparsers.add_parser('update', help='Update a playlist')
     update_parser.add_argument('playlist', help='Name of the playlist')
     update_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
+    update_parser.add_argument('--fresh-days', type=int, default=60, 
+                              help='Prioritize songs not listened to in this many days (default: 60)')
 
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show statistics')

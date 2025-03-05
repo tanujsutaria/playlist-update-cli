@@ -83,28 +83,74 @@ class RotationManager:
             current_strategy="similarity-based"
         )
 
-    def select_songs_for_today(self, count: int = 30) -> List[Song]:
-        """Select songs for today's playlist"""
-        today = datetime.now().strftime("%Y-%m-%d")
+    def select_songs_for_today(self, count: int = 30, fresh_days: int = 60) -> List[Song]:
+        """Select songs for today's playlist, prioritizing songs not listened to recently
+        
+        Args:
+            count: Number of songs to select
+            fresh_days: Prioritize songs not used in this many days
+        """
+        today = datetime.now()
         all_songs = self.db.get_all_songs()
         used_songs = self.history.all_used_songs
         
-        # First, try to use songs that haven't been used yet
+        # First priority: songs that have never been used
         unused_songs = [s for s in all_songs if s.id not in used_songs]
-        if unused_songs:
-            selected = unused_songs[:count]
-            if len(selected) >= count:
-                return selected
-
-        # If we need more songs, use similarity-based selection
-        remaining_count = count - len(unused_songs)
-        used_songs_list = [s for s in all_songs if s.id in used_songs]
+        logger.info(f"Found {len(unused_songs)} songs that have never been used")
         
-        # Use the last song from unused as seed for similarity search
-        seed_song = unused_songs[-1] if unused_songs else used_songs_list[0]
+        if len(unused_songs) >= count:
+            return unused_songs[:count]
+        
+        # Second priority: songs not used in the last fresh_days
+        fresh_date_cutoff = today - timedelta(days=fresh_days)
+        
+        # Get songs used in each generation with timestamps
+        recent_usage = {}
+        for i, gen_songs in enumerate(self.history.generations):
+            # Estimate the date based on generation index
+            # Assuming one generation per day, counting backwards from today
+            gen_date = today - timedelta(days=len(self.history.generations) - i)
+            
+            for song_id in gen_songs:
+                # Keep the most recent usage date
+                recent_usage[song_id] = gen_date
+        
+        # Find songs not used in the fresh period
+        fresh_songs = []
+        for song in all_songs:
+            if song.id in unused_songs:
+                continue  # Already counted in unused_songs
+                
+            if song.id not in recent_usage:
+                # This shouldn't happen, but just in case
+                fresh_songs.append(song)
+                continue
+                
+            last_used = recent_usage[song.id]
+            if last_used < fresh_date_cutoff:
+                fresh_songs.append(song)
+        
+        logger.info(f"Found {len(fresh_songs)} additional songs not used in the last {fresh_days} days")
+        
+        # Combine unused and fresh songs
+        selected = unused_songs + fresh_songs
+        if len(selected) >= count:
+            return selected[:count]
+        
+        # Third priority: use similarity-based selection for remaining slots
+        remaining_count = count - len(selected)
+        logger.info(f"Need {remaining_count} more songs, using similarity-based selection")
+        
+        # Use the last selected song as seed for similarity search
+        seed_song = selected[-1] if selected else all_songs[0]
+        
+        # Exclude already selected songs from similarity search
+        selected_ids = {s.id for s in selected}
+        candidates = [s for s in all_songs if s.id not in selected_ids]
+        
         similar_songs = self.db.find_similar_songs(seed_song, k=remaining_count, threshold=0.7)
         
-        return unused_songs + similar_songs[:remaining_count]
+        return selected + similar_songs[:remaining_count]
 
     def update_playlist(self, songs: List[Song]) -> bool:
         """Update the playlist with the given songs"""

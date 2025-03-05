@@ -178,14 +178,20 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
-    def update_playlist(self, playlist_name: str, song_count: int = 10):
-        """Update a playlist with new songs"""
+    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 60):
+        """Update a playlist with new songs, prioritizing songs not listened to recently
+        
+        Args:
+            playlist_name: Name of the playlist to update
+            song_count: Number of songs to include in the playlist
+            fresh_days: Prioritize songs not listened to in this many days
+        """
         try:
             rm = self._get_rotation_manager(playlist_name)
             
             # Select songs
-            logger.info(f"Selecting {song_count} songs...")
-            songs = rm.select_songs_for_today(count=song_count)
+            logger.info(f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)...")
+            songs = rm.select_songs_for_today(count=song_count, fresh_days=fresh_days)
             
             # Update playlist
             logger.info("Updating playlist...")
@@ -412,7 +418,7 @@ def main():
         if command == 'import':
             cli.import_songs(args.file)
         elif command == 'update':
-            cli.update_playlist(args.playlist, args.count)
+            cli.update_playlist(args.playlist, args.count, args.fresh_days)
         elif command == 'stats':
             cli.show_stats(args.playlist)
         elif command == 'view':
