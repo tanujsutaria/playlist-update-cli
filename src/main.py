@@ -59,6 +59,10 @@ class PlaylistCLI:
         
         Supports both .txt and .csv files with format: song_name,artist_name
         Lines starting with # are treated as comments
+        
+        Validates that:
+        1. The song exists in Spotify
+        2. The artist has less than 1 million monthly listeners
         """
         path = Path(file_path)
         if not path.exists():
@@ -69,18 +73,41 @@ class PlaylistCLI:
             logger.warning(f"File extension {path.suffix} not recognized. Expected .txt or .csv")
             logger.warning("Attempting to process file anyway...")
 
+        # Initialize Spotify for validation
+        try:
+            # Ensure Spotify manager is initialized
+            spotify = self.spotify
+            logger.info("Spotify connection established for song validation")
+        except Exception as e:
+            logger.error(f"Failed to initialize Spotify for validation: {str(e)}")
+            return
+
+        # Track statistics
+        stats = {
+            "total": 0,
+            "added": 0,
+            "already_exists": 0,
+            "not_found": 0,
+            "popular_artist": 0,
+            "error": 0
+        }
+
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     try:
+                        stats["total"] += 1
+                        
                         # Skip empty lines and comments
                         if not line.strip() or line.startswith('#'):
+                            stats["total"] -= 1  # Don't count comments/empty lines
                             continue
                             
                         # Split and take only first two columns (name, artist)
                         parts = [x.strip().lower() for x in line.split(',')]
                         if len(parts) < 2:
                             logger.warning(f"Line {line_num}: Skipping invalid line (not enough columns): {line.strip()}")
+                            stats["error"] += 1
                             continue
                             
                         name, artist = parts[0], parts[1]
@@ -88,22 +115,60 @@ class PlaylistCLI:
                         # Basic validation
                         if not name or not artist:
                             logger.warning(f"Line {line_num}: Skipping invalid line (empty name or artist): {line.strip()}")
+                            stats["error"] += 1
                             continue
-                            
+                        
+                        logger.info(f"Validating: {name} by {artist}")
+                        
+                        # Step 1: Check if song exists in Spotify
+                        query = f"track:{name} artist:{artist}"
+                        results = spotify.sp.search(query, type='track', limit=1)
+                        
+                        if not results['tracks']['items']:
+                            logger.warning(f"Line {line_num}: Song not found in Spotify: {name} by {artist}")
+                            stats["not_found"] += 1
+                            continue
+                        
+                        track = results['tracks']['items'][0]
+                        track_uri = track['uri']
+                        
+                        # Step 2: Check artist popularity
+                        artist_id = track['artists'][0]['id']
+                        artist_info = spotify.sp.artist(artist_id)
+                        
+                        if artist_info['followers']['total'] >= 1000000:
+                            logger.warning(f"Line {line_num}: Artist too popular ({artist_info['followers']['total']} followers): {artist}")
+                            stats["popular_artist"] += 1
+                            continue
+                        
+                        # Song passed validation, add to database
                         song = Song(
                             id=f"{artist}|||{name}",
                             name=name,
-                            artist=artist
+                            artist=artist,
+                            spotify_uri=track_uri
                         )
                         
                         if self.db.add_song(song):
                             logger.info(f"Added: {song.name} by {song.artist}")
+                            stats["added"] += 1
                         else:
                             logger.info(f"Skipped (already exists): {song.name} by {song.artist}")
+                            stats["already_exists"] += 1
                             
                     except Exception as e:
                         logger.warning(f"Line {line_num}: Error processing line: {str(e)}")
+                        stats["error"] += 1
                         continue
+            
+            # Display import statistics
+            logger.info("\n=== Import Statistics ===")
+            logger.info(f"Total entries processed: {stats['total']}")
+            logger.info(f"Songs added: {stats['added']}")
+            logger.info(f"Songs already in database: {stats['already_exists']}")
+            logger.info(f"Songs not found in Spotify: {stats['not_found']}")
+            logger.info(f"Artists with ≥1M followers: {stats['popular_artist']}")
+            logger.info(f"Errors: {stats['error']}")
                     
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
