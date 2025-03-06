@@ -429,6 +429,7 @@ class PlaylistCLI:
             
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
+        or whose artists have 1 million or more monthly listeners
         
         Args:
             dry_run: If True, only show what would be removed without actually removing
@@ -452,6 +453,7 @@ class PlaylistCLI:
                 "total": len(all_songs),
                 "checked": 0,
                 "not_found": 0,
+                "popular_artist": 0,
                 "kept": 0
             }
             
@@ -469,6 +471,18 @@ class PlaylistCLI:
                     try:
                         track_info = spotify.get_track_info(song.spotify_uri)
                         if track_info:
+                            # Check artist popularity
+                            track = spotify.sp.track(song.spotify_uri)
+                            artist_id = track['artists'][0]['id']
+                            artist_info = spotify.sp.artist(artist_id)
+                            follower_count = artist_info['followers']['total']
+                            
+                            if follower_count >= 1000000:
+                                logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                                songs_to_remove.append(song)
+                                stats["popular_artist"] += 1
+                                continue
+                            
                             stats["kept"] += 1
                             continue
                     except Exception:
@@ -486,10 +500,22 @@ class PlaylistCLI:
                     stats["not_found"] += 1
                 else:
                     # Song found, update URI if needed
+                    track = results['tracks']['items'][0]
                     if not song.spotify_uri:
-                        song.spotify_uri = results['tracks']['items'][0]['uri']
+                        song.spotify_uri = track['uri']
                         self.db._save_state()  # Save the updated URI
-                    stats["kept"] += 1
+                    
+                    # Check artist popularity
+                    artist_id = track['artists'][0]['id']
+                    artist_info = spotify.sp.artist(artist_id)
+                    follower_count = artist_info['followers']['total']
+                    
+                    if follower_count >= 1000000:
+                        logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                        songs_to_remove.append(song)
+                        stats["popular_artist"] += 1
+                    else:
+                        stats["kept"] += 1
             
             # Remove songs if not in dry run mode
             if songs_to_remove:
@@ -508,6 +534,7 @@ class PlaylistCLI:
             logger.info(f"Total songs checked: {stats['checked']}")
             logger.info(f"Songs kept: {stats['kept']}")
             logger.info(f"Songs not found in Spotify: {stats['not_found']}")
+            logger.info(f"Songs with popular artists (≥1M followers): {stats['popular_artist']}")
             if dry_run and songs_to_remove:
                 logger.info(f"DRY RUN: No songs were actually removed")
             elif songs_to_remove:

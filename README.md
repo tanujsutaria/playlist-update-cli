@@ -93,7 +93,7 @@ python src/main.py extract playlist_name --output songs.csv
 ```
 
 ### Clean Database
-Clean the database by removing songs that no longer exist in Spotify:
+Clean the database by removing songs that no longer exist in Spotify or whose artists have 1 million or more monthly followers:
 ```bash
 python src/main.py clean
 # or do a dry run first
