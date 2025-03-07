@@ -173,7 +173,7 @@ class RotationManager:
         return selected + similar_songs[:remaining_count]
 
     def update_playlist(self, songs: List[Song]) -> bool:
-        """Update the playlist with the given songs"""
+        """Update the playlist with the given songs by deleting and recreating it"""
         try:
             # Get or create playlist
             logger.info(f"Refreshing playlist '{self.playlist_name}' with {len(songs)} songs...")
@@ -188,7 +188,8 @@ class RotationManager:
             logger.info(f"Updating playlist '{self.playlist_name}' with songs:")
             for i, song in enumerate(songs, 1):
                 logger.info(f"  {i}. {song.name} by {song.artist}")
-                
+            
+            # Force delete and recreate the playlist
             success = self.spotify.refresh_playlist(self.playlist_name, songs)
             
             if not success:

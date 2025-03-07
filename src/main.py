@@ -179,7 +179,7 @@ class PlaylistCLI:
             logger.error(f"Error importing songs: {str(e)}")
 
     def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 30):
-        """Update a playlist with new songs, prioritizing songs not listened to recently
+        """Update a playlist with new songs by deleting and recreating it
         
         Args:
             playlist_name: Name of the playlist to update

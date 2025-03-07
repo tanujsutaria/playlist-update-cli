@@ -221,14 +221,25 @@ class SpotifyManager:
             return None
 
     def refresh_playlist(self, name: str, songs: List[Song], sync_mode: bool = False) -> bool:
-        """Refresh a playlist with new songs"""
+        """Refresh a playlist with new songs by deleting and recreating it"""
         try:
+            # Delete the playlist if it exists
+            if name in self.playlists:
+                old_playlist_id = self.playlists[name]
+                logger.info(f"Deleting existing playlist '{name}' (ID: {old_playlist_id})...")
+                try:
+                    self.sp.current_user_unfollow_playlist(old_playlist_id)
+                    # Remove from cache
+                    del self.playlists[name]
+                    logger.info(f"Successfully deleted playlist '{name}'")
+                except Exception as e:
+                    logger.warning(f"Error deleting playlist: {str(e)}")
+            
+            # Create a new playlist
+            logger.info(f"Creating new playlist '{name}'...")
             playlist_id = self.create_playlist(name)
             if not playlist_id:
                 return False
-            
-            logger.info("Clearing existing tracks...")
-            self.sp.playlist_replace_items(playlist_id, [])
             
             # Process new tracks
             track_uris = []
