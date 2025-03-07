@@ -178,12 +178,20 @@ class RotationManager:
             # Get or create playlist
             logger.info(f"Refreshing playlist '{self.playlist_name}' with {len(songs)} songs...")
             
+            # Verify we have valid songs before updating
+            valid_songs = [song for song in songs if song.spotify_uri or self.spotify.search_song(song)]
+            
+            if not valid_songs and songs:
+                logger.warning("No valid songs found with Spotify URIs. Will use fallback songs.")
+            
             # Use the spotify manager instance to update the playlist
-            if not self.spotify.refresh_playlist(self.playlist_name, songs):
+            success = self.spotify.refresh_playlist(self.playlist_name, songs)
+            
+            if not success:
                 logger.error(f"Failed to update playlist '{self.playlist_name}'")
                 return False
             
-            # Update history
+            # Update history even if we used fallback songs
             logger.info("Updating playlist history...")
             self.history.generations.append([song.id for song in songs])
             self.history.current_generation += 1

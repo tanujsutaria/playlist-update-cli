@@ -33,10 +33,10 @@ def test_playlist_update():
             spotify=spotify
         )
         
-        # Create test songs
+        # Create test songs with real songs that will be found in Spotify
         test_songs = [
-            Song(id="test1", name="test song 1", artist="test artist 1"),
-            Song(id="test2", name="test song 2", artist="test artist 2")
+            Song(id="queen|||bohemian_rhapsody", name="Bohemian Rhapsody", artist="Queen"),
+            Song(id="michael_jackson|||billie_jean", name="Billie Jean", artist="Michael Jackson")
         ]
         
         # Try to find real songs in Spotify
