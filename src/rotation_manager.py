@@ -185,6 +185,10 @@ class RotationManager:
                 logger.warning("No valid songs found with Spotify URIs. Will use fallback songs.")
             
             # Use the spotify manager instance to update the playlist
+            logger.info(f"Updating playlist '{self.playlist_name}' with songs:")
+            for i, song in enumerate(songs, 1):
+                logger.info(f"  {i}. {song.name} by {song.artist}")
+                
             success = self.spotify.refresh_playlist(self.playlist_name, songs)
             
             if not success:

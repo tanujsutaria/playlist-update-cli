@@ -279,6 +279,13 @@ class SpotifyManager:
             if track_uris:
                 logger.info(f"Adding {len(track_uris)} new tracks...")
                 batch_size = 50
+                
+                # Keep track of successfully added songs
+                added_songs = []
+                for i, song in enumerate(songs):
+                    if song.spotify_uri in track_uris or any(uri == song.spotify_uri for uri in track_uris):
+                        added_songs.append(song)
+                
                 for i in range(0, len(track_uris), batch_size):
                     batch = track_uris[i:i + batch_size]
                     try:
@@ -291,7 +298,12 @@ class SpotifyManager:
             if failed_songs:
                 logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
             
-            logger.info(f"Successfully updated playlist '{name}': added {len(track_uris)} new tracks")
+            # Log the songs that were successfully added
+            if track_uris:
+                logger.info(f"Successfully updated playlist '{name}': added {len(track_uris)} new tracks")
+                for i, song in enumerate(songs):
+                    if song.spotify_uri and (song.spotify_uri in track_uris):
+                        logger.info(f"  - Added: {song.name} by {song.artist}")
             return True
             
         except Exception as e:
