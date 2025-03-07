@@ -176,19 +176,25 @@ class RotationManager:
         """Update the playlist with the given songs"""
         try:
             # Get or create playlist
+            logger.info(f"Refreshing playlist '{self.playlist_name}' with {len(songs)} songs...")
+            
+            # Use the spotify manager instance to update the playlist
             if not self.spotify.refresh_playlist(self.playlist_name, songs):
                 logger.error(f"Failed to update playlist '{self.playlist_name}'")
                 return False
             
             # Update history
+            logger.info("Updating playlist history...")
             self.history.generations.append([song.id for song in songs])
             self.history.current_generation += 1
             self._save_history()
             
+            logger.info(f"Successfully updated playlist '{self.playlist_name}'")
             return True
             
         except Exception as e:
             logger.error(f"Error updating playlist: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
             return False
 
     def get_recent_generations(self, count: int = 5) -> List[List[Song]]:
@@ -197,4 +203,39 @@ class RotationManager:
         for gen_songs in self.history.generations[-count:]:
             songs = [self.db.get_song_by_id(sid) for sid in gen_songs]
             recent_gens.append([s for s in songs if s is not None])
-        return recent_gens 
+        return recent_gens
+        
+    def get_recent_songs(self, days: int = 7) -> Dict[str, List[Song]]:
+        """Get songs used in the last N days, grouped by date"""
+        from datetime import datetime, timedelta
+        
+        # Calculate date range
+        today = datetime.now()
+        start_date = today - timedelta(days=days)
+        
+        # Create a dictionary to store songs by date
+        songs_by_date = {}
+        
+        # Get the most recent generations
+        recent_count = min(days, len(self.history.generations))
+        if recent_count == 0:
+            return {}
+            
+        recent_gens = self.history.generations[-recent_count:]
+        
+        # Assign dates to generations (estimate based on current date)
+        for i, gen_songs in enumerate(recent_gens):
+            # Estimate date: today - (number of days from most recent)
+            gen_date = today - timedelta(days=recent_count-i-1)
+            date_str = gen_date.strftime("%Y-%m-%d")
+            
+            # Get song objects
+            songs = []
+            for sid in gen_songs:
+                song = self.db.get_song_by_id(sid)
+                if song:
+                    songs.append(song)
+            
+            songs_by_date[date_str] = songs
+            
+        return songs_by_date
