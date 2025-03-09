@@ -1,4 +1,5 @@
 import logging
+import shutil
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -427,6 +428,55 @@ class PlaylistCLI:
             logger.error(f"Error extracting playlist: {str(e)}")
             return False
             
+    def backup_data(self, backup_name: Optional[str] = None):
+        """
+        Create a backup of the entire data/ folder in a new backups/ directory
+        at the same level as src/.
+        """
+        project_root = Path(__file__).parent.parent
+        data_dir = project_root / "data"
+        backups_dir = project_root / "backups"
+        backups_dir.mkdir(exist_ok=True)
+
+        # Generate a backup folder name
+        if not backup_name:
+            # Use YYYYMMDD_HHMMSS format
+            backup_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        backup_folder = backups_dir / backup_name
+
+        if backup_folder.exists():
+            logger.warning(f"Backup folder '{backup_folder.name}' already exists. Aborting.")
+            return
+
+        logger.info(f"Creating backup '{backup_folder.name}' from data folder...")
+        shutil.copytree(str(data_dir), str(backup_folder))
+        logger.info(f"Backup '{backup_folder.name}' created successfully.")
+
+    def restore_data(self, backup_name: str):
+        """
+        Restore data/ from the chosen backup in backups/.
+        """
+        project_root = Path(__file__).parent.parent
+        data_dir = project_root / "data"
+        backups_dir = project_root / "backups"
+        backup_folder = backups_dir / backup_name
+
+        if not backup_folder.exists():
+            logger.error(f"No such backup folder: '{backup_folder.name}'")
+            return
+
+        # Rename or remove current data/ before restoring
+        if data_dir.exists():
+            logger.info("Renaming existing data folder...")
+            old_data_dir = project_root / f"data_old_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            data_dir.rename(old_data_dir)
+            logger.info(f"Renamed existing data/ to {old_data_dir.name}")
+
+        logger.info(f"Restoring backup '{backup_folder.name}' to data/ ...")
+        shutil.copytree(str(backup_folder), str(data_dir))
+        logger.info(f"Data successfully restored from '{backup_folder.name}'.")
+        
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
         or whose artists have 1 million or more monthly listeners
@@ -568,6 +618,10 @@ def main():
             cli.extract_playlist(args.playlist, args.output)
         elif command == 'clean':
             cli.clean_database(args.dry_run)
+        elif command == 'backup':
+            cli.backup_data(args.backup_name)
+        elif command == 'restore':
+            cli.restore_data(args.backup_name)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1

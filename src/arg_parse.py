@@ -38,6 +38,16 @@ def setup_parsers() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser('clean', help='Clean database by removing songs that no longer exist in Spotify')
     clean_parser.add_argument('--dry-run', action='store_true', help='Show what would be removed without actually removing')
 
+    # Backup command
+    backup_parser = subparsers.add_parser('backup', help='Backup the data directory')
+    backup_parser.add_argument('backup_name', nargs='?', default=None, 
+                               help='Optional name for the backup (defaults to timestamp)')
+
+    # Restore command
+    restore_parser = subparsers.add_parser('restore', help='Restore from a backup')
+    restore_parser.add_argument('backup_name', 
+                                help='Name of the backup to restore')
+
     return parser
 
 def parse_args() -> Tuple[str, Any]:

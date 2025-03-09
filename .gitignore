@@ -46,6 +46,7 @@ Thumbs.db
 # data
 data/
 imports/
+backups/
 
 # old scripts
 spotify.py

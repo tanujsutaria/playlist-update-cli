@@ -9,6 +9,7 @@ A Python script to manage Spotify playlists through the command line, featuring 
 - View detailed playlist and rotation statistics
 - Sync entire song database to a playlist
 - Track playlist history and rotation progress
+- Backup and restore your `data/` directory
 
 ## Setup
 
@@ -39,6 +40,21 @@ Import songs from a file (supports both .txt and .csv formats):
 python src/main.py import songs.csv
 # or
 python src/main.py import songs.txt
+```
+
+### Backup and Restore
+
+Quickly backup the existing `data/` folder to a `backups/` folder at the same level as `src/`:
+
+```bash
+python src/main.py backup
+# Optionally specify a name
+python src/main.py backup my_backup_name
+```
+
+To restore from a backup:
+```bash
+python src/main.py restore my_backup_name
 ```
 
 ## Input File Format
