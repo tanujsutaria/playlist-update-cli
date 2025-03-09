@@ -1,4 +1,5 @@
 import logging
+import shutil
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -427,6 +428,25 @@ class PlaylistCLI:
             logger.error(f"Error extracting playlist: {str(e)}")
             return False
             
+    def backup_data(self, backup_name: Optional[str] = None):
+        """
+        Create a backup of the entire data/ folder in a new backups/ directory
+        at the same level as src/.
+        """
+        # TODO: implement logic to:
+        # 1) Create backups/ if needed
+        # 2) Generate a backup folder name (use backup_name or a timestamp)
+        # 3) Copy data/ to that backup folder
+
+    def restore_data(self, backup_name: str):
+        """
+        Restore data/ from the chosen backup in backups/.
+        """
+        # TODO: implement logic to:
+        # 1) Identify the backup directory by backup_name
+        # 2) Remove or rename the current data/ 
+        # 3) Copy the backup's data folder back to data/
+        
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
         or whose artists have 1 million or more monthly listeners
@@ -568,6 +588,10 @@ def main():
             cli.extract_playlist(args.playlist, args.output)
         elif command == 'clean':
             cli.clean_database(args.dry_run)
+        elif command == 'backup':
+            cli.backup_data(args.backup_name)
+        elif command == 'restore':
+            cli.restore_data(args.backup_name)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
