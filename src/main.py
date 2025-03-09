@@ -433,19 +433,49 @@ class PlaylistCLI:
         Create a backup of the entire data/ folder in a new backups/ directory
         at the same level as src/.
         """
-        # TODO: implement logic to:
-        # 1) Create backups/ if needed
-        # 2) Generate a backup folder name (use backup_name or a timestamp)
-        # 3) Copy data/ to that backup folder
+        project_root = Path(__file__).parent.parent
+        data_dir = project_root / "data"
+        backups_dir = project_root / "backups"
+        backups_dir.mkdir(exist_ok=True)
+
+        # Generate a backup folder name
+        if not backup_name:
+            # Use YYYYMMDD_HHMMSS format
+            backup_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        backup_folder = backups_dir / backup_name
+
+        if backup_folder.exists():
+            logger.warning(f"Backup folder '{backup_folder.name}' already exists. Aborting.")
+            return
+
+        logger.info(f"Creating backup '{backup_folder.name}' from data folder...")
+        shutil.copytree(str(data_dir), str(backup_folder))
+        logger.info(f"Backup '{backup_folder.name}' created successfully.")
 
     def restore_data(self, backup_name: str):
         """
         Restore data/ from the chosen backup in backups/.
         """
-        # TODO: implement logic to:
-        # 1) Identify the backup directory by backup_name
-        # 2) Remove or rename the current data/ 
-        # 3) Copy the backup's data folder back to data/
+        project_root = Path(__file__).parent.parent
+        data_dir = project_root / "data"
+        backups_dir = project_root / "backups"
+        backup_folder = backups_dir / backup_name
+
+        if not backup_folder.exists():
+            logger.error(f"No such backup folder: '{backup_folder.name}'")
+            return
+
+        # Rename or remove current data/ before restoring
+        if data_dir.exists():
+            logger.info("Renaming existing data folder...")
+            old_data_dir = project_root / f"data_old_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            data_dir.rename(old_data_dir)
+            logger.info(f"Renamed existing data/ to {old_data_dir.name}")
+
+        logger.info(f"Restoring backup '{backup_folder.name}' to data/ ...")
+        shutil.copytree(str(backup_folder), str(data_dir))
+        logger.info(f"Data successfully restored from '{backup_folder.name}'.")
         
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
