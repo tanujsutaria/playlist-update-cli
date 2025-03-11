@@ -91,6 +91,7 @@ Data is persisted in several locations:
 - **Embeddings**: Stored as NumPy arrays in `data/embeddings/`
 - **Playlist History**: Stored as pickle files in `data/history/`
 - **Spotify Authentication**: Cached in `.spotify_cache/`
+- **Dependencies**: Managed via `pyproject.toml`
 
 ## Backup and Restore
 
@@ -117,3 +118,4 @@ Potential areas for improvement:
 3. **Multi-User Support**: Allow multiple users with separate configurations
 4. **Improved Embeddings**: Use more sophisticated embedding models
 5. **Playlist Scheduling**: Automated playlist updates on a schedule
+6. **Package Distribution**: Publish as installable package using pyproject.toml

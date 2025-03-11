@@ -111,6 +111,7 @@ The system uses several persistence mechanisms:
 - **Embeddings**: NumPy array files
 - **Playlist History**: Python pickle files
 - **Spotify Tokens**: Cache files managed by Spotipy
+- **Project Dependencies**: Managed via pyproject.toml
 
 ### File Structure:
 
@@ -123,6 +124,7 @@ data/
 │   └── playlist_name.pkl  # Playlist history
 └── state/
     └── ...             # Additional state files
+pyproject.toml          # Project dependencies and metadata
 ```
 
 ## 6. Error Handling

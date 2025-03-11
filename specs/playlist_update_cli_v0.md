@@ -102,6 +102,7 @@ The system implements comprehensive error handling:
 - File I/O errors
 - Song validation errors
 - Database consistency errors
+- Dependency management via pyproject.toml
 
 ## Future Enhancements
 
@@ -112,3 +113,4 @@ Planned for future versions:
 3. Multi-user support
 4. Improved embedding models
 5. Playlist scheduling
+6. Distribution as installable package using pyproject.toml
