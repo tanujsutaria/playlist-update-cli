@@ -24,7 +24,11 @@ A Python script to manage Spotify playlists through the command line, featuring 
 
 3. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   # Using uv (recommended)
+   uv pip sync
+   
+   # Or using pip
+   pip install -e .
    ```
 
 4. Run initial setup:
