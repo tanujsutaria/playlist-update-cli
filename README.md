@@ -61,6 +61,14 @@ To restore from a backup:
 python src/main.py restore my_backup_name
 ```
 
+### Restore Previous Rotation
+
+Restore a playlist to a previous rotation:
+```bash
+python src/main.py restore-previous-rotation playlist_name 1
+```
+Where `1` means go back one generation, `2` means go back two generations, etc.
+
 ## Input File Format
 Songs should be in a text file (.txt or .csv) with the following format:
 ```

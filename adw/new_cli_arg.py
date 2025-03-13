@@ -8,10 +8,20 @@ References:
   - reference_docs/new-chart-type.md
 """
 import sys
+import os
 from pathlib import Path
-from aider.coders import Coder
-from aider.models import Model
-from aider.io import InputOutput
+
+# Check if aider is installed
+try:
+    from aider.coders import Coder
+    from aider.models import Model
+    from aider.io import InputOutput
+except ImportError:
+    print("Error: 'aider' package not found. Please install it with:")
+    print("  pip install aider-chat")
+    print("  # or")
+    print("  uv pip sync")
+    sys.exit(1)
 
 def new_cli_arg(instruction: str):
     """
