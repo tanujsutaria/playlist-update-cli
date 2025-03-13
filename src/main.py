@@ -275,8 +275,11 @@ class PlaylistCLI:
 
             # Update playlist with these songs
             logger.info(f"Restoring playlist '{playlist_name}' to generation index {new_gen_index}...")
-            success = rm.update_playlist(songs_to_restore)
+            # Don't record a new generation when reverting
+            success = rm.update_playlist(songs_to_restore, record_generation=False)
             if success:
+                rm.history.current_generation = new_gen_index
+                rm._save_history()
                 logger.info("Playlist successfully restored to the requested generation.")
             else:
                 logger.error("Failed to restore playlist.")
