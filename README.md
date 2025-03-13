@@ -13,6 +13,7 @@ A Python script to manage Spotify playlists through the command line, featuring 
 
 ## Setup
 
+
 1. Create a Spotify Developer account and register your application at https://developer.spotify.com/dashboard
 
 2. Set up environment variables in `config/.env`:
