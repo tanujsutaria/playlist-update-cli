@@ -4,8 +4,7 @@ to this application's source code. Uses Aider for Git-based AI editing.
 
 References:
   - ai_docs/aider-scripting.md
-  - reference_docs/new_chart.py
-  - reference_docs/new-chart-type.md
+  - reference_docs/new-cli-arg.md
 """
 import sys
 import os
@@ -30,11 +29,7 @@ def new_cli_arg(instruction: str):
     """
     # Identify files to edit in src/
     files_to_edit = [
-        "src/arg_parse.py",
-        "src/main.py",
-        "src/db_manager.py",
-        "src/rotation_manager.py",
-        "src/spotify_manager.py",
+        "src/",
         "README.md"
     ]
 
@@ -65,7 +60,7 @@ def new_cli_arg(instruction: str):
         edit_format="architect",
         io=InputOutput(yes=True),
         fnames=files_to_edit,
-        auto_commits=False,
+        auto_commit=True,
         suggest_shell_commands=False,
     )
 

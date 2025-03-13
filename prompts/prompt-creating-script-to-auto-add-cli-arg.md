@@ -8,7 +8,7 @@
 ## Mid-Level Objective
 
 - Create a new script in adw/new_cli_arg.py
-- Use ai_docs/aider-scripting.md as a guide of how to do this. Additionally, use reference_docs/new_chart.py and reference_docs/new-chart-type.md as concrete examples of example output for a different project
+- Use ai_docs/aider-scripting.md as a guide of how to do this. Additionally, use reference_docs/new_chart.py and reference_docs/new-chart-type.md as concrete examples of how this is implemented. USE THIS ONLY FOR REFERENCE NOT AS EXAMPLE OUTPUT.
 - Ensure the new script is compatible with the existing application structure which is found in src/
 
 ## Implementation Notes
