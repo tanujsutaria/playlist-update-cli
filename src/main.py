@@ -244,6 +244,46 @@ class PlaylistCLI:
                       headers=["Date", "Songs Added", "Sample Songs"],
                       tablefmt="grid"))
 
+    def restore_previous_rotation(self, playlist_name: str, offset: int = -1):
+        """
+        Restore a playlist to a previous rotation by going 'offset' generations back.
+        If out of range, inform user and do nothing.
+        """
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+
+            # Calculate the generation index to restore
+            new_gen_index = rm.history.current_generation + offset
+            if new_gen_index < 0 or new_gen_index >= len(rm.history.generations):
+                logger.error(
+                    f"Offset {offset} is out of bounds. Valid range: 0 to {-(len(rm.history.generations))} "
+                    f"(or up to {len(rm.history.generations) - 1} if you prefer positive indexes)."
+                )
+                return
+
+            # Retrieve songs from that generation
+            old_song_ids = rm.history.generations[new_gen_index]
+            songs_to_restore = []
+            for sid in old_song_ids:
+                song = self.db.get_song_by_id(sid)
+                if song:
+                    songs_to_restore.append(song)
+
+            if not songs_to_restore:
+                logger.info(f"No songs found in generation index {new_gen_index}.")
+                return
+
+            # Update playlist with these songs
+            logger.info(f"Restoring playlist '{playlist_name}' to generation index {new_gen_index}...")
+            success = rm.update_playlist(songs_to_restore)
+            if success:
+                logger.info("Playlist successfully restored to the requested generation.")
+            else:
+                logger.error("Failed to restore playlist.")
+        except Exception as e:
+            logger.error(f"Error restoring previous rotation: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            
     def view_playlist(self, playlist_name: str):
         """View current playlist contents - only needs Spotify"""
         try:
@@ -622,6 +662,9 @@ def main():
             cli.backup_data(args.backup_name)
         elif command == 'restore':
             cli.restore_data(args.backup_name)
+        elif command == 'restore-previous-rotation':
+            # New command handling
+            cli.restore_previous_rotation(args.playlist, args.offset)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
