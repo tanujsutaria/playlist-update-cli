@@ -22,6 +22,10 @@ def new_cli_arg(instruction: str):
     files_to_edit = [
         "src/arg_parse.py",
         "src/main.py",
+        "src/db_manager.py",
+        "src/rotation_manager.py",
+        "src/spotify_manager.py",
+        "README.md"
     ]
 
     # Create an overall prompt for Aider
@@ -29,14 +33,19 @@ def new_cli_arg(instruction: str):
         "Add or modify a CLI argument in the application's code based on the following instruction:\n\n"
         f"{instruction}\n\n"
         "Update src/arg_parse.py to register the argument.\n"
-        "Update src/main.py to implement the functionality.\n"
+        "Update src/... to implement the functionality.\n"
+        "Update README.md to reflect the new argument.\n"
         "Follow best practices and ensure the new argument works seamlessly.\n"
+        "Do not add any other functionality to the code.\n"
+        "Do not add any other files to the code.\n"
+        "Do not change any existing functionality.\n"
+        "Do not add any other dependencies to the code.\n"
     )
 
     # Initialize the model
     model = Model(
-        "gpt-4-turbo",
-        editor_model="gpt-4-turbo",
+        "o1",
+        editor_model="claude-3-7-sonnet-20250219",
         editor_edit_format="diff",
     )
 
