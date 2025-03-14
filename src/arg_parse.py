@@ -59,6 +59,7 @@ def setup_parsers() -> argparse.ArgumentParser:
     # List rotations command
     list_rotations_parser = subparsers.add_parser('list-rotations', help='List all rotations for a given playlist')
     list_rotations_parser.add_argument('playlist', help='Name of the playlist')
+    list_rotations_parser.add_argument('--generations', '-g', default='3', help='Number of generations to list, or "all" for all generations')
 
     return parser
 

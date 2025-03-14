@@ -287,16 +287,47 @@ class PlaylistCLI:
             logger.error(f"Error restoring previous rotation: {str(e)}")
             logger.debug("Full error:", exc_info=True)
             
-    def list_rotations(self, playlist_name: str):
-        """List all rotations for a given playlist"""
+    def list_rotations(self, playlist_name: str, generations: str = "3"):
+        """List rotations for a given playlist
+        
+        Args:
+            playlist_name: Name of the playlist
+            generations: Number of generations to list, or 'all' for all generations
+        """
         try:
             rm = self._get_rotation_manager(playlist_name)
             if not rm.history.generations:
                 logger.info(f"No rotations found for playlist '{playlist_name}'.")
                 return
 
+            # Determine how many generations to show
+            gens_str = generations.lower()
+            all_gens = rm.history.generations
+            if gens_str == "all":
+                limit = len(all_gens)
+                logger.info(f"Showing all {limit} generations")
+            else:
+                try:
+                    limit = int(gens_str)
+                    if limit <= 0:
+                        logger.info("Number of generations must be positive.")
+                        return
+                except ValueError:
+                    logger.info("Invalid --generations value. Must be an integer or 'all'.")
+                    return
+                
+            # Handle out-of-bounds
+            if limit > len(all_gens):
+                logger.info(f"Requested {limit} generations, but only {len(all_gens)} available.")
+                limit = len(all_gens)
+                
+            # Get the most recent N generations
+            selected_gens = all_gens[-limit:]
+            
             logger.info(f"\n=== Rotations for playlist '{playlist_name}' ===")
-            for i, gen_songs in enumerate(rm.history.generations, start=1):
+            # Calculate the starting index for proper numbering
+            start_idx = len(all_gens) - limit + 1
+            for i, gen_songs in enumerate(selected_gens, start=start_idx):
                 logger.info(f"\nGeneration {i}:")
                 songs = []
                 for song_id in gen_songs:
@@ -702,7 +733,7 @@ def main():
             # New command handling
             cli.restore_previous_rotation(args.playlist, args.offset)
         elif command == 'list-rotations':
-            cli.list_rotations(args.playlist)
+            cli.list_rotations(args.playlist, args.generations)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
