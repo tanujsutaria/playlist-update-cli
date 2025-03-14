@@ -287,6 +287,39 @@ class PlaylistCLI:
             logger.error(f"Error restoring previous rotation: {str(e)}")
             logger.debug("Full error:", exc_info=True)
             
+    def list_rotations(self, playlist_name: str):
+        """List all rotations for a given playlist"""
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+            if not rm.history.generations:
+                logger.info(f"No rotations found for playlist '{playlist_name}'.")
+                return
+
+            logger.info(f"\n=== Rotations for playlist '{playlist_name}' ===")
+            for i, gen_songs in enumerate(rm.history.generations, start=1):
+                logger.info(f"\nGeneration {i}:")
+                songs = []
+                for song_id in gen_songs:
+                    song = self.db.get_song_by_id(song_id)
+                    if song:
+                        songs.append(song)
+                
+                # Display songs in a tabular format
+                if songs:
+                    table_data = []
+                    for j, song in enumerate(songs, 1):
+                        table_data.append([j, song.name, song.artist])
+                    print(tabulate(table_data, 
+                                  headers=["#", "Song", "Artist"],
+                                  tablefmt="grid"))
+                else:
+                    logger.info("   No songs found for this generation.")
+                    
+            logger.info(f"\nCurrent generation: {rm.history.current_generation + 1}")
+        except Exception as e:
+            logger.error(f"Error listing rotations: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            
     def view_playlist(self, playlist_name: str):
         """View current playlist contents - only needs Spotify"""
         try:
@@ -668,6 +701,8 @@ def main():
         elif command == 'restore-previous-rotation':
             # New command handling
             cli.restore_previous_rotation(args.playlist, args.offset)
+        elif command == 'list-rotations':
+            cli.list_rotations(args.playlist)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1

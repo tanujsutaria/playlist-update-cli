@@ -55,6 +55,10 @@ def setup_parsers() -> argparse.ArgumentParser:
     restore_prev_parser.add_argument('offset', nargs='?', type=int, default=-1,
                                      help='How many generations back to restore from the current generation (default: -1). '
                                           'Example: -5 restores 5 generations back.')
+                                          
+    # List rotations command
+    list_rotations_parser = subparsers.add_parser('list-rotations', help='List all rotations for a given playlist')
+    list_rotations_parser.add_argument('playlist', help='Name of the playlist')
 
     return parser
 
