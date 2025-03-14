@@ -29,7 +29,12 @@ def new_cli_arg(instruction: str):
     """
     # Identify files to edit in src/
     files_to_edit = [
-        "src/",
+        "src/arg_parse.py",
+        "src/main.py",
+        "src/db_manager.py",
+        "src/models.py",
+        "src/rotation_manager.py",
+        "src/spotify_manager.py",
         "README.md"
     ]
 
@@ -38,7 +43,7 @@ def new_cli_arg(instruction: str):
         "Add or modify a CLI argument in the application's code based on the following instruction:\n\n"
         f"{instruction}\n\n"
         "Update src/arg_parse.py to register the argument.\n"
-        "Update src/... to implement the functionality.\n"
+        "Update src/ to implement the functionality.\n"
         "Update README.md to reflect the new argument.\n"
         "Follow best practices and ensure the new argument works seamlessly.\n"
         "Do not add any other functionality to the code.\n"
@@ -60,7 +65,6 @@ def new_cli_arg(instruction: str):
         edit_format="architect",
         io=InputOutput(yes=True),
         fnames=files_to_edit,
-        auto_commit=True,
         suggest_shell_commands=False,
     )
 
