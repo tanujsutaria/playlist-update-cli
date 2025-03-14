@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 Automates adding a new CLI argument and corresponding functionality
 to this application's source code. Uses Aider for Git-based AI editing.
