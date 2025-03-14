@@ -244,6 +244,113 @@ class PlaylistCLI:
                       headers=["Date", "Songs Added", "Sample Songs"],
                       tablefmt="grid"))
 
+    def restore_previous_rotation(self, playlist_name: str, offset: int = -1):
+        """
+        Restore a playlist to a previous rotation by going 'offset' generations back.
+        If out of range, inform user and do nothing.
+        """
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+
+            # Calculate the generation index to restore
+            new_gen_index = rm.history.current_generation + offset
+            if new_gen_index < 0 or new_gen_index >= len(rm.history.generations):
+                logger.error(
+                    f"Offset {offset} is out of bounds. Valid range: 0 to {-(len(rm.history.generations))} "
+                    f"(or up to {len(rm.history.generations) - 1} if you prefer positive indexes)."
+                )
+                return
+
+            # Retrieve songs from that generation
+            old_song_ids = rm.history.generations[new_gen_index]
+            songs_to_restore = []
+            for sid in old_song_ids:
+                song = self.db.get_song_by_id(sid)
+                if song:
+                    songs_to_restore.append(song)
+
+            if not songs_to_restore:
+                logger.info(f"No songs found in generation index {new_gen_index}.")
+                return
+
+            # Update playlist with these songs
+            logger.info(f"Restoring playlist '{playlist_name}' to generation index {new_gen_index}...")
+            # Don't record a new generation when reverting
+            success = rm.update_playlist(songs_to_restore, record_generation=False)
+            if success:
+                rm.history.current_generation = new_gen_index
+                rm._save_history()
+                logger.info("Playlist successfully restored to the requested generation.")
+            else:
+                logger.error("Failed to restore playlist.")
+        except Exception as e:
+            logger.error(f"Error restoring previous rotation: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            
+    def list_rotations(self, playlist_name: str, generations: str = "3"):
+        """List rotations for a given playlist
+        
+        Args:
+            playlist_name: Name of the playlist
+            generations: Number of generations to list, or 'all' for all generations
+        """
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+            if not rm.history.generations:
+                logger.info(f"No rotations found for playlist '{playlist_name}'.")
+                return
+
+            # Determine how many generations to show
+            gens_str = generations.lower()
+            all_gens = rm.history.generations
+            if gens_str == "all":
+                limit = len(all_gens)
+                logger.info(f"Showing all {limit} generations")
+            else:
+                try:
+                    limit = int(gens_str)
+                    if limit <= 0:
+                        logger.info("Number of generations must be positive.")
+                        return
+                except ValueError:
+                    logger.info("Invalid --generations value. Must be an integer or 'all'.")
+                    return
+                
+            # Handle out-of-bounds
+            if limit > len(all_gens):
+                logger.info(f"Requested {limit} generations, but only {len(all_gens)} available.")
+                limit = len(all_gens)
+                
+            # Get the most recent N generations
+            selected_gens = all_gens[-limit:]
+            
+            logger.info(f"\n=== Rotations for playlist '{playlist_name}' ===")
+            # Calculate the starting index for proper numbering
+            start_idx = len(all_gens) - limit + 1
+            for i, gen_songs in enumerate(selected_gens, start=start_idx):
+                logger.info(f"\nGeneration {i}:")
+                songs = []
+                for song_id in gen_songs:
+                    song = self.db.get_song_by_id(song_id)
+                    if song:
+                        songs.append(song)
+                
+                # Display songs in a tabular format
+                if songs:
+                    table_data = []
+                    for j, song in enumerate(songs, 1):
+                        table_data.append([j, song.name, song.artist])
+                    print(tabulate(table_data, 
+                                  headers=["#", "Song", "Artist"],
+                                  tablefmt="grid"))
+                else:
+                    logger.info("   No songs found for this generation.")
+                    
+            logger.info(f"\nCurrent generation: {rm.history.current_generation + 1}")
+        except Exception as e:
+            logger.error(f"Error listing rotations: {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            
     def view_playlist(self, playlist_name: str):
         """View current playlist contents - only needs Spotify"""
         try:
@@ -622,6 +729,11 @@ def main():
             cli.backup_data(args.backup_name)
         elif command == 'restore':
             cli.restore_data(args.backup_name)
+        elif command == 'restore-previous-rotation':
+            # New command handling
+            cli.restore_previous_rotation(args.playlist, args.offset)
+        elif command == 'list-rotations':
+            cli.list_rotations(args.playlist, args.generations)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1

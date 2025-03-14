@@ -172,7 +172,7 @@ class RotationManager:
         
         return selected + similar_songs[:remaining_count]
 
-    def update_playlist(self, songs: List[Song]) -> bool:
+    def update_playlist(self, songs: List[Song], record_generation: bool = True) -> bool:
         """Update the playlist with the given songs by deleting and recreating it"""
         try:
             # Get or create playlist
@@ -198,8 +198,9 @@ class RotationManager:
             
             # Update history even if we used fallback songs
             logger.info("Updating playlist history...")
-            self.history.generations.append([song.id for song in songs])
-            self.history.current_generation += 1
+            if record_generation:
+                self.history.generations.append([song.id for song in songs])
+                self.history.current_generation += 1
             self._save_history()
             
             logger.info(f"Successfully updated playlist '{self.playlist_name}'")
