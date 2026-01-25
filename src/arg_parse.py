@@ -61,6 +61,9 @@ def setup_parsers() -> argparse.ArgumentParser:
     list_rotations_parser.add_argument('playlist', help='Name of the playlist')
     list_rotations_parser.add_argument('--generations', '-g', default='3', help='Number of generations to list, or "all" for all generations')
 
+    # List backups command
+    subparsers.add_parser('list-backups', help='List all available backups with their sizes and dates')
+
     return parser
 
 def parse_args() -> Tuple[str, Any]:

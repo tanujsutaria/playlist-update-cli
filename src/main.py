@@ -583,7 +583,48 @@ class PlaylistCLI:
         logger.info(f"Restoring backup '{backup_folder.name}' to data/ ...")
         shutil.copytree(str(backup_folder), str(data_dir))
         logger.info(f"Data successfully restored from '{backup_folder.name}'.")
-        
+
+    def list_backups(self):
+        """List all available backups with their sizes and dates"""
+        project_root = Path(__file__).parent.parent
+        backups_dir = project_root / "backups"
+
+        if not backups_dir.exists():
+            logger.info("No backups directory found.")
+            return
+
+        # Get all backup folders
+        backup_folders = sorted(backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if not backup_folders:
+            logger.info("No backups found.")
+            return
+
+        logger.info(f"\n=== Available Backups ===")
+
+        # Prepare table data
+        table_data = []
+        for backup in backup_folders:
+            if backup.is_dir():
+                # Calculate folder size
+                total_size = sum(f.stat().st_size for f in backup.rglob('*') if f.is_file())
+                size_mb = total_size / (1024 * 1024)
+
+                # Get modification time
+                mod_time = datetime.fromtimestamp(backup.stat().st_mtime)
+                date_str = mod_time.strftime("%Y-%m-%d %H:%M:%S")
+
+                table_data.append([backup.name, f"{size_mb:.2f} MB", date_str])
+
+        if table_data:
+            print(tabulate(table_data,
+                         headers=["Backup Name", "Size", "Created"],
+                         tablefmt="grid"))
+            print(f"\nTotal backups: {len(table_data)}")
+            print(f"Use 'restore <backup_name>' to restore a backup.")
+        else:
+            logger.info("No backup folders found.")
+
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
         or whose artists have 1 million or more monthly listeners
@@ -734,6 +775,8 @@ def main():
             cli.restore_previous_rotation(args.playlist, args.offset)
         elif command == 'list-rotations':
             cli.list_rotations(args.playlist, args.generations)
+        elif command == 'list-backups':
+            cli.list_backups()
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
