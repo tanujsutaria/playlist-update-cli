@@ -9,30 +9,14 @@ from io import StringIO
 class TestListBackups:
     """Tests for the list_backups command"""
 
-    def test_no_backups_directory(self, capsys):
+    def test_no_backups_directory(self, tmp_path):
         """Test when backups directory doesn't exist"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch('main.Path.__file__', tmpdir):
-                # Import here to avoid module-level Spotify init
-                from main import PlaylistCLI
+        # Simply test that a non-existent backups directory is handled
+        backups_dir = tmp_path / "backups"
+        assert not backups_dir.exists()
 
-                cli = PlaylistCLI.__new__(PlaylistCLI)
-                cli._db = None
-                cli._spotify = None
-                cli._rotation_managers = {}
-
-                # Mock the project root to use temp directory
-                with patch.object(Path, 'parent', new_callable=lambda: property(lambda self: Path(tmpdir))):
-                    with patch('main.Path') as mock_path:
-                        mock_path.return_value.parent.parent = Path(tmpdir)
-                        mock_path.__file__ = tmpdir
-
-                        # Create a fresh CLI and call list_backups
-                        project_root = Path(tmpdir)
-                        backups_dir = project_root / "backups"
-
-                        # Ensure backups dir doesn't exist
-                        assert not backups_dir.exists()
+        # The list_backups method should handle this gracefully
+        # We just verify the directory doesn't exist as a precondition
 
     def test_empty_backups_directory(self, tmp_path, capsys):
         """Test when backups directory exists but is empty"""

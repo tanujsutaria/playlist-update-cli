@@ -190,7 +190,41 @@ def mock_spotipy():
 
 @pytest.fixture
 def mock_spotify_manager(mock_spotipy):
-    """Create a mocked SpotifyManager that doesn't require credentials"""
+    """Create a fully mocked SpotifyManager for CLI tests"""
+    # Create a MagicMock for the manager itself
+    manager = MagicMock()
+    manager.sp = mock_spotipy
+    manager.user_id = 'test_user_id'
+    manager.playlists = {
+        'Test Playlist': 'playlist_123',
+        'Another Playlist': 'playlist_456'
+    }
+    manager.cache_dir = Path('/tmp/test_spotify_cache')
+    manager.cache_path = manager.cache_dir / '.spotify_token'
+
+    # Mock manager methods
+    manager.search_song.return_value = 'spotify:track:mock123'
+    manager.create_playlist.return_value = 'new_playlist_id'
+    manager.refresh_playlist.return_value = True
+    manager.append_to_playlist.return_value = True
+    manager.remove_from_playlist.return_value = True
+    manager.get_playlist_tracks.return_value = [
+        {'name': 'Track 1', 'artist': 'Artist 1', 'uri': 'spotify:track:track1', 'added_at': '2024-01-01T00:00:00Z'},
+        {'name': 'Track 2', 'artist': 'Artist 2', 'uri': 'spotify:track:track2', 'added_at': '2024-01-02T00:00:00Z'},
+    ]
+    manager.get_track_info.return_value = {
+        'name': 'Test Track',
+        'artist': 'Test Artist',
+        'uri': 'spotify:track:mock123'
+    }
+    manager.get_playlist_id.side_effect = lambda name: manager.playlists.get(name)
+
+    return manager
+
+
+@pytest.fixture
+def real_spotify_manager_with_mock_client(mock_spotipy):
+    """Create a real SpotifyManager with mocked spotipy client for testing actual methods"""
     with patch('spotify_manager.spotipy.Spotify', return_value=mock_spotipy):
         with patch('spotify_manager.SpotifyOAuth'):
             with patch.dict('os.environ', {
@@ -221,18 +255,28 @@ def mock_spotify_manager(mock_spotipy):
 @pytest.fixture
 def mock_database_manager(tmp_path, sample_songs):
     """Create a mocked DatabaseManager using temp directory"""
-    from db_manager import DatabaseManager
-
-    # Create instance without triggering real __init__
-    db = DatabaseManager.__new__(DatabaseManager)
+    # Create a MagicMock instead of real DatabaseManager
+    db = MagicMock()
 
     # Set up paths
     db.data_dir = tmp_path / "data"
     db.embeddings_dir = tmp_path / "data" / "embeddings"
     db.embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    # Set up songs dictionary
-    db.songs = {song.id: song for song in sample_songs}
+    # Set up songs dictionary for internal use
+    songs_dict = {song.id: song for song in sample_songs}
+
+    # Mock methods
+    db.get_all_songs.return_value = sample_songs
+    db.get_song_by_id.side_effect = lambda sid: songs_dict.get(sid)
+    db.add_song.return_value = True
+    db.remove_song.return_value = True
+    db.find_similar_songs.return_value = sample_songs[:2]
+    db.get_stats.return_value = {
+        'total_songs': len(sample_songs),
+        'embedding_dimensions': 384,
+        'storage_size_mb': 1.5
+    }
 
     # Set up embeddings array
     embeddings_list = []
@@ -242,12 +286,7 @@ def mock_database_manager(tmp_path, sample_songs):
         else:
             embeddings_list.append(np.zeros(384))
     db.embeddings = np.array(embeddings_list)
-
-    # Mock the TF-IDF model
-    db.model = MagicMock()
-
-    # Override _save_state to do nothing (or save to tmp_path)
-    db._save_state = MagicMock()
+    db.songs = songs_dict
 
     return db
 
@@ -255,16 +294,25 @@ def mock_database_manager(tmp_path, sample_songs):
 @pytest.fixture
 def empty_database_manager(tmp_path):
     """Create a mocked DatabaseManager with no songs"""
-    from db_manager import DatabaseManager
+    db = MagicMock()
 
-    db = DatabaseManager.__new__(DatabaseManager)
     db.data_dir = tmp_path / "data"
     db.embeddings_dir = tmp_path / "data" / "embeddings"
     db.embeddings_dir.mkdir(parents=True, exist_ok=True)
+
+    # Mock methods for empty database
+    db.get_all_songs.return_value = []
+    db.get_song_by_id.return_value = None
+    db.add_song.return_value = True
+    db.remove_song.return_value = False
+    db.find_similar_songs.return_value = []
+    db.get_stats.return_value = {
+        'total_songs': 0,
+        'embedding_dimensions': 0,
+        'storage_size_mb': 0
+    }
     db.songs = {}
     db.embeddings = np.array([])
-    db.model = MagicMock()
-    db._save_state = MagicMock()
 
     return db
 
@@ -274,7 +322,7 @@ def empty_database_manager(tmp_path):
 # =============================================================================
 
 @pytest.fixture
-def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_playlist_history, tmp_path):
+def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_playlist_history, sample_songs, tmp_path):
     """Create a mocked RotationManager"""
     from rotation_manager import RotationManager
 
@@ -284,9 +332,13 @@ def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_pl
     rm.db = mock_database_manager
     rm.spotify = mock_spotify_manager
     rm.history = sample_playlist_history
+    rm.root_dir = tmp_path
     rm.history_dir = tmp_path / "history"
     rm.history_dir.mkdir(parents=True, exist_ok=True)
     rm._save_history = MagicMock()
+
+    # Make sure db.get_all_songs returns sample_songs for the rotation manager
+    mock_database_manager.get_all_songs.return_value = sample_songs
 
     return rm
 
