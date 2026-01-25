@@ -58,15 +58,19 @@ class TestSearchSong:
             spotify_uri=None
         )
 
-        # Return slightly different name but same artist - fuzzy matching should work
+        # Clear side_effect to allow return_value to work
+        manager.sp.search.side_effect = None
         manager.sp.search.return_value = create_spotify_search_response([
             create_spotify_track_response("Hey Jude", "The Beatles")
         ])
 
         uri = manager.search_song(song)
-        # May or may not match depending on fuzzy threshold
-        # Just test it doesn't crash
-        assert True
+        # Fuzzy matching with 80% threshold should succeed here:
+        # - Name match: "hey jude" vs "Hey Jude" = 100% (case-insensitive)
+        # - Artist match: "beatles" vs "The Beatles" ≈ 72%, boosted to 90% (contained)
+        # - Combined score: 0.9 * 0.6 + 1.0 * 0.4 = 0.94 > 0.8 threshold
+        assert uri is not None
+        assert uri.startswith('spotify:track:')
 
     def test_search_song_not_found(self, real_spotify_manager_with_mock_client):
         """Test handling of non-existent songs"""

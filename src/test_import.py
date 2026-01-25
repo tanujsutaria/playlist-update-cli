@@ -98,7 +98,7 @@ class TestImportArtistValidation:
         mock_cli._spotify.sp.search.return_value = {
             'tracks': {'items': [create_spotify_track_response("hit song", "popular artist")]}
         }
-        # Artist has 2 million followers - should be rejected
+        # Artist has 2,000,000 followers - should be rejected
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("popular artist", 2000000)
 
         mock_cli.import_songs(str(csv_file))
