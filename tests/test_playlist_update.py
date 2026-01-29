@@ -3,7 +3,7 @@ Unit tests for the playlist update workflow.
 Tests the integration between RotationManager, SpotifyManager, and DatabaseManager.
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, ANY
 from models import Song
 
 
@@ -30,7 +30,7 @@ class TestUpdatePlaylistCommand:
 
             mock_cli.update_playlist("Test Playlist", song_count=10, fresh_days=30)
 
-            mock_rm.select_songs_for_today.assert_called_once_with(count=10, fresh_days=30)
+            mock_rm.select_songs_for_today.assert_called_once_with(count=10, fresh_days=30, score_config=ANY)
             mock_rm.update_playlist.assert_called_once()
 
     def test_update_playlist_custom_count(self, mock_cli, sample_songs):
@@ -50,7 +50,7 @@ class TestUpdatePlaylistCommand:
 
             mock_cli.update_playlist("Test Playlist", song_count=5, fresh_days=30)
 
-            mock_rm.select_songs_for_today.assert_called_once_with(count=5, fresh_days=30)
+            mock_rm.select_songs_for_today.assert_called_once_with(count=5, fresh_days=30, score_config=ANY)
 
     def test_update_playlist_custom_fresh_days(self, mock_cli, sample_songs):
         """Test update with custom fresh_days parameter"""
@@ -69,7 +69,7 @@ class TestUpdatePlaylistCommand:
 
             mock_cli.update_playlist("Test Playlist", song_count=10, fresh_days=7)
 
-            mock_rm.select_songs_for_today.assert_called_once_with(count=10, fresh_days=7)
+            mock_rm.select_songs_for_today.assert_called_once_with(count=10, fresh_days=7, score_config=ANY)
 
     def test_update_playlist_failure_logged(self, mock_cli, sample_songs, capsys):
         """Test that update failure is properly logged"""

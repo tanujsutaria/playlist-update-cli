@@ -18,6 +18,10 @@ def setup_parsers() -> argparse.ArgumentParser:
                               help='Prioritize songs not listened to in this many days (default: 30)')
     update_parser.add_argument('--dry-run', action='store_true',
                               help='Preview selected songs without updating Spotify')
+    update_parser.add_argument('--score-strategy', choices=['local', 'web', 'hybrid'], default='local',
+                              help='Match scoring strategy to rank candidates (default: local)')
+    update_parser.add_argument('--query', default=None,
+                              help='Optional theme query to build the playlist profile')
 
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Show statistics')
@@ -47,6 +51,10 @@ def setup_parsers() -> argparse.ArgumentParser:
                              help='Prioritize songs not listened to in this many days (default: 30)')
     plan_parser.add_argument('--generations', type=int, default=3,
                              help='Number of future generations to preview (default: 3)')
+    plan_parser.add_argument('--score-strategy', choices=['local', 'web', 'hybrid'], default='local',
+                             help='Match scoring strategy to rank candidates (default: local)')
+    plan_parser.add_argument('--query', default=None,
+                             help='Optional theme query to build the playlist profile')
 
     # Diff command
     diff_parser = subparsers.add_parser('diff', help='Show playlist changes before applying update')
@@ -54,6 +62,10 @@ def setup_parsers() -> argparse.ArgumentParser:
     diff_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
     diff_parser.add_argument('--fresh-days', type=int, default=30,
                              help='Prioritize songs not listened to in this many days (default: 30)')
+    diff_parser.add_argument('--score-strategy', choices=['local', 'web', 'hybrid'], default='local',
+                             help='Match scoring strategy to rank candidates (default: local)')
+    diff_parser.add_argument('--query', default=None,
+                             help='Optional theme query to build the playlist profile')
     
     # Clean command
     clean_parser = subparsers.add_parser('clean', help='Clean database by removing songs that no longer exist in Spotify')
