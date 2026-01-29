@@ -69,6 +69,23 @@ def setup_parsers() -> argparse.ArgumentParser:
     restore_parser.add_argument('backup_name', 
                                 help='Name of the backup to restore')
 
+    # Restore previous rotation command
+    restore_prev_parser = subparsers.add_parser('restore-previous-rotation',
+                                                help='Restore a playlist to a previous rotation')
+    restore_prev_parser.add_argument('playlist', help='Name of the playlist')
+    restore_prev_parser.add_argument('offset', nargs='?', type=int, default=-1,
+                                     help='How many generations back to restore from the current generation (default: -1). '
+                                          'Example: -5 restores 5 generations back.')
+
+    # List rotations command
+    list_rotations_parser = subparsers.add_parser('list-rotations', help='List all rotations for a given playlist')
+    list_rotations_parser.add_argument('playlist', help='Name of the playlist')
+    list_rotations_parser.add_argument('--generations', '-g', default='3',
+                                       help='Number of generations to list, or "all" for all generations')
+
+    # List backups command
+    subparsers.add_parser('list-backups', help='List all available backups with their sizes and dates')
+
     # Auth commands
     subparsers.add_parser('auth-status', help='Show Spotify auth token status')
     subparsers.add_parser('auth-refresh', help='Refresh Spotify auth token if possible')

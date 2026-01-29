@@ -62,6 +62,36 @@ To restore from a backup:
 python src/main.py restore my_backup_name
 ```
 
+### Restore Previous Rotation
+
+Restore a playlist to a previous rotation:
+```bash
+python src/main.py restore-previous-rotation playlist_name -1
+```
+Where `-1` means go back one generation, `-2` means go back two generations, etc.
+
+For example:
+```bash
+python src/main.py restore-previous-rotation MyPlaylist -5
+```
+This will attempt to restore 5 generations prior. If the offset is out of range, you'll see an error message.
+
+### List Rotations
+
+List rotations for a given playlist, along with each rotation's songs:
+```bash
+python src/main.py list-rotations "My Daily Mix"
+```
+
+By default, this shows the last 3 generations. Use `--generations` (or `-g`) to customize:
+```bash
+# Show last 5 generations
+python src/main.py list-rotations "My Daily Mix" --generations 5
+
+# Show all generations
+python src/main.py list-rotations "My Daily Mix" -g all
+```
+
 ## Input File Format
 Songs should be in a text file (.txt or .csv) with the following format:
 ```
