@@ -6,6 +6,7 @@ A Python script to manage Spotify playlists through the command line, featuring 
 - Import songs from CSV files into local database
 - Automatically rotate songs in playlists using smart selection
 - Find similar songs using AI-powered embeddings
+- Match-score candidates using local embeddings, Spotify audio features, and optional web search
 - View detailed playlist and rotation statistics
 - Sync entire song database to a playlist
 - Track playlist history and rotation progress
@@ -38,6 +39,9 @@ A Python script to manage Spotify playlists through the command line, featuring 
    ```
 
 ## Usage
+
+### Output Styling
+The CLI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 
 ### Import Songs
 Import songs from a file (supports both .txt and .csv formats):
@@ -118,6 +122,12 @@ Preview the selection without updating Spotify:
 ```bash
 python src/main.py update playlist_name --count 10 --fresh-days 30 --dry-run
 ```
+Choose a scoring strategy and provide an optional theme query:
+```bash
+python src/main.py update playlist_name --score-strategy local
+python src/main.py update playlist_name --score-strategy web --query "late night jazz"
+python src/main.py update playlist_name --score-strategy hybrid --query "uplifting synth pop"
+```
 
 ### View Playlist
 View current contents of a playlist:
@@ -157,12 +167,40 @@ Preview the next N generations without updating Spotify:
 ```bash
 python src/main.py plan playlist_name --count 10 --fresh-days 30 --generations 3
 ```
+Include scoring options for planning:
+```bash
+python src/main.py plan playlist_name --score-strategy hybrid --query "moody indie"
+```
 
 ### Show Playlist Diff
 Compare the next update against the current playlist contents:
 ```bash
 python src/main.py diff playlist_name --count 10 --fresh-days 30
 ```
+Include scoring options for diff:
+```bash
+python src/main.py diff playlist_name --score-strategy web --query "coffeehouse folk"
+```
+
+### Match Scoring (Web + Hybrid)
+The web and hybrid strategies can call external Claude/Codex commands to score candidates using web search.
+Provide one or more commands via environment variables:
+```bash
+export WEB_SCORE_CMD="path/to/your-web-score-wrapper"
+export WEB_SCORE_CLAUDE_CMD="claude --json"
+export WEB_SCORE_CODEX_CMD="codex --json"
+```
+Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
+to a 0-1 relevance score. For example:
+```json
+{
+  "scores": {
+    "artist|||song": 0.82,
+    "artist2|||song2": 0.63
+  }
+}
+```
+If no web command is configured, the CLI falls back to local scoring.
 
 ### Spotify Auth Status
 Check cached token status or attempt a refresh:

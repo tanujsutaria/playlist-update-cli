@@ -6,18 +6,32 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import Optional, Dict, List
-from tabulate import tabulate
+
+from rich.logging import RichHandler
 
 from arg_parse import parse_args
 from models import Song
 from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from rotation_manager import RotationManager
+from scoring import ScoreConfig
+from ui import console, section, subsection, table, key_value_table, info, warning
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            console=console,
+            show_time=True,
+            show_level=True,
+            show_path=False,
+            rich_tracebacks=True,
+            markup=False,
+        )
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -170,18 +184,30 @@ class PlaylistCLI:
                         continue
             
             # Display import statistics
-            logger.info("\n=== Import Statistics ===")
-            logger.info(f"Total entries processed: {stats['total']}")
-            logger.info(f"Songs added: {stats['added']}")
-            logger.info(f"Songs already in database: {stats['already_exists']}")
-            logger.info(f"Songs not found in Spotify: {stats['not_found']}")
-            logger.info(f"Artists with ≥1M followers: {stats['popular_artist']}")
-            logger.info(f"Errors: {stats['error']}")
+            section("Import Summary")
+            key_value_table(
+                [
+                    ["Total entries processed", stats["total"]],
+                    ["Songs added", stats["added"]],
+                    ["Songs already in database", stats["already_exists"]],
+                    ["Songs not found in Spotify", stats["not_found"]],
+                    ["Artists with >=1M followers", stats["popular_artist"]],
+                    ["Errors", stats["error"]],
+                ]
+            )
                     
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
-    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 30, dry_run: bool = False):
+    def update_playlist(
+        self,
+        playlist_name: str,
+        song_count: int = 10,
+        fresh_days: int = 30,
+        dry_run: bool = False,
+        score_strategy: str = "local",
+        query: Optional[str] = None
+    ):
         """Update a playlist with new songs by deleting and recreating it
         
         Args:
@@ -189,19 +215,26 @@ class PlaylistCLI:
             song_count: Number of songs to include in the playlist
             fresh_days: Prioritize songs not listened to in this many days
             dry_run: If True, preview selection without updating Spotify
+            score_strategy: Match scoring strategy (local, web, hybrid)
+            query: Optional theme query for building a playlist profile
         """
         try:
             rm = self._get_rotation_manager(playlist_name)
+            score_config = ScoreConfig(strategy=score_strategy, query=query)
             
             # Select songs
             logger.info(f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)...")
-            songs = rm.select_songs_for_today(count=song_count, fresh_days=fresh_days)
+            songs = rm.select_songs_for_today(
+                count=song_count,
+                fresh_days=fresh_days,
+                score_config=score_config
+            )
 
             if dry_run:
-                logger.info("\n=== Dry Run: Selected Songs ===")
+                section("Dry Run", "Selected Songs")
                 table_data = [[i, s.name, s.artist] for i, s in enumerate(songs, 1)]
-                print(tabulate(table_data, headers=["#", "Song", "Artist"], tablefmt="grid"))
-                print(f"\nTotal selected: {len(songs)}")
+                table(["#", "Song", "Artist"], table_data)
+                info(f"Total selected: {len(songs)}")
                 return
             
             # Update playlist
@@ -209,12 +242,16 @@ class PlaylistCLI:
             if rm.update_playlist(songs):
                 # Show detailed stats
                 stats = rm.get_rotation_stats()
-                logger.info("\nPlaylist Update Stats:")
-                logger.info(f"Total songs in database: {stats.total_songs}")
-                logger.info(f"Songs used so far: {stats.unique_songs_used}")
-                logger.info(f"Songs never used: {stats.songs_never_used}")
-                logger.info(f"Total generations: {stats.generations_count}")
-                logger.info(f"Complete rotation achieved: {stats.complete_rotation_achieved}")
+                section("Playlist Update Stats")
+                key_value_table(
+                    [
+                        ["Total songs in database", stats.total_songs],
+                        ["Songs used so far", stats.unique_songs_used],
+                        ["Songs never used", stats.songs_never_used],
+                        ["Total generations", stats.generations_count],
+                        ["Complete rotation achieved", stats.complete_rotation_achieved],
+                    ]
+                )
             else:
                 logger.error("Failed to update playlist")
             
@@ -228,7 +265,7 @@ class PlaylistCLI:
         recent_songs = rm.get_recent_songs(days=7)
         
         # Basic stats
-        logger.info("\n=== Playlist Statistics ===")
+        section("Playlist Statistics")
         stats_table = [
             ["Total Songs", stats.total_songs],
             ["Songs Used", stats.unique_songs_used],
@@ -236,12 +273,12 @@ class PlaylistCLI:
             ["Total generations", stats.generations_count],
             ["Complete Rotation", "Yes" if stats.complete_rotation_achieved else "No"],
             ["Rotation Progress", f"{(stats.unique_songs_used/stats.total_songs)*100:.1f}%"],
-            ["Current Strategy", stats.current_strategy]
+            ["Current Strategy", stats.current_strategy],
         ]
-        print(tabulate(stats_table, tablefmt="grid"))
+        key_value_table(stats_table)
         
         # Recent activity
-        logger.info("\n=== Recent Activity (Last 7 Days) ===")
+        section("Recent Activity", "Last 7 Days")
         recent_table = []
         for date, songs in recent_songs.items():
             recent_table.append([
@@ -250,9 +287,10 @@ class PlaylistCLI:
                 ", ".join(f"{s.name} by {s.artist}"[:40] for s in songs[:3]) + 
                 ("..." if len(songs) > 3 else "")
             ])
-        print(tabulate(recent_table, 
-                      headers=["Date", "Songs Added", "Sample Songs"],
-                      tablefmt="grid"))
+        table(
+            ["Date", "Songs Added", "Sample Songs"],
+            recent_table,
+        )
 
     def restore_previous_rotation(self, playlist_name: str, offset: int = -1):
         """
@@ -334,11 +372,11 @@ class PlaylistCLI:
             # Get the most recent N generations
             selected_gens = all_gens[-limit:]
             
-            logger.info(f"\n=== Rotations for playlist '{playlist_name}' ===")
+            section("Rotations", f"Playlist: {playlist_name}")
             # Calculate the starting index for proper numbering
             start_idx = len(all_gens) - limit + 1
             for i, gen_songs in enumerate(selected_gens, start=start_idx):
-                logger.info(f"\nGeneration {i}:")
+                subsection(f"Generation {i}")
                 songs = []
                 for song_id in gen_songs:
                     song = self.db.get_song_by_id(song_id)
@@ -350,13 +388,11 @@ class PlaylistCLI:
                     table_data = []
                     for j, song in enumerate(songs, 1):
                         table_data.append([j, song.name, song.artist])
-                    print(tabulate(table_data, 
-                                  headers=["#", "Song", "Artist"],
-                                  tablefmt="grid"))
+                    table(["#", "Song", "Artist"], table_data)
                 else:
                     logger.info("   No songs found for this generation.")
                     
-            logger.info(f"\nCurrent generation: {rm.history.current_generation + 1}")
+            info(f"Current generation: {rm.history.current_generation + 1}")
         except Exception as e:
             logger.error(f"Error listing rotations: {str(e)}")
             logger.debug("Full error:", exc_info=True)
@@ -367,10 +403,10 @@ class PlaylistCLI:
             # Only initialize Spotify manager
             tracks = self.spotify.get_playlist_tracks(playlist_name)
             
-            logger.info(f"\n=== Current Playlist: {playlist_name} ===")
+            section("Current Playlist", playlist_name)
             
             if not tracks:
-                print("\nPlaylist is empty!")
+                warning("Playlist is empty.")
                 return
             
             # Prepare table data
@@ -391,12 +427,13 @@ class PlaylistCLI:
                     added_date or 'Unknown'
                 ])
             
-            print(tabulate(table_data,
-                         headers=["#", "Song", "Artist", "Added Date"],
-                         tablefmt="grid"))
+            table(
+                ["#", "Song", "Artist", "Added Date"],
+                table_data,
+            )
             
             # Show summary
-            print(f"\nTotal tracks: {len(tracks)}")
+            info(f"Total tracks: {len(tracks)}")
             
         except Exception as e:
             logger.error(f"Error viewing playlist: {str(e)}")
@@ -407,33 +444,44 @@ class PlaylistCLI:
         try:
             # Database stats
             db_stats = self.db.get_stats()
-            logger.info("\n=== Database Stats ===")
-            logger.info(f"Total songs: {db_stats['total_songs']}")
-            logger.info(f"Embedding dimensions: {db_stats['embedding_dimensions']}")
-            logger.info(f"Storage size: {db_stats['storage_size_mb']:.2f} MB")
+            section("Database Stats")
+            key_value_table(
+                [
+                    ["Total songs", db_stats["total_songs"]],
+                    ["Embedding dimensions", db_stats["embedding_dimensions"]],
+                    ["Storage size (MB)", f"{db_stats['storage_size_mb']:.2f}"],
+                ]
+            )
 
             # Playlist stats if specified
             if playlist_name:
                 rm = self._get_rotation_manager(playlist_name)
                 stats = rm.get_rotation_stats()
                 
-                logger.info(f"\n=== Playlist '{playlist_name}' Stats ===")
-                logger.info(f"Total songs: {stats.total_songs}")
-                logger.info(f"Songs used so far: {stats.unique_songs_used}")
-                logger.info(f"Songs never used: {stats.songs_never_used}")
-                logger.info(f"Total generations: {stats.generations_count}")
-                logger.info(f"Complete rotation achieved: {stats.complete_rotation_achieved}")
+                section("Playlist Stats", playlist_name)
+                key_value_table(
+                    [
+                        ["Total songs", stats.total_songs],
+                        ["Songs used so far", stats.unique_songs_used],
+                        ["Songs never used", stats.songs_never_used],
+                        ["Total generations", stats.generations_count],
+                        ["Complete rotation achieved", stats.complete_rotation_achieved],
+                    ]
+                )
                 
                 # Show recent generations
                 recent_gens = rm.get_recent_generations(count=5)
                 if recent_gens:
-                    logger.info("\n=== Recent Generations ===")
+                    section("Recent Generations")
                     for i, gen_songs in enumerate(recent_gens, 1):
-                        logger.info(f"\nGeneration {stats.generations_count - len(recent_gens) + i}:")
+                        gen_index = stats.generations_count - len(recent_gens) + i
+                        subsection(f"Generation {gen_index}")
+                        table_data = []
                         for j, song in enumerate(gen_songs, 1):
-                            logger.info(f"{j:2d}. {song.name} by {song.artist}")
+                            table_data.append([j, song.name, song.artist])
+                        table(["#", "Song", "Artist"], table_data)
                 else:
-                    logger.info("\nNo generation history found")
+                    info("No generation history found.")
                 
         except Exception as e:
             logger.error(f"Error showing stats: {str(e)}")
@@ -658,7 +706,7 @@ class PlaylistCLI:
             logger.info("No backups found.")
             return
 
-        logger.info(f"\n=== Available Backups ===")
+        section("Available Backups")
 
         # Prepare table data
         table_data = []
@@ -675,11 +723,9 @@ class PlaylistCLI:
                 table_data.append([backup.name, f"{size_mb:.2f} MB", date_str])
 
         if table_data:
-            print(tabulate(table_data,
-                         headers=["Backup Name", "Size", "Created"],
-                         tablefmt="grid"))
-            print(f"\nTotal backups: {len(table_data)}")
-            print(f"Use 'restore <backup_name>' to restore a backup.")
+            table(["Backup Name", "Size", "Created"], table_data)
+            info(f"Total backups: {len(table_data)}")
+            info("Use 'restore <backup_name>' to restore a backup.")
         else:
             logger.info("No backup folders found.")
 
@@ -786,41 +832,71 @@ class PlaylistCLI:
                         self.db.remove_song(song.id)
             
             # Display cleaning statistics
-            logger.info("\n=== Database Cleaning Results ===")
-            logger.info(f"Total songs checked: {stats['checked']}")
-            logger.info(f"Songs kept: {stats['kept']}")
-            logger.info(f"Songs not found in Spotify: {stats['not_found']}")
-            logger.info(f"Songs with popular artists (≥1M followers): {stats['popular_artist']}")
+            section("Database Cleaning Results")
+            key_value_table(
+                [
+                    ["Total songs checked", stats["checked"]],
+                    ["Songs kept", stats["kept"]],
+                    ["Songs not found in Spotify", stats["not_found"]],
+                    ["Songs with popular artists (>=1M followers)", stats["popular_artist"]],
+                ]
+            )
             if dry_run and songs_to_remove:
-                logger.info(f"DRY RUN: No songs were actually removed")
+                info("DRY RUN: No songs were actually removed.")
             elif songs_to_remove:
-                logger.info(f"Songs removed: {len(songs_to_remove)}")
+                info(f"Songs removed: {len(songs_to_remove)}")
             else:
-                logger.info("No songs needed to be removed")
+                info("No songs needed to be removed.")
             
         except Exception as e:
             logger.error(f"Error cleaning database: {str(e)}")
             logger.debug("Full error:", exc_info=True)
 
-    def plan_playlist(self, playlist_name: str, song_count: int, fresh_days: int, generations: int):
+    def plan_playlist(
+        self,
+        playlist_name: str,
+        song_count: int,
+        fresh_days: int,
+        generations: int,
+        score_strategy: str = "local",
+        query: Optional[str] = None
+    ):
         """Preview future generations without updating Spotify."""
         try:
             rm = self._get_rotation_manager(playlist_name)
-            plans = rm.simulate_generations(count=song_count, fresh_days=fresh_days, generations=generations)
-            logger.info(f"\n=== Plan: {generations} future generations for '{playlist_name}' ===")
+            score_config = ScoreConfig(strategy=score_strategy, query=query)
+            plans = rm.simulate_generations(
+                count=song_count,
+                fresh_days=fresh_days,
+                generations=generations,
+                score_config=score_config
+            )
+            section("Plan", f"{generations} future generations for '{playlist_name}'")
             for idx, songs in enumerate(plans, 1):
-                logger.info(f"\nGeneration {idx}")
+                subsection(f"Generation {idx}")
                 table_data = [[i, s.name, s.artist] for i, s in enumerate(songs, 1)]
-                print(tabulate(table_data, headers=["#", "Song", "Artist"], tablefmt="grid"))
+                table(["#", "Song", "Artist"], table_data)
         except Exception as e:
             logger.error(f"Error planning playlist: {str(e)}")
 
-    def diff_playlist(self, playlist_name: str, song_count: int, fresh_days: int):
+    def diff_playlist(
+        self,
+        playlist_name: str,
+        song_count: int,
+        fresh_days: int,
+        score_strategy: str = "local",
+        query: Optional[str] = None
+    ):
         """Show playlist changes before applying update."""
         try:
             rm = self._get_rotation_manager(playlist_name)
             logger.info(f"Selecting {song_count} songs for diff (fresh_days={fresh_days})...")
-            selected = rm.select_songs_for_today(count=song_count, fresh_days=fresh_days)
+            score_config = ScoreConfig(strategy=score_strategy, query=query)
+            selected = rm.select_songs_for_today(
+                count=song_count,
+                fresh_days=fresh_days,
+                score_config=score_config
+            )
 
             current_tracks = self.spotify.get_playlist_tracks(playlist_name)
             current_uris = {t["uri"] for t in current_tracks if t.get("uri")}
@@ -835,23 +911,27 @@ class PlaylistCLI:
             to_add = selected_uris - current_uris
             to_remove = current_uris - selected_uris
 
-            logger.info("\n=== Playlist Diff ===")
-            print(f"Would add: {len(to_add)} tracks")
-            print(f"Would remove: {len(to_remove)} tracks")
+            section("Playlist Diff")
+            key_value_table(
+                [
+                    ["Would add", f"{len(to_add)} tracks"],
+                    ["Would remove", f"{len(to_remove)} tracks"],
+                ]
+            )
 
             if to_add:
                 add_sample = []
                 for uri in list(to_add)[:10]:
                     add_sample.append([uri])
-                print("\nSample additions (URIs):")
-                print(tabulate(add_sample, headers=["URI"], tablefmt="grid"))
+                subsection("Sample additions (URIs)")
+                table(["URI"], add_sample)
 
             if to_remove:
                 remove_sample = []
                 for uri in list(to_remove)[:10]:
                     remove_sample.append([uri])
-                print("\nSample removals (URIs):")
-                print(tabulate(remove_sample, headers=["URI"], tablefmt="grid"))
+                subsection("Sample removals (URIs)")
+                table(["URI"], remove_sample)
         except Exception as e:
             logger.error(f"Error generating playlist diff: {str(e)}")
 
@@ -865,14 +945,21 @@ class PlaylistCLI:
         expires_at = token_info.get("expires_at")
         expires_in = token_info.get("expires_in")
         scope = token_info.get("scope")
-        logger.info("Spotify auth token found.")
+
+        section("Spotify Auth Status")
+        rows = []
         if expires_at:
             expires_dt = datetime.fromtimestamp(expires_at)
-            logger.info(f"Expires at: {expires_dt.isoformat()}")
+            rows.append(["Expires at", expires_dt.isoformat()])
         if expires_in:
-            logger.info(f"Expires in (seconds): {expires_in}")
+            rows.append(["Expires in (seconds)", expires_in])
         if scope:
-            logger.info(f"Scopes: {scope}")
+            rows.append(["Scopes", scope])
+
+        if rows:
+            key_value_table(rows)
+        else:
+            info("Token metadata not available.")
 
     def auth_refresh(self):
         """Refresh Spotify auth token if possible."""
@@ -898,7 +985,14 @@ def main():
         if command == 'import':
             cli.import_songs(args.file)
         elif command == 'update':
-            cli.update_playlist(args.playlist, args.count, args.fresh_days, args.dry_run)
+            cli.update_playlist(
+                args.playlist,
+                args.count,
+                args.fresh_days,
+                args.dry_run,
+                args.score_strategy,
+                args.query
+            )
         elif command == 'stats':
             if args.export:
                 cli.export_stats(args.playlist, args.export, args.output)
@@ -911,9 +1005,22 @@ def main():
         elif command == 'extract':
             cli.extract_playlist(args.playlist, args.output)
         elif command == 'plan':
-            cli.plan_playlist(args.playlist, args.count, args.fresh_days, args.generations)
+            cli.plan_playlist(
+                args.playlist,
+                args.count,
+                args.fresh_days,
+                args.generations,
+                args.score_strategy,
+                args.query
+            )
         elif command == 'diff':
-            cli.diff_playlist(args.playlist, args.count, args.fresh_days)
+            cli.diff_playlist(
+                args.playlist,
+                args.count,
+                args.fresh_days,
+                args.score_strategy,
+                args.query
+            )
         elif command == 'clean':
             cli.clean_database(args.dry_run)
         elif command == 'backup':

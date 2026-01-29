@@ -71,6 +71,8 @@ class TestUpdateCommand:
         assert args.playlist == 'My Playlist'
         assert args.count == 10  # Default
         assert args.fresh_days == 30  # Default
+        assert args.score_strategy == 'local'
+        assert args.query is None
 
     def test_parse_update_with_count(self):
         """Test parsing update with --count option"""
@@ -98,6 +100,20 @@ class TestUpdateCommand:
         assert args.playlist == 'My Playlist'
         assert args.count == 15
         assert args.fresh_days == 14
+        assert args.score_strategy == 'local'
+        assert args.query is None
+
+    def test_parse_update_with_scoring_options(self):
+        """Test parsing update with scoring options"""
+        parser = setup_parsers()
+        args = parser.parse_args([
+            'update', 'My Playlist',
+            '--score-strategy', 'web',
+            '--query', 'late night jazz'
+        ])
+
+        assert args.score_strategy == 'web'
+        assert args.query == 'late night jazz'
 
 
 class TestStatsCommand:
@@ -283,6 +299,50 @@ class TestListBackupsCommand:
         args = parser.parse_args(['list-backups'])
 
         assert args.command == 'list-backups'
+
+
+class TestPlanCommand:
+    """Tests for plan command parsing"""
+
+    def test_parse_plan_with_scoring(self):
+        parser = setup_parsers()
+        args = parser.parse_args([
+            'plan', 'My Playlist',
+            '--count', '8',
+            '--fresh-days', '12',
+            '--generations', '4',
+            '--score-strategy', 'hybrid',
+            '--query', 'ambient focus'
+        ])
+
+        assert args.command == 'plan'
+        assert args.playlist == 'My Playlist'
+        assert args.count == 8
+        assert args.fresh_days == 12
+        assert args.generations == 4
+        assert args.score_strategy == 'hybrid'
+        assert args.query == 'ambient focus'
+
+
+class TestDiffCommand:
+    """Tests for diff command parsing"""
+
+    def test_parse_diff_with_scoring(self):
+        parser = setup_parsers()
+        args = parser.parse_args([
+            'diff', 'My Playlist',
+            '--count', '6',
+            '--fresh-days', '21',
+            '--score-strategy', 'web',
+            '--query', 'sunny acoustic'
+        ])
+
+        assert args.command == 'diff'
+        assert args.playlist == 'My Playlist'
+        assert args.count == 6
+        assert args.fresh_days == 21
+        assert args.score_strategy == 'web'
+        assert args.query == 'sunny acoustic'
 
 
 class TestParseArgsFunction:

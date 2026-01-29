@@ -8,6 +8,7 @@ import pickle
 from models import Song, PlaylistHistory, RotationStats
 from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager
+from scoring import ScoreConfig, MatchScorer
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +88,37 @@ class RotationManager:
         self,
         history: PlaylistHistory,
         count: int = 10,
-        fresh_days: int = 30
+        fresh_days: int = 30,
+        score_config: Optional[ScoreConfig] = None
     ) -> List[Song]:
         """Select songs using a provided history snapshot."""
         today = datetime.now()
         all_songs = self.db.get_all_songs()
         used_songs = history.all_used_songs
+
+        scores_by_id: Dict[str, float] = {}
+        if score_config is not None:
+            try:
+                scorer = MatchScorer(self.playlist_name, self.db, self.spotify, history, score_config)
+                scores_by_id = scorer.score_candidates(all_songs)
+            except Exception as e:
+                logger.warning(f"Match scoring failed, falling back to legacy selection: {e}")
+                scores_by_id = {}
+
+        def rank_candidates(candidates: List[Song]) -> List[Song]:
+            if not scores_by_id:
+                return candidates
+            return sorted(
+                candidates,
+                key=lambda s: (-scores_by_id.get(s.id, 0.0), s.name, s.artist)
+            )
         
         # First priority: songs that have never been used
         unused_songs = [s for s in all_songs if s.id not in used_songs]
         logger.info(f"Found {len(unused_songs)} songs that have never been used")
-        
+
         if len(unused_songs) >= count:
-            return unused_songs[:count]
+            return rank_candidates(unused_songs)[:count]
         
         # Second priority: songs not used in the last fresh_days
         fresh_date_cutoff = today - timedelta(days=fresh_days)
@@ -133,21 +152,24 @@ class RotationManager:
         logger.info(f"Found {len(fresh_songs)} additional songs not used in the last {fresh_days} days")
         
         # Combine unused and fresh songs
-        selected = unused_songs + fresh_songs
+        selected = rank_candidates(unused_songs) + rank_candidates(fresh_songs)
         if len(selected) >= count:
             return selected[:count]
         
-        # Third priority: use similarity-based selection for remaining slots
+        # Third priority: use scoring or similarity-based selection for remaining slots
         remaining_count = count - len(selected)
-        logger.info(f"Need {remaining_count} more songs, using similarity-based selection")
-        
-        # Use the last selected song as seed for similarity search
-        seed_song = selected[-1] if selected else all_songs[0]
-        
-        # Exclude already selected songs from similarity search
+        logger.info(f"Need {remaining_count} more songs, using match scoring or similarity fallback")
+
+        # Exclude already selected songs from the remaining candidate pool
         selected_ids = {s.id for s in selected}
         candidates = [s for s in all_songs if s.id not in selected_ids]
-        
+
+        if scores_by_id:
+            ranked_remaining = rank_candidates(candidates)
+            return selected + ranked_remaining[:remaining_count]
+
+        # Fallback to legacy similarity search
+        seed_song = selected[-1] if selected else all_songs[0]
         similar_songs = self.db.find_similar_songs(seed_song, k=remaining_count, threshold=0.7)
         
         # If we still don't have enough songs, add random ones from the remaining pool
@@ -172,20 +194,31 @@ class RotationManager:
         
         return selected + similar_songs[:remaining_count]
 
-    def select_songs_for_today(self, count: int = 10, fresh_days: int = 30) -> List[Song]:
+    def select_songs_for_today(
+        self,
+        count: int = 10,
+        fresh_days: int = 30,
+        score_config: Optional[ScoreConfig] = None
+    ) -> List[Song]:
         """Select songs for today's playlist, prioritizing songs not listened to recently
         
         Args:
             count: Number of songs to select
             fresh_days: Prioritize songs not used in this many days
         """
-        return self._select_songs_with_history(self.history, count=count, fresh_days=fresh_days)
+        return self._select_songs_with_history(
+            self.history,
+            count=count,
+            fresh_days=fresh_days,
+            score_config=score_config
+        )
 
     def simulate_generations(
         self,
         count: int = 10,
         fresh_days: int = 30,
-        generations: int = 3
+        generations: int = 3,
+        score_config: Optional[ScoreConfig] = None
     ) -> List[List[Song]]:
         """Simulate future generations without writing history to disk."""
         import copy
@@ -193,7 +226,12 @@ class RotationManager:
         plans: List[List[Song]] = []
 
         for _ in range(max(0, generations)):
-            songs = self._select_songs_with_history(simulated_history, count=count, fresh_days=fresh_days)
+            songs = self._select_songs_with_history(
+                simulated_history,
+                count=count,
+                fresh_days=fresh_days,
+                score_config=score_config
+            )
             plans.append(songs)
             simulated_history.generations.append([song.id for song in songs])
             simulated_history.current_generation += 1
