@@ -1,13 +1,23 @@
 import logging
-from models import Song
-from spotify_manager import SpotifyManager
+import os
+import sys
+from pathlib import Path
+
+import pytest
 from dotenv import load_dotenv
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+from models import Song  # noqa: E402
+from spotify_manager import SpotifyManager  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def test_spotify_integration():
     """Test basic Spotify functionality"""
+    if not os.getenv("SPOTIFY_CLIENT_ID"):
+        pytest.skip("Spotify credentials not configured")
     try:
         load_dotenv('config/.env')
         sp = SpotifyManager()

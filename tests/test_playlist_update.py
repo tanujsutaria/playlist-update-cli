@@ -1,10 +1,17 @@
 import logging
 import os
+import sys
+from pathlib import Path
+
+import pytest
 from dotenv import load_dotenv
-from models import Song
-from db_manager import DatabaseManager
-from spotify_manager import SpotifyManager
-from rotation_manager import RotationManager
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+from models import Song  # noqa: E402
+from db_manager import DatabaseManager  # noqa: E402
+from spotify_manager import SpotifyManager  # noqa: E402
+from rotation_manager import RotationManager  # noqa: E402
 
 # Set up logging
 logging.basicConfig(
@@ -15,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 def test_playlist_update():
     """Test the playlist update functionality"""
+    if not os.getenv("SPOTIFY_CLIENT_ID"):
+        pytest.skip("Spotify credentials not configured")
     try:
         # Load environment variables
         load_dotenv('config/.env')

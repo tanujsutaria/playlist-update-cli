@@ -84,6 +84,10 @@ Update a playlist with new songs using smart rotation:
 ```bash
 python src/main.py update playlist_name --count 10 --fresh-days 30
 ```
+Preview the selection without updating Spotify:
+```bash
+python src/main.py update playlist_name --count 10 --fresh-days 30 --dry-run
+```
 
 ### View Playlist
 View current contents of a playlist:
@@ -98,6 +102,11 @@ python src/main.py stats
 # or for a specific playlist
 python src/main.py stats --playlist playlist_name
 ```
+Export stats to a file:
+```bash
+python src/main.py stats --export json --output stats.json
+python src/main.py stats --export csv
+```
 
 ### Sync Playlist
 Sync the entire song database to a playlist:
@@ -111,6 +120,25 @@ Extract playlist contents to a CSV file:
 python src/main.py extract playlist_name
 # or specify output file
 python src/main.py extract playlist_name --output songs.csv
+```
+
+### Plan Future Rotations
+Preview the next N generations without updating Spotify:
+```bash
+python src/main.py plan playlist_name --count 10 --fresh-days 30 --generations 3
+```
+
+### Show Playlist Diff
+Compare the next update against the current playlist contents:
+```bash
+python src/main.py diff playlist_name --count 10 --fresh-days 30
+```
+
+### Spotify Auth Status
+Check cached token status or attempt a refresh:
+```bash
+python src/main.py auth-status
+python src/main.py auth-refresh
 ```
 
 ### Clean Database
