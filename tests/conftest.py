@@ -2,14 +2,18 @@
 Shared pytest fixtures for all tests.
 Provides mocked managers and sample data to enable testing without Spotify credentials.
 """
-import pytest
-import numpy as np
+import sys
 from pathlib import Path
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from typing import List, Dict
 
-from models import Song, PlaylistHistory, RotationStats
+import numpy as np
+import pytest
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+from models import Song, PlaylistHistory, RotationStats  # noqa: E402
 
 
 # =============================================================================

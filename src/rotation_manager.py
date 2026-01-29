@@ -83,16 +83,16 @@ class RotationManager:
             current_strategy="similarity-based"
         )
 
-    def select_songs_for_today(self, count: int = 10, fresh_days: int = 30) -> List[Song]:
-        """Select songs for today's playlist, prioritizing songs not listened to recently
-        
-        Args:
-            count: Number of songs to select
-            fresh_days: Prioritize songs not used in this many days
-        """
+    def _select_songs_with_history(
+        self,
+        history: PlaylistHistory,
+        count: int = 10,
+        fresh_days: int = 30
+    ) -> List[Song]:
+        """Select songs using a provided history snapshot."""
         today = datetime.now()
         all_songs = self.db.get_all_songs()
-        used_songs = self.history.all_used_songs
+        used_songs = history.all_used_songs
         
         # First priority: songs that have never been used
         unused_songs = [s for s in all_songs if s.id not in used_songs]
@@ -106,10 +106,10 @@ class RotationManager:
         
         # Get songs used in each generation with timestamps
         recent_usage = {}
-        for i, gen_songs in enumerate(self.history.generations):
+        for i, gen_songs in enumerate(history.generations):
             # Estimate the date based on generation index
             # Assuming one generation per day, counting backwards from today
-            gen_date = today - timedelta(days=len(self.history.generations) - i)
+            gen_date = today - timedelta(days=len(history.generations) - i)
             
             for song_id in gen_songs:
                 # Keep the most recent usage date
@@ -171,6 +171,34 @@ class RotationManager:
             return selected + similar_songs + random_selections
         
         return selected + similar_songs[:remaining_count]
+
+    def select_songs_for_today(self, count: int = 10, fresh_days: int = 30) -> List[Song]:
+        """Select songs for today's playlist, prioritizing songs not listened to recently
+        
+        Args:
+            count: Number of songs to select
+            fresh_days: Prioritize songs not used in this many days
+        """
+        return self._select_songs_with_history(self.history, count=count, fresh_days=fresh_days)
+
+    def simulate_generations(
+        self,
+        count: int = 10,
+        fresh_days: int = 30,
+        generations: int = 3
+    ) -> List[List[Song]]:
+        """Simulate future generations without writing history to disk."""
+        import copy
+        simulated_history = copy.deepcopy(self.history)
+        plans: List[List[Song]] = []
+
+        for _ in range(max(0, generations)):
+            songs = self._select_songs_with_history(simulated_history, count=count, fresh_days=fresh_days)
+            plans.append(songs)
+            simulated_history.generations.append([song.id for song in songs])
+            simulated_history.current_generation += 1
+
+        return plans
 
     def update_playlist(self, songs: List[Song], record_generation: bool = True) -> bool:
         """Update the playlist with the given songs by deleting and recreating it"""

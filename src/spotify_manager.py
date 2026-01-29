@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Any
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from models import Song
@@ -11,36 +11,61 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+SPOTIFY_SCOPES = [
+    'playlist-modify-public',
+    'playlist-modify-private',
+    'playlist-read-private',
+    'user-library-read'
+]
+
+def _get_cache_handler() -> spotipy.cache_handler.CacheFileHandler:
+    cache_dir = Path(__file__).parent.parent / ".spotify_cache"
+    cache_dir.mkdir(exist_ok=True, mode=0o700)
+    cache_path = cache_dir / ".spotify_token"
+    return spotipy.cache_handler.CacheFileHandler(
+        cache_path=str(cache_path),
+        username='default'
+    )
+
+def _get_auth_manager(open_browser: bool = True) -> SpotifyOAuth:
+    return SpotifyOAuth(
+        scope=' '.join(SPOTIFY_SCOPES),
+        redirect_uri=os.getenv('SPOTIFY_REDIRECT_URI'),
+        client_id=os.getenv('SPOTIFY_CLIENT_ID'),
+        client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
+        cache_handler=_get_cache_handler(),
+        open_browser=open_browser,
+        show_dialog=False
+    )
+
+def get_cached_token_info() -> Optional[Dict[str, Any]]:
+    """Return cached token info without triggering auth flow."""
+    try:
+        auth_manager = _get_auth_manager(open_browser=False)
+        return auth_manager.get_cached_token()
+    except Exception as e:
+        logger.error(f"Error reading cached token: {e}")
+        return None
+
+def refresh_cached_token() -> Optional[Dict[str, Any]]:
+    """Refresh the cached token if possible."""
+    try:
+        auth_manager = _get_auth_manager(open_browser=False)
+        cached = auth_manager.get_cached_token()
+        if not cached or "refresh_token" not in cached:
+            logger.warning("No refresh token available in cache")
+            return None
+        refreshed = auth_manager.refresh_access_token(cached["refresh_token"])
+        return refreshed
+    except Exception as e:
+        logger.error(f"Error refreshing token: {e}")
+        return None
+
 class SpotifyManager:
     """Manages Spotify playlist operations"""
     
     def __init__(self):
-        # Create cache directory in project root
-        self.cache_dir = Path(__file__).parent.parent / ".spotify_cache"
-        self.cache_dir.mkdir(exist_ok=True, mode=0o700)  # Ensure proper permissions
-        self.cache_path = self.cache_dir / ".spotify_token"
-        
-        # Create custom cache handler with proper permissions
-        cache_handler = spotipy.cache_handler.CacheFileHandler(
-            cache_path=str(self.cache_path),
-            username='default'  # Use a fixed username instead of client_id
-        )
-        
-        # Initialize auth manager with proper settings
-        auth_manager = SpotifyOAuth(
-            scope=' '.join([
-                'playlist-modify-public',
-                'playlist-modify-private',
-                'playlist-read-private',
-                'user-library-read'
-            ]),
-            redirect_uri=os.getenv('SPOTIFY_REDIRECT_URI'),
-            client_id=os.getenv('SPOTIFY_CLIENT_ID'),
-            client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
-            cache_handler=cache_handler,
-            open_browser=True,
-            show_dialog=False
-        )
+        auth_manager = _get_auth_manager(open_browser=True)
         
         # Initialize Spotify client with auth manager
         self.sp = spotipy.Spotify(auth_manager=auth_manager)

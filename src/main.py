@@ -1,4 +1,6 @@
 import logging
+import json
+import csv
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -9,7 +11,7 @@ from tabulate import tabulate
 from arg_parse import parse_args
 from models import Song
 from db_manager import DatabaseManager
-from spotify_manager import SpotifyManager
+from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from rotation_manager import RotationManager
 
 # Set up logging
@@ -179,13 +181,14 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
-    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 30):
+    def update_playlist(self, playlist_name: str, song_count: int = 10, fresh_days: int = 30, dry_run: bool = False):
         """Update a playlist with new songs by deleting and recreating it
         
         Args:
             playlist_name: Name of the playlist to update
             song_count: Number of songs to include in the playlist
             fresh_days: Prioritize songs not listened to in this many days
+            dry_run: If True, preview selection without updating Spotify
         """
         try:
             rm = self._get_rotation_manager(playlist_name)
@@ -193,6 +196,13 @@ class PlaylistCLI:
             # Select songs
             logger.info(f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)...")
             songs = rm.select_songs_for_today(count=song_count, fresh_days=fresh_days)
+
+            if dry_run:
+                logger.info("\n=== Dry Run: Selected Songs ===")
+                table_data = [[i, s.name, s.artist] for i, s in enumerate(songs, 1)]
+                print(tabulate(table_data, headers=["#", "Song", "Artist"], tablefmt="grid"))
+                print(f"\nTotal selected: {len(songs)}")
+                return
             
             # Update playlist
             logger.info("Updating playlist...")
@@ -427,6 +437,54 @@ class PlaylistCLI:
                 
         except Exception as e:
             logger.error(f"Error showing stats: {str(e)}")
+
+    def export_stats(self, playlist_name: Optional[str], export_format: str, output_file: Optional[str]):
+        """Export database and playlist stats to a file."""
+        db_stats = self.db.get_stats()
+        export_payload = {
+            "database": db_stats,
+            "playlist": None,
+            "generated_at": datetime.now().isoformat()
+        }
+
+        if playlist_name:
+            rm = self._get_rotation_manager(playlist_name)
+            stats = rm.get_rotation_stats()
+            export_payload["playlist"] = {
+                "name": playlist_name,
+                "total_songs": stats.total_songs,
+                "unique_songs_used": stats.unique_songs_used,
+                "songs_never_used": stats.songs_never_used,
+                "generations_count": stats.generations_count,
+                "complete_rotation_achieved": stats.complete_rotation_achieved,
+                "current_strategy": stats.current_strategy
+            }
+
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix = "json" if export_format == "json" else "csv"
+            output_file = f"stats_export_{timestamp}.{suffix}"
+
+        if export_format == "json":
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(export_payload, f, indent=2)
+            logger.info(f"Exported stats to {output_file}")
+            return
+
+        # CSV export: flattened key/value pairs
+        rows = []
+        for key, value in db_stats.items():
+            rows.append(["database", key, value])
+
+        if export_payload["playlist"]:
+            for key, value in export_payload["playlist"].items():
+                rows.append(["playlist", key, value])
+
+        with open(output_file, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["section", "key", "value"])
+            writer.writerows(rows)
+        logger.info(f"Exported stats to {output_file}")
 
     def sync_playlist(self, playlist_name: str):
         """Sync a playlist with all songs in the database by adding new songs and removing songs no longer in the database"""
@@ -744,6 +802,91 @@ class PlaylistCLI:
             logger.error(f"Error cleaning database: {str(e)}")
             logger.debug("Full error:", exc_info=True)
 
+    def plan_playlist(self, playlist_name: str, song_count: int, fresh_days: int, generations: int):
+        """Preview future generations without updating Spotify."""
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+            plans = rm.simulate_generations(count=song_count, fresh_days=fresh_days, generations=generations)
+            logger.info(f"\n=== Plan: {generations} future generations for '{playlist_name}' ===")
+            for idx, songs in enumerate(plans, 1):
+                logger.info(f"\nGeneration {idx}")
+                table_data = [[i, s.name, s.artist] for i, s in enumerate(songs, 1)]
+                print(tabulate(table_data, headers=["#", "Song", "Artist"], tablefmt="grid"))
+        except Exception as e:
+            logger.error(f"Error planning playlist: {str(e)}")
+
+    def diff_playlist(self, playlist_name: str, song_count: int, fresh_days: int):
+        """Show playlist changes before applying update."""
+        try:
+            rm = self._get_rotation_manager(playlist_name)
+            logger.info(f"Selecting {song_count} songs for diff (fresh_days={fresh_days})...")
+            selected = rm.select_songs_for_today(count=song_count, fresh_days=fresh_days)
+
+            current_tracks = self.spotify.get_playlist_tracks(playlist_name)
+            current_uris = {t["uri"] for t in current_tracks if t.get("uri")}
+
+            selected_uris = set()
+            for song in selected:
+                if not song.spotify_uri:
+                    song.spotify_uri = self.spotify.search_song(song)
+                if song.spotify_uri:
+                    selected_uris.add(song.spotify_uri)
+
+            to_add = selected_uris - current_uris
+            to_remove = current_uris - selected_uris
+
+            logger.info("\n=== Playlist Diff ===")
+            print(f"Would add: {len(to_add)} tracks")
+            print(f"Would remove: {len(to_remove)} tracks")
+
+            if to_add:
+                add_sample = []
+                for uri in list(to_add)[:10]:
+                    add_sample.append([uri])
+                print("\nSample additions (URIs):")
+                print(tabulate(add_sample, headers=["URI"], tablefmt="grid"))
+
+            if to_remove:
+                remove_sample = []
+                for uri in list(to_remove)[:10]:
+                    remove_sample.append([uri])
+                print("\nSample removals (URIs):")
+                print(tabulate(remove_sample, headers=["URI"], tablefmt="grid"))
+        except Exception as e:
+            logger.error(f"Error generating playlist diff: {str(e)}")
+
+    def auth_status(self):
+        """Show Spotify auth token status without triggering auth flow."""
+        token_info = get_cached_token_info()
+        if not token_info:
+            logger.info("No cached Spotify token found.")
+            return
+
+        expires_at = token_info.get("expires_at")
+        expires_in = token_info.get("expires_in")
+        scope = token_info.get("scope")
+        logger.info("Spotify auth token found.")
+        if expires_at:
+            expires_dt = datetime.fromtimestamp(expires_at)
+            logger.info(f"Expires at: {expires_dt.isoformat()}")
+        if expires_in:
+            logger.info(f"Expires in (seconds): {expires_in}")
+        if scope:
+            logger.info(f"Scopes: {scope}")
+
+    def auth_refresh(self):
+        """Refresh Spotify auth token if possible."""
+        refreshed = refresh_cached_token()
+        if not refreshed:
+            logger.info("No token refreshed. You may need to re-authenticate using any Spotify command.")
+            return
+        expires_at = refreshed.get("expires_at")
+        if expires_at:
+            expires_dt = datetime.fromtimestamp(expires_at)
+            logger.info(f"Token refreshed. New expiry: {expires_dt.isoformat()}")
+        else:
+            logger.info("Token refreshed.")
+
 def main():
     cli = PlaylistCLI()
     command, args = parse_args()
@@ -755,15 +898,22 @@ def main():
         if command == 'import':
             cli.import_songs(args.file)
         elif command == 'update':
-            cli.update_playlist(args.playlist, args.count, args.fresh_days)
+            cli.update_playlist(args.playlist, args.count, args.fresh_days, args.dry_run)
         elif command == 'stats':
-            cli.show_stats(args.playlist)
+            if args.export:
+                cli.export_stats(args.playlist, args.export, args.output)
+            else:
+                cli.show_stats(args.playlist)
         elif command == 'view':
             cli.view_playlist(args.playlist)
         elif command == 'sync':
             cli.sync_playlist(args.playlist)
         elif command == 'extract':
             cli.extract_playlist(args.playlist, args.output)
+        elif command == 'plan':
+            cli.plan_playlist(args.playlist, args.count, args.fresh_days, args.generations)
+        elif command == 'diff':
+            cli.diff_playlist(args.playlist, args.count, args.fresh_days)
         elif command == 'clean':
             cli.clean_database(args.dry_run)
         elif command == 'backup':
@@ -777,6 +927,10 @@ def main():
             cli.list_rotations(args.playlist, args.generations)
         elif command == 'list-backups':
             cli.list_backups()
+        elif command == 'auth-status':
+            cli.auth_status()
+        elif command == 'auth-refresh':
+            cli.auth_refresh()
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
