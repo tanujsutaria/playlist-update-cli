@@ -1,0 +1,104 @@
+diff --git a/README.md b/README.md
+index 742582c..d01eb62 100644
+--- a/README.md
++++ b/README.md
+@@ -139,12 +139,12 @@ Bohemian Rhapsody,Queen
+ The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
+ - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
+ - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
+-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex exec -`)
++- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex exec --search --output-schema ...`)
+ 
+ You can also set a generic command for search via `WEB_SEARCH_CMD`.
+ If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
+ with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`. If you see
+-`stdin is not a terminal`, use `codex exec -`.
++`stdin is not a terminal`, use `codex exec --search --output-schema ... -`.
+ 
+ ## Validation rules for /search
+ - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
+@@ -162,7 +162,7 @@ for scoring candidates. Provide one or more commands via environment variables:
+ ```bash
+ export WEB_SCORE_CMD="path/to/your-web-score-wrapper"
+ export WEB_SCORE_CLAUDE_CMD="claude"
+-export WEB_SCORE_CODEX_CMD="codex exec -"
++export WEB_SCORE_CODEX_CMD="codex exec --search -"
+ ```
+ Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
+ (`artist|||song`) to a 0-1 relevance score.
+diff --git a/src/scoring.py b/src/scoring.py
+index 783211c..8aa741b 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -324,7 +324,7 @@ class WebSearchScoreProvider(ScoreProvider):
+             "Return JSON only."
+         )
+         if args and args[0] == "codex" and "exec" not in args:
+-            args = ["codex", "exec", "-"]
++            args = ["codex", "exec", "--search", "-"]
+         elif args and args[0] == "codex" and "exec" in args and "-" not in args:
+             args = args + ["-"]
+         return args, prompt
+diff --git a/src/web_search.py b/src/web_search.py
+index bdd4a7f..06f6507 100644
+--- a/src/web_search.py
++++ b/src/web_search.py
+@@ -56,7 +56,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
+     if codex_cmd:
+         commands["codex"] = codex_cmd
+     elif env.get("OPENAI_API_KEY"):
+-        commands["codex"] = "codex exec -"
++        commands["codex"] = _default_codex_command()
+ 
+     if not commands:
+         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
+@@ -276,12 +276,23 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
+ def _prepare_codex_command(args: List[str], payload: dict) -> Tuple[List[str], str]:
+     prompt = _build_prompt_from_payload(payload)
+     if args and args[0] == "codex" and "exec" not in args:
+-        args = ["codex", "exec", "-"]
++        args = ["codex", "exec", "--search", "--output-schema", _codex_schema(), "-"]
+     elif args and args[0] == "codex" and "exec" in args and "-" not in args:
+         args = args + ["-"]
+     return args, prompt
+ 
+ 
++def _default_codex_command() -> str:
++    schema = _codex_schema()
++    return f'codex exec --search --output-schema {schema} -'
++
++
++def _codex_schema() -> str:
++    return (
++        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
++    )
++
++
+ def _build_prompt_from_payload(payload: dict) -> str:
+     instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
+     filtered = {key: value for key, value in payload.items() if key != "instructions"}
+@@ -304,6 +315,24 @@ def _stderr_needs_tty(stderr: str) -> bool:
+ 
+ 
+ def _parse_json_output(text: str) -> Optional[object]:
++    if text:
++        candidate = text.strip()
++        if candidate.startswith("```json"):
++            candidate = candidate[len("```json") :]
++        if candidate.startswith("```"):
++            candidate = candidate[len("```") :]
++        if candidate.endswith("```"):
++            candidate = candidate[: -3]
++        candidate = candidate.strip()
++        if candidate.startswith("{") and candidate.endswith("}"):
++            parsed = _try_parse_json(candidate)
++            if parsed is not None:
++                return parsed
++        if candidate.startswith("[") and candidate.endswith("]"):
++            parsed = _try_parse_json(candidate)
++            if parsed is not None:
++                return parsed
++
+     try:
+         return json.loads(text)
+     except json.JSONDecodeError:

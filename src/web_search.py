@@ -56,7 +56,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
     if codex_cmd:
         commands["codex"] = codex_cmd
     elif env.get("OPENAI_API_KEY"):
-        commands["codex"] = "codex exec -"
+        commands["codex"] = _default_codex_command()
 
     if not commands:
         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
@@ -276,10 +276,21 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
 def _prepare_codex_command(args: List[str], payload: dict) -> Tuple[List[str], str]:
     prompt = _build_prompt_from_payload(payload)
     if args and args[0] == "codex" and "exec" not in args:
-        args = ["codex", "exec", "-"]
+        args = ["codex", "exec", "--search", "--output-schema", _codex_schema(), "-"]
     elif args and args[0] == "codex" and "exec" in args and "-" not in args:
         args = args + ["-"]
     return args, prompt
+
+
+def _default_codex_command() -> str:
+    schema = _codex_schema()
+    return f'codex exec --search --output-schema {schema} -'
+
+
+def _codex_schema() -> str:
+    return (
+        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
+    )
 
 
 def _build_prompt_from_payload(payload: dict) -> str:
@@ -304,6 +315,24 @@ def _stderr_needs_tty(stderr: str) -> bool:
 
 
 def _parse_json_output(text: str) -> Optional[object]:
+    if text:
+        candidate = text.strip()
+        if candidate.startswith("```json"):
+            candidate = candidate[len("```json") :]
+        if candidate.startswith("```"):
+            candidate = candidate[len("```") :]
+        if candidate.endswith("```"):
+            candidate = candidate[: -3]
+        candidate = candidate.strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            parsed = _try_parse_json(candidate)
+            if parsed is not None:
+                return parsed
+        if candidate.startswith("[") and candidate.endswith("]"):
+            parsed = _try_parse_json(candidate)
+            if parsed is not None:
+                return parsed
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:

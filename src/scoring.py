@@ -324,7 +324,7 @@ class WebSearchScoreProvider(ScoreProvider):
             "Return JSON only."
         )
         if args and args[0] == "codex" and "exec" not in args:
-            args = ["codex", "exec", "-"]
+            args = ["codex", "exec", "--search", "-"]
         elif args and args[0] == "codex" and "exec" in args and "-" not in args:
             args = args + ["-"]
         return args, prompt
