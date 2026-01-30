@@ -262,6 +262,11 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
                 logger.info("Retrying %s with codex exec (non-interactive)", label)
                 args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
                 return _run_command(label, " ".join(args), payload, timeout_sec)
+            if label == "codex" and _stderr_unknown_argument(result.stderr):
+                logger.info("Retrying %s without unsupported codex flags", label)
+                args = _strip_flag(args, "--search", takes_value=False)
+                args = _strip_flag(args, "--output-schema", takes_value=True)
+                return _run_command(label, " ".join(args), payload, timeout_sec)
         return [], ""
 
     output = _parse_json_output(result.stdout)
@@ -312,6 +317,11 @@ def _stderr_has_unknown_json(stderr: str) -> bool:
 def _stderr_needs_tty(stderr: str) -> bool:
     lowered = (stderr or "").lower()
     return "stdin is not a terminal" in lowered
+
+
+def _stderr_unknown_argument(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return "unexpected argument" in lowered
 
 
 def _parse_json_output(text: str) -> Optional[object]:
@@ -380,6 +390,23 @@ def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[
     if start == -1 or end == -1 or end <= start:
         return None
     return text[start : end + 1].strip()
+
+
+def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
+    if flag not in args:
+        return args
+    cleaned: List[str] = []
+    skip_next = False
+    for idx, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == flag:
+            if takes_value:
+                skip_next = True
+            continue
+        cleaned.append(arg)
+    return cleaned
 
 
 def _extract_output(output: object) -> Tuple[List[dict], str]:

@@ -295,6 +295,10 @@ class WebSearchScoreProvider(ScoreProvider):
                 if label == "codex" and self._stderr_needs_tty(result.stderr):
                     logger.info("Retrying %s with codex exec (non-interactive)", label)
                     return self._run_command(label, "codex exec -", payload)
+                if label == "codex" and self._stderr_unknown_argument(result.stderr):
+                    logger.info("Retrying %s without unsupported codex flags", label)
+                    stripped = self._strip_flag(args, "--search", takes_value=False)
+                    return self._run_command(label, " ".join(stripped), payload)
             return {}
 
         try:
@@ -333,6 +337,28 @@ class WebSearchScoreProvider(ScoreProvider):
     def _stderr_needs_tty(stderr: str) -> bool:
         lowered = (stderr or "").lower()
         return "stdin is not a terminal" in lowered
+
+    @staticmethod
+    def _stderr_unknown_argument(stderr: str) -> bool:
+        lowered = (stderr or "").lower()
+        return "unexpected argument" in lowered
+
+    @staticmethod
+    def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
+        if flag not in args:
+            return args
+        cleaned: List[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == flag:
+                if takes_value:
+                    skip_next = True
+                continue
+            cleaned.append(arg)
+        return cleaned
 
     def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
         if not self.commands:
