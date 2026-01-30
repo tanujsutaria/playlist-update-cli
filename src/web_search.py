@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -641,11 +642,24 @@ def run_deep_search(
             requested_metrics.append("monthly_listeners")
     if constraints.get("similarity_requested") and "similarity" not in requested_metrics:
         requested_metrics.append("similarity")
+    logger.info(
+        "Deep search started (expanded=%s, limit=%s).",
+        "yes" if expanded else "no",
+        resolved_limit,
+    )
+    logger.info("Query: %s", query)
+    logger.info("Using providers: %s", ", ".join(selected.keys()))
+    logger.info("Each provider may take up to %ss.", timeout_sec)
     payload = build_search_payload(query, resolved_limit, requested_metrics, constraints, expanded)
     provider_results: Dict[str, List[dict]] = {}
     provider_summaries: Dict[str, str] = {}
+    started_at = time.monotonic()
     for label, command in selected.items():
+        logger.info("Searching with %s...", label)
+        provider_start = time.monotonic()
         results, summary = _run_command(label, command, payload, timeout_sec)
+        elapsed = time.monotonic() - provider_start
+        logger.info("%s returned %s results in %.1fs.", label, len(results), elapsed)
         if results:
             provider_results[label] = results
         if summary:
@@ -654,7 +668,10 @@ def run_deep_search(
     if not provider_results:
         return [], {}, [], "No results returned by providers.", requested_metrics, "", constraints, build_source_policy(expanded)
 
+    logger.info("Synthesizing results across providers...")
     combined = synthesize_results(provider_results, resolved_limit)
+    total_elapsed = time.monotonic() - started_at
+    logger.info("Deep search complete (%s results, %.1fs).", len(combined), total_elapsed)
     providers = list(provider_results.keys())
     summary = synthesize_summary(provider_summaries, query)
     return combined, provider_results, providers, None, requested_metrics, summary, constraints, build_source_policy(expanded)

@@ -148,7 +148,7 @@ with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
 OpenAI API wrapper (recommended for Codex search):
 ```bash
 export WEB_SEARCH_CODEX_CMD="python -m src.openai_web_search_wrapper"
-export WEB_SEARCH_MODEL="gpt-4o"
+export WEB_SEARCH_MODEL="o3-deep-research"  # alt: o4-mini-deep-research
 export WEB_SEARCH_TOOL_CHOICE="required"  # optional: auto|required|none
 export WEB_SEARCH_TOOL="web_search"        # optional: web_search|web_search_preview
 ```
