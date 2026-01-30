@@ -1,102 +1,123 @@
-# Spotify Playlist Manager
+# Spotify Playlist Manager (tunr)
 
-A Python script to manage Spotify playlists through the command line, featuring intelligent song rotation and similarity-based recommendations.
+Interactive CLI for Spotify playlist management with rotation, similarity, history tracking, and deep search.
 
 ## Features
-- Import songs from CSV files into local database
-- Automatically rotate songs in playlists using smart selection
-- Find similar songs using AI-powered embeddings
-- Match-score candidates using local embeddings, Spotify audio features, and optional web search
-- View detailed playlist and rotation statistics
-- Sync entire song database to a playlist
-- Track playlist history and rotation progress
-- Backup and restore your `data/` directory
+- Full-screen Textual UI with slash commands
+- Import songs into a local database
+- Rotate playlists using smart selection and similarity scoring
+- Deep search for new songs via Claude/Codex and validate on Spotify
+- Obscurity and similarity validation for search results
+- Playlist history, stats, backups, and restores
 
 ## Setup
 
+1. Create a Spotify Developer app at https://developer.spotify.com/dashboard
 
-1. Create a Spotify Developer account and register your application at https://developer.spotify.com/dashboard
-
-2. Set up environment variables in `config/.env`:
+2. Create `config/.env` with required keys:
    ```
    SPOTIFY_CLIENT_ID=your_client_id
    SPOTIFY_CLIENT_SECRET=your_client_secret
    SPOTIFY_REDIRECT_URI=your_redirect_uri
+   ```
+   Optional for /search:
+   ```
+   ANTHROPIC_API_KEY=your_anthropic_key
+   OPENAI_API_KEY=your_openai_key
    ```
 
 3. Install dependencies:
    ```bash
    # Using uv (recommended)
    uv pip sync
-   
+
    # Or using pip
    pip install -e .
    ```
 
-4. Run initial setup:
+4. Install the `tunr` command:
    ```bash
-   python src/setup.py
+   uv pip install -e .
    ```
+
+5. Launch the app:
+   ```bash
+   tunr
+   ```
+   You can also run `python src/main.py` with no arguments.
+
+## First-time setup
+- On launch, `tunr` auto-detects keys in your environment.
+- If any Spotify keys are missing, the app enters setup mode.
+- Use `/setup` to see instructions and `/env` to confirm detected keys.
+- `/help` is available on demand and is not shown automatically.
 
 ## Usage
 
-### Output Styling
-The CLI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
+### Output styling
+The UI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 
-### Import Songs
-Import songs from a file (supports both .txt and .csv formats):
+### Search (deep web search)
 ```bash
-python src/main.py import songs.csv
-# or
-python src/main.py import songs.txt
+/search "late night jazz with soft vocals"
+```
+After results are shown, confirm whether to add them to the database and/or create a playlist.
+
+To broaden the last search (expanded source policy):
+```bash
+/expand
 ```
 
-### Backup and Restore
-
-Quickly backup the existing `data/` folder to a `backups/` folder at the same level as `src/`:
-
+### Playlist operations
 ```bash
-python src/main.py backup
-# Optionally specify a name
-python src/main.py backup my_backup_name
+/update "My Playlist" --count 10 --fresh-days 30
+/update "My Playlist" --score-strategy web --query "late night jazz"
+/update "My Playlist" --score-strategy hybrid --query "uplifting synth pop"
+/view "My Playlist"
+/stats --playlist "My Playlist"
+/sync "My Playlist"
+/extract "My Playlist" --output songs.csv
+/plan "My Playlist" --count 10 --fresh-days 30 --generations 3
+/diff "My Playlist" --count 10 --fresh-days 30
 ```
 
-To restore from a backup:
+### Import songs
 ```bash
-python src/main.py restore my_backup_name
+/import songs.csv
+/import songs.txt
 ```
 
-### Restore Previous Rotation
-
-Restore a playlist to a previous rotation:
+### Backup and restore
 ```bash
-python src/main.py restore-previous-rotation playlist_name -1
-```
-Where `-1` means go back one generation, `-2` means go back two generations, etc.
-
-For example:
-```bash
-python src/main.py restore-previous-rotation MyPlaylist -5
-```
-This will attempt to restore 5 generations prior. If the offset is out of range, you'll see an error message.
-
-### List Rotations
-
-List rotations for a given playlist, along with each rotation's songs:
-```bash
-python src/main.py list-rotations "My Daily Mix"
+/backup
+/backup my_backup_name
+/restore my_backup_name
+/list-backups
 ```
 
-By default, this shows the last 3 generations. Use `--generations` (or `-g`) to customize:
+### Rotation history
 ```bash
-# Show last 5 generations
-python src/main.py list-rotations "My Daily Mix" --generations 5
-
-# Show all generations
-python src/main.py list-rotations "My Daily Mix" -g all
+/restore-previous-rotation "My Playlist" -1
+/restore-previous-rotation "My Playlist" -5
+/list-rotations "My Playlist" --generations 5
+/list-rotations "My Playlist" -g all
 ```
 
-## Input File Format
+### Auth and maintenance
+```bash
+/auth-status
+/auth-refresh
+/clean
+/clean --dry-run
+```
+
+### Help and exit
+```bash
+/help
+/quit
+```
+
+## Input file format
 Songs should be in a text file (.txt or .csv) with the following format:
 ```
 song_name,artist_name
@@ -113,106 +134,36 @@ Dancing Queen,ABBA
 Bohemian Rhapsody,Queen
 ```
 
-### Update Playlist
-Update a playlist with new songs using smart rotation:
-```bash
-python src/main.py update playlist_name --count 10 --fresh-days 30
-```
-Preview the selection without updating Spotify:
-```bash
-python src/main.py update playlist_name --count 10 --fresh-days 30 --dry-run
-```
-Choose a scoring strategy and provide an optional theme query:
-```bash
-python src/main.py update playlist_name --score-strategy local
-python src/main.py update playlist_name --score-strategy web --query "late night jazz"
-python src/main.py update playlist_name --score-strategy hybrid --query "uplifting synth pop"
-```
+## Deep search providers
+The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
+- `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
+- `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude --json` / `codex --json`)
 
-### View Playlist
-View current contents of a playlist:
-```bash
-python src/main.py view playlist_name
-```
+You can also set a generic command for search via `WEB_SEARCH_CMD`.
 
-### View Statistics
-View detailed statistics about the database and optionally a specific playlist:
-```bash
-python src/main.py stats
-# or for a specific playlist
-python src/main.py stats --playlist playlist_name
-```
-Export stats to a file:
-```bash
-python src/main.py stats --export json --output stats.json
-python src/main.py stats --export csv
-```
+## Validation rules for /search
+- If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
+  results must include a `monthly_listeners` metric or they will be skipped.
+- Set `OBSCURITY_VALIDATION_MODE=followers` to approximate monthly listeners using Spotify follower counts.
+- If your query implies similarity (for example, "like Royel Otis"), the workflow expects a `similarity` metric.
+  Control the minimum similarity with `SEARCH_SIMILARITY_MIN` (default: 0.55).
+- Audio similarity validation uses Spotify audio features as an additional filter when similarity is requested.
+  Control the minimum with `SEARCH_AUDIO_SIMILARITY_MIN` and the mode with `SEARCH_AUDIO_SIMILARITY_MODE`
+  (`strict` or `soft`).
 
-### Sync Playlist
-Sync the entire song database to a playlist:
-```bash
-python src/main.py sync playlist_name
-```
-
-### Extract Playlist Contents
-Extract playlist contents to a CSV file:
-```bash
-python src/main.py extract playlist_name
-# or specify output file
-python src/main.py extract playlist_name --output songs.csv
-```
-
-### Plan Future Rotations
-Preview the next N generations without updating Spotify:
-```bash
-python src/main.py plan playlist_name --count 10 --fresh-days 30 --generations 3
-```
-Include scoring options for planning:
-```bash
-python src/main.py plan playlist_name --score-strategy hybrid --query "moody indie"
-```
-
-### Show Playlist Diff
-Compare the next update against the current playlist contents:
-```bash
-python src/main.py diff playlist_name --count 10 --fresh-days 30
-```
-Include scoring options for diff:
-```bash
-python src/main.py diff playlist_name --score-strategy web --query "coffeehouse folk"
-```
-
-### Match Scoring (Web + Hybrid)
-The web and hybrid strategies can call external Claude/Codex commands to score candidates using web search.
-Provide one or more commands via environment variables:
+## Match scoring (web + hybrid)
+The web and hybrid strategies for `/update`, `/plan`, and `/diff` can call external Claude/Codex commands
+for scoring candidates. Provide one or more commands via environment variables:
 ```bash
 export WEB_SCORE_CMD="path/to/your-web-score-wrapper"
 export WEB_SCORE_CLAUDE_CMD="claude --json"
 export WEB_SCORE_CODEX_CMD="codex --json"
 ```
 Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
-to a 0-1 relevance score. For example:
-```json
-{
-  "scores": {
-    "artist|||song": 0.82,
-    "artist2|||song2": 0.63
-  }
-}
-```
-If no web command is configured, the CLI falls back to local scoring.
+(`artist|||song`) to a 0-1 relevance score.
 
-### Spotify Auth Status
-Check cached token status or attempt a refresh:
-```bash
-python src/main.py auth-status
-python src/main.py auth-refresh
-```
+If no web command is configured, the app falls back to local scoring.
 
-### Clean Database
-Clean the database by removing songs that no longer exist in Spotify or whose artists have 1 million or more monthly followers:
-```bash
-python src/main.py clean
-# or do a dry run first
-python src/main.py clean --dry-run
-```
+## Notes
+- The classic CLI entrypoint has been removed. Use `tunr` (interactive UI) instead.

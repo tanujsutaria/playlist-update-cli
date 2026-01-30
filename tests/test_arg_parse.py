@@ -6,7 +6,7 @@ import pytest
 import sys
 from unittest.mock import patch
 
-from arg_parse import setup_parsers, parse_args
+from arg_parse import setup_parsers, parse_args, parse_tokens
 
 
 class TestSetupParsers:
@@ -24,7 +24,8 @@ class TestSetupParsers:
         expected_commands = [
             'import', 'update', 'stats', 'view', 'sync', 'extract',
             'clean', 'backup', 'restore', 'restore-previous-rotation',
-            'list-rotations', 'list-backups'
+            'list-rotations', 'list-backups', 'plan', 'diff',
+            'auth-status', 'auth-refresh', 'search', 'interactive'
         ]
 
         # Get subparsers
@@ -345,6 +346,22 @@ class TestDiffCommand:
         assert args.query == 'sunny acoustic'
 
 
+class TestSearchCommand:
+    """Tests for search command parsing"""
+
+    def test_parse_search_basic(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['search', 'late', 'night', 'jazz'])
+
+        assert args.command == 'search'
+        assert args.query == ['late', 'night', 'jazz']
+
+    def test_parse_search_requires_query(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(['search'])
+
+
 class TestParseArgsFunction:
     """Tests for the parse_args function"""
 
@@ -365,6 +382,25 @@ class TestParseArgsFunction:
 
             assert command is None
             assert args is None
+
+
+class TestParseTokensFunction:
+    """Tests for interactive token parsing"""
+
+    def test_parse_tokens_valid(self):
+        command, args, error = parse_tokens(['stats'])
+        assert command == 'stats'
+        assert error is None
+
+    def test_parse_tokens_missing_required(self):
+        command, args, error = parse_tokens(['update'])
+        assert command is None
+        assert error is not None
+
+    def test_parse_tokens_empty(self):
+        command, args, error = parse_tokens([])
+        assert command is None
+        assert error is not None
 
 
 if __name__ == "__main__":

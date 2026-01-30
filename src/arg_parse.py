@@ -1,9 +1,13 @@
 import argparse
-from typing import Tuple, Any
+import inspect
+from typing import Tuple, Any, Optional
 
-def setup_parsers() -> argparse.ArgumentParser:
+def setup_parsers(exit_on_error: bool = True) -> argparse.ArgumentParser:
     """Create and configure argument parser"""
-    parser = argparse.ArgumentParser(description="Spotify Playlist Manager CLI")
+    parser_kwargs = {"description": "Spotify Playlist Manager CLI"}
+    if "exit_on_error" in inspect.signature(argparse.ArgumentParser).parameters:
+        parser_kwargs["exit_on_error"] = exit_on_error
+    parser = argparse.ArgumentParser(**parser_kwargs)
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
     # Import command
@@ -71,6 +75,10 @@ def setup_parsers() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser('clean', help='Clean database by removing songs that no longer exist in Spotify')
     clean_parser.add_argument('--dry-run', action='store_true', help='Show what would be removed without actually removing')
 
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Deep web search for new songs')
+    search_parser.add_argument('query', nargs='+', help='Search criteria (freeform)')
+
     # Backup command
     backup_parser = subparsers.add_parser('backup', help='Backup the data directory')
     backup_parser.add_argument('backup_name', nargs='?', default=None, 
@@ -102,6 +110,9 @@ def setup_parsers() -> argparse.ArgumentParser:
     subparsers.add_parser('auth-status', help='Show Spotify auth token status')
     subparsers.add_parser('auth-refresh', help='Refresh Spotify auth token if possible')
 
+    # Interactive UI
+    subparsers.add_parser('interactive', help='Launch the interactive UI')
+
     return parser
 
 def parse_args() -> Tuple[str, Any]:
@@ -114,3 +125,21 @@ def parse_args() -> Tuple[str, Any]:
         return None, None
         
     return args.command, args 
+
+
+def parse_tokens(tokens: list[str]) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Parse tokens for interactive /command input."""
+    parser = setup_parsers(exit_on_error=False)
+    if not tokens:
+        return None, None, "No command provided."
+    try:
+        args = parser.parse_args(tokens)
+    except argparse.ArgumentError as exc:
+        return None, None, str(exc)
+    except SystemExit:
+        return None, None, "Invalid command."
+
+    if not getattr(args, "command", None):
+        return None, None, "No command provided."
+
+    return args.command, args, None

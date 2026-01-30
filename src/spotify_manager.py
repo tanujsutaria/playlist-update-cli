@@ -191,6 +191,29 @@ class SpotifyManager:
             logger.error(f"Error searching for song {song_name}: {str(e)}")
             return None
 
+    def get_artist_top_tracks(self, artist_name: str, limit: int = 3, market: str = "US") -> List[Dict]:
+        """Fetch top tracks for an artist by name."""
+        try:
+            results = self.sp.search(f"artist:{artist_name}", type='artist', limit=1)
+            items = results.get("artists", {}).get("items", [])
+            if not items:
+                logger.warning(f"No artist found for '{artist_name}'")
+                return []
+            artist_id = items[0]["id"]
+            tracks = self.sp.artist_top_tracks(artist_id, country=market).get("tracks", [])
+            top_tracks = []
+            for track in tracks[:limit]:
+                artist = track["artists"][0]["name"] if track.get("artists") else artist_name
+                top_tracks.append({
+                    "name": track["name"],
+                    "artist": artist,
+                    "uri": track.get("uri"),
+                })
+            return top_tracks
+        except Exception as e:
+            logger.error(f"Error fetching top tracks for {artist_name}: {str(e)}")
+            return []
+
     def get_playlist_tracks(self, name: str) -> List[Dict]:
         """Get all tracks in a playlist with their metadata"""
         if name not in self.playlists:

@@ -1,15 +1,21 @@
 import logging
+import sys
+import os
+import re
+from pathlib import Path
+
+SRC_DIR = Path(__file__).resolve().parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 import json
 import csv
 import shutil
-from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union, Tuple
 
 from rich.logging import RichHandler
 
-from arg_parse import parse_args
 from models import Song
 from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
@@ -17,13 +23,16 @@ from rotation_manager import RotationManager
 from scoring import ScoreConfig
 from ui import console, section, subsection, table, key_value_table, info, warning
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[
-        RichHandler(
+logger = logging.getLogger(__name__)
+
+def configure_logging(handler: Optional[logging.Handler] = None) -> None:
+    """Configure logging for CLI or interactive UI."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers = []
+
+    if handler is None:
+        handler = RichHandler(
             console=console,
             show_time=True,
             show_level=True,
@@ -31,9 +40,7 @@ logging.basicConfig(
             rich_tracebacks=True,
             markup=False,
         )
-    ],
-)
-logger = logging.getLogger(__name__)
+    root_logger.addHandler(handler)
 
 class PlaylistCLI:
     def __init__(self):
@@ -45,6 +52,13 @@ class PlaylistCLI:
         self._db = None
         self._spotify = None
         self._rotation_managers = {}
+        self.last_search_results = None
+        self.last_search_query = None
+        self.last_search_summary = None
+        self.last_search_metrics = None
+        self.last_search_constraints = None
+        self.last_search_expanded = False
+        self.last_search_policy = None
 
     @property
     def db(self) -> DatabaseManager:
@@ -852,6 +866,441 @@ class PlaylistCLI:
             logger.error(f"Error cleaning database: {str(e)}")
             logger.debug("Full error:", exc_info=True)
 
+    def search_songs(
+        self,
+        query: Union[List[str], str],
+        expanded: bool = False,
+    ):
+        """Deep web search for new songs based on criteria."""
+        from web_search import run_deep_search
+
+        query_text = " ".join(query) if isinstance(query, list) else str(query)
+        section("Deep Search", query_text)
+        results, _, providers, error, requested_metrics, summary, constraints, source_policy = run_deep_search(
+            query=query_text,
+            expanded=expanded,
+        )
+        if error:
+            warning(error)
+            self.last_search_results = None
+            return
+
+        info(f"Providers: {', '.join(providers)}")
+        if summary:
+            info(summary)
+        if constraints.get("max_monthly_listeners"):
+            info(f"Constraint: monthly listeners <= {constraints['max_monthly_listeners']:,}")
+        if constraints.get("min_monthly_listeners"):
+            info(f"Constraint: monthly listeners >= {constraints['min_monthly_listeners']:,}")
+        info(
+            f"Source policy: {source_policy.get('path', 'hybrid')} "
+            f"(expanded={'yes' if source_policy.get('expanded') else 'no'})"
+        )
+        info(
+            "Validation defaults: "
+            f"obscurity={self._obscurity_mode()} "
+            f"(fallback={'followers' if self._obscurity_mode() == 'followers' else 'none'}), "
+            f"similarity_web>={self._similarity_min():.2f}, "
+            f"similarity_audio>={self._audio_similarity_min():.2f} "
+            f"({self._audio_similarity_mode()})"
+        )
+
+        if not results:
+            info("No results returned.")
+            self.last_search_results = None
+            return
+
+        rows = []
+        metric_columns = requested_metrics or []
+        if constraints.get("max_monthly_listeners") and "monthly_listeners" not in metric_columns:
+            metric_columns.append("monthly_listeners")
+        if constraints.get("min_monthly_listeners") and "monthly_listeners" not in metric_columns:
+            metric_columns.append("monthly_listeners")
+        metric_headers = [metric.replace("_", " ").title() for metric in metric_columns]
+        for idx, item in enumerate(results, 1):
+            sources = item.get("sources") or []
+            sources_preview = ", ".join(sources[:2])
+            if len(sources) > 2:
+                sources_preview += " ..."
+            metrics = item.get("metrics") or {}
+            metric_values = [str(metrics.get(metric, "")) for metric in metric_columns]
+            rows.append([
+                idx,
+                item.get("song", ""),
+                item.get("artist", ""),
+                item.get("year", "") or "-",
+                *metric_values,
+                ", ".join(item.get("providers", [])),
+                item.get("why", ""),
+                sources_preview,
+            ])
+
+        headers = ["#", "Song", "Artist", "Year", *metric_headers, "Providers", "Why", "Sources"]
+        table(headers, rows)
+        self.last_search_results = results
+        self.last_search_query = query_text
+        self.last_search_summary = summary
+        self.last_search_metrics = requested_metrics
+        self.last_search_constraints = constraints
+        self.last_search_expanded = expanded
+        self.last_search_policy = source_policy
+
+    def build_songs_from_search_results(self, results: List[Dict]) -> List[Song]:
+        songs: List[Song] = []
+        seen = set()
+        for item in results:
+            song = self._song_from_result(item)
+            if not song:
+                continue
+            if song.id in seen:
+                continue
+            seen.add(song.id)
+            songs.append(song)
+        return songs
+
+    def _parse_metric_number(self, value: object) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().lower().replace(",", "")
+        multiplier = 1
+        if text.endswith("k"):
+            multiplier = 1000
+            text = text[:-1]
+        elif text.endswith("m"):
+            multiplier = 1000000
+            text = text[:-1]
+        try:
+            return float(text) * multiplier
+        except ValueError:
+            return None
+
+    def _obscurity_mode(self) -> str:
+        mode = (os.getenv("OBSCURITY_VALIDATION_MODE") or "strict").lower()
+        if mode not in {"strict", "followers"}:
+            return "strict"
+        return mode
+
+    def _similarity_min(self) -> float:
+        value = os.getenv("SEARCH_SIMILARITY_MIN", "0.55")
+        try:
+            return float(value)
+        except ValueError:
+            return 0.55
+
+    def _audio_similarity_min(self) -> float:
+        value = os.getenv("SEARCH_AUDIO_SIMILARITY_MIN", os.getenv("SEARCH_SIMILARITY_MIN", "0.55"))
+        try:
+            return float(value)
+        except ValueError:
+            return 0.55
+
+    def _audio_similarity_mode(self) -> str:
+        mode = (os.getenv("SEARCH_AUDIO_SIMILARITY_MODE") or "strict").lower()
+        if mode not in {"strict", "soft"}:
+            return "strict"
+        return mode
+
+    def _extract_seed_artists(self, query: str) -> List[str]:
+        if not query:
+            return []
+        patterns = [
+            r"like\s+([^,;]+)",
+            r"similar to\s+([^,;]+)",
+            r"in the style of\s+([^,;]+)",
+            r"in the vein of\s+([^,;]+)",
+        ]
+        seeds: List[str] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+                segment = match.group(1)
+                segment = re.split(
+                    r"\b(with|under|over|below|above|less than|more than|at least|at most|featuring|feat\.?|ft\.?|that|but|for)\b",
+                    segment,
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0]
+                parts = re.split(r",| and ", segment)
+                for part in parts:
+                    name = part.strip()
+                    if name:
+                        seeds.append(name)
+        deduped = []
+        seen = set()
+        for name in seeds:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(name)
+        return deduped
+
+    def _seed_songs_from_query(self, query: str) -> List[Song]:
+        artists = self._extract_seed_artists(query)
+        if not artists:
+            return []
+        seeds: List[Song] = []
+        for artist_name in artists:
+            top_tracks = self.spotify.get_artist_top_tracks(artist_name, limit=3)
+            for track in top_tracks:
+                name = track.get("name")
+                artist = track.get("artist") or artist_name
+                uri = track.get("uri")
+                if not name or not artist:
+                    continue
+                song = Song(
+                    id=f"{artist.lower()}|||{name.lower()}",
+                    name=name.lower(),
+                    artist=artist.lower(),
+                    spotify_uri=uri,
+                    first_added=datetime.now(),
+                )
+                seeds.append(song)
+        return seeds
+
+    def _audio_similarity_scores(self, candidates: List[Song], seeds: List[Song]) -> Dict[str, float]:
+        if not candidates or not seeds:
+            return {}
+        try:
+            from scoring import SpotifyAudioFeaturesProvider, PlaylistProfile
+        except Exception as exc:
+            logger.warning("Audio similarity unavailable: %s", exc)
+            return {}
+
+        provider = SpotifyAudioFeaturesProvider(self.spotify)
+        profile = PlaylistProfile(
+            playlist_name="search",
+            query=self.last_search_query,
+            seed_songs=seeds,
+            seed_text="; ".join([f"{s.name} by {s.artist}" for s in seeds[:10]]),
+        )
+        return provider.score_candidates(candidates, profile)
+
+    def _resolve_search_results(self, results: List[Dict]) -> Tuple[List[Song], Dict[str, int]]:
+        """Resolve search results into Spotify-validated Song objects."""
+        try:
+            spotify = self.spotify
+        except Exception as e:
+            logger.error(f"Failed to initialize Spotify for validation: {str(e)}")
+            return [], {"error": len(results) if results else 0}
+
+        constraints = self.last_search_constraints or {}
+        max_listeners = constraints.get("max_monthly_listeners")
+        min_listeners = constraints.get("min_monthly_listeners")
+        similarity_required = bool(constraints.get("similarity_requested"))
+        similarity_min = self._similarity_min() if similarity_required else None
+        audio_similarity_min = self._audio_similarity_min() if similarity_required else None
+        audio_similarity_mode = self._audio_similarity_mode() if similarity_required else "strict"
+        obscurity_mode = self._obscurity_mode()
+
+        stats = {
+            "total": 0,
+            "validated": 0,
+            "not_found": 0,
+            "popular_artist": 0,
+            "obscurity_failed": 0,
+            "obscurity_unverified": 0,
+            "similarity_failed": 0,
+            "similarity_unverified": 0,
+            "error": 0,
+        }
+        validated: List[Song] = []
+        seen = set()
+
+        for item in results:
+            stats["total"] += 1
+            metrics = item.get("metrics") or {}
+            song = self._song_from_result(item)
+            if not song:
+                stats["error"] += 1
+                continue
+            if song.id in seen:
+                continue
+            seen.add(song.id)
+
+            similarity_value = self._parse_metric_number(metrics.get("similarity"))
+            if similarity_required:
+                if similarity_value is None:
+                    stats["similarity_unverified"] += 1
+                    continue
+                if similarity_value > 1 and similarity_value <= 100:
+                    similarity_value = similarity_value / 100.0
+                if similarity_min is not None and float(similarity_value) < similarity_min:
+                    stats["similarity_failed"] += 1
+                    continue
+
+            monthly_listeners = self._parse_metric_number(metrics.get("monthly_listeners"))
+            pending_obscurity_proxy = False
+            if max_listeners or min_listeners:
+                if monthly_listeners is not None:
+                    if max_listeners and monthly_listeners > max_listeners:
+                        stats["obscurity_failed"] += 1
+                        continue
+                    if min_listeners and monthly_listeners < min_listeners:
+                        stats["obscurity_failed"] += 1
+                        continue
+                else:
+                    if obscurity_mode == "strict":
+                        stats["obscurity_unverified"] += 1
+                        continue
+                    pending_obscurity_proxy = True
+
+            try:
+                query = f"track:{song.name} artist:{song.artist}"
+                search_results = spotify.sp.search(query, type='track', limit=1)
+                if not search_results['tracks']['items']:
+                    stats["not_found"] += 1
+                    continue
+
+                track = search_results['tracks']['items'][0]
+                song.spotify_uri = track['uri']
+
+                artist_id = track['artists'][0]['id']
+                artist_info = spotify.sp.artist(artist_id)
+                follower_count = artist_info['followers']['total']
+
+                if pending_obscurity_proxy:
+                    if max_listeners and follower_count > max_listeners:
+                        stats["obscurity_failed"] += 1
+                        continue
+                    if min_listeners and follower_count < min_listeners:
+                        stats["obscurity_failed"] += 1
+                        continue
+
+                if follower_count >= 1000000:
+                    stats["popular_artist"] += 1
+                    continue
+
+                validated.append(song)
+                stats["validated"] += 1
+            except Exception as e:
+                logger.warning(f"Error processing {song.name} by {song.artist}: {str(e)}")
+                stats["error"] += 1
+
+        if similarity_required and validated:
+            seed_songs = self._seed_songs_from_query(self.last_search_query or "")
+            if not seed_songs:
+                logger.warning("No seed artists found for audio similarity validation.")
+            audio_scores = self._audio_similarity_scores(validated, seed_songs) if seed_songs else {}
+
+            filtered: List[Song] = []
+            for song in validated:
+                score = audio_scores.get(song.id)
+                if score is None:
+                    stats["similarity_unverified"] += 1
+                    if audio_similarity_mode == "strict":
+                        continue
+                    filtered.append(song)
+                    continue
+                if audio_similarity_min is not None and score < audio_similarity_min:
+                    stats["similarity_failed"] += 1
+                    continue
+                filtered.append(song)
+
+            stats["validated"] = len(filtered)
+            validated = filtered
+
+        return validated, stats
+
+    def add_search_results_to_db(self, results: List[Dict]) -> List[Song]:
+        """Add search results to the database after Spotify validation."""
+        validated, validation_stats = self._resolve_search_results(results)
+        stats = {
+            "total": validation_stats.get("total", 0),
+            "validated": validation_stats.get("validated", 0),
+            "added": 0,
+            "already_exists": 0,
+            "not_found": validation_stats.get("not_found", 0),
+            "popular_artist": validation_stats.get("popular_artist", 0),
+            "obscurity_failed": validation_stats.get("obscurity_failed", 0),
+            "obscurity_unverified": validation_stats.get("obscurity_unverified", 0),
+            "similarity_failed": validation_stats.get("similarity_failed", 0),
+            "similarity_unverified": validation_stats.get("similarity_unverified", 0),
+            "error": validation_stats.get("error", 0),
+        }
+        added_songs: List[Song] = []
+        for song in validated:
+            existing = self.db.get_song_by_id(song.id)
+            if existing:
+                stats["already_exists"] += 1
+                added_songs.append(existing)
+                continue
+            if self.db.add_song(song):
+                stats["added"] += 1
+                added_songs.append(song)
+            else:
+                stats["already_exists"] += 1
+                existing = self.db.get_song_by_id(song.id)
+                if existing:
+                    added_songs.append(existing)
+
+        self._show_search_validation_summary(stats, title="Search Import Summary")
+        return added_songs
+
+    def resolve_search_results_for_playlist(self, results: List[Dict]) -> List[Song]:
+        songs, validation_stats = self._resolve_search_results(results)
+        summary_stats = {
+            "total": validation_stats.get("total", 0),
+            "validated": validation_stats.get("validated", 0),
+            "not_found": validation_stats.get("not_found", 0),
+            "popular_artist": validation_stats.get("popular_artist", 0),
+            "obscurity_failed": validation_stats.get("obscurity_failed", 0),
+            "obscurity_unverified": validation_stats.get("obscurity_unverified", 0),
+            "similarity_failed": validation_stats.get("similarity_failed", 0),
+            "similarity_unverified": validation_stats.get("similarity_unverified", 0),
+            "error": validation_stats.get("error", 0),
+        }
+        self._show_search_validation_summary(summary_stats, title="Search Validation Summary")
+        return songs
+
+    def create_playlist_from_search_results(self, playlist_name: str, songs: List[Song]) -> bool:
+        """Create or append to a playlist from search results."""
+        if not songs:
+            warning("No songs available to create a playlist.")
+            return False
+        section("Create Playlist", playlist_name)
+        success = self.spotify.append_to_playlist(playlist_name, songs)
+        if success:
+            info(f"Playlist '{playlist_name}' updated with {len(songs)} tracks.")
+        else:
+            warning(f"Failed to update playlist '{playlist_name}'.")
+        return success
+
+    def _show_search_validation_summary(self, stats: Dict[str, int], title: str) -> None:
+        section(title)
+        rows = [["Total results processed", stats.get("total", 0)]]
+        if "validated" in stats:
+            rows.append(["Validated by Spotify", stats.get("validated", 0)])
+        if "added" in stats:
+            rows.append(["Songs added", stats.get("added", 0)])
+        if "already_exists" in stats:
+            rows.append(["Songs already in database", stats.get("already_exists", 0)])
+        rows.extend([
+            ["Songs not found in Spotify", stats.get("not_found", 0)],
+            ["Artists with >=1M followers", stats.get("popular_artist", 0)],
+            ["Obscurity failed", stats.get("obscurity_failed", 0)],
+            ["Obscurity unverified", stats.get("obscurity_unverified", 0)],
+            ["Similarity failed", stats.get("similarity_failed", 0)],
+            ["Similarity unverified", stats.get("similarity_unverified", 0)],
+            ["Errors", stats.get("error", 0)],
+        ])
+        key_value_table(rows)
+
+    def _song_from_result(self, item: Dict) -> Optional[Song]:
+        name = (item.get("song") or item.get("name") or "").strip()
+        artist = (item.get("artist") or "").strip()
+        if not name or not artist:
+            return None
+        name_clean = name.lower()
+        artist_clean = artist.lower()
+        return Song(
+            id=f"{artist_clean}|||{name_clean}",
+            name=name_clean,
+            artist=artist_clean,
+            first_added=datetime.now()
+        )
+
     def plan_playlist(
         self,
         playlist_name: str,
@@ -975,12 +1424,21 @@ class PlaylistCLI:
             logger.info("Token refreshed.")
 
 def main():
-    cli = PlaylistCLI()
-    command, args = parse_args()
-    
-    if not command:
+    if len(sys.argv) > 1:
+        print("Classic CLI has been removed. Use 'tunr' or run without arguments.")
         return 1
 
+    try:
+        from interactive_app import run_interactive
+    except ImportError:
+        print("Interactive mode requires the 'textual' package.")
+        print("Install dependencies and try again.")
+        return 1
+    return run_interactive()
+
+
+def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
+    """Execute a parsed command against the CLI."""
     try:
         if command == 'import':
             cli.import_songs(args.file)
@@ -1023,12 +1481,15 @@ def main():
             )
         elif command == 'clean':
             cli.clean_database(args.dry_run)
+        elif command == 'search':
+            cli.search_songs(
+                args.query
+            )
         elif command == 'backup':
             cli.backup_data(args.backup_name)
         elif command == 'restore':
             cli.restore_data(args.backup_name)
         elif command == 'restore-previous-rotation':
-            # New command handling
             cli.restore_previous_rotation(args.playlist, args.offset)
         elif command == 'list-rotations':
             cli.list_rotations(args.playlist, args.generations)
@@ -1038,6 +1499,9 @@ def main():
             cli.auth_status()
         elif command == 'auth-refresh':
             cli.auth_refresh()
+        else:
+            logger.error(f"Unknown command: {command}")
+            return 1
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
