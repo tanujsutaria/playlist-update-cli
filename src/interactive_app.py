@@ -21,6 +21,8 @@ from textual.widgets import Input, RichLog, Static
 from arg_parse import setup_parsers, parse_tokens
 from main import PlaylistCLI, dispatch_command, configure_logging
 from ui import set_output_sink
+
+logger = logging.getLogger(__name__)
 SPOTIFY_REQUIRED_KEYS = [
     "SPOTIFY_CLIENT_ID",
     "SPOTIFY_CLIENT_SECRET",
@@ -54,6 +56,8 @@ class UILogHandler(logging.Handler):
                 style = "dim"
             text = Text(message, style=style)
             self.app.call_from_thread(self.app.append_log, text)
+            if record.levelno >= logging.ERROR:
+                self.app.call_from_thread(self.app.record_error, message)
         except Exception:
             self.handleError(record)
 
@@ -110,6 +114,7 @@ class PlaylistInteractiveApp(App):
         self._env_status: dict = {}
         self._setup_mode = False
         self._mounted = False
+        self._error_log: List[str] = []
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -190,6 +195,11 @@ class PlaylistInteractiveApp(App):
         log = self.query_one(RichLog)
         log.write(renderable)
 
+    def record_error(self, message: str) -> None:
+        self._error_log.append(message)
+        if len(self._error_log) > 200:
+            self._error_log = self._error_log[-200:]
+
     def _emit_renderable(self, renderable) -> None:
         self.call_from_thread(self.append_log, renderable)
 
@@ -236,6 +246,9 @@ class PlaylistInteractiveApp(App):
         if text in ("env", "keys"):
             self._show_env()
             return
+        if text in ("debug", "errors"):
+            self._show_debug()
+            return
         if text in ("expand", "search-more"):
             self._expand_search()
             return
@@ -280,6 +293,8 @@ class PlaylistInteractiveApp(App):
     def _execute_command(self, command: str, args: object) -> None:
         try:
             dispatch_command(self.cli, command, args)
+        except Exception:
+            logger.exception("Command failed: /%s", command)
         finally:
             self.call_from_thread(self._post_command, command)
 
@@ -305,6 +320,7 @@ class PlaylistInteractiveApp(App):
         table.add_row("/help", "Show this help screen")
         table.add_row("/setup", "Show first-time setup instructions")
         table.add_row("/env", "Show detected environment keys")
+        table.add_row("/debug", "Show recent errors for copy/paste")
         table.add_row("/expand", "Expand the last search")
         table.add_row("/clear", "Clear the output pane")
         table.add_row("/quit", "Exit the app")
@@ -377,6 +393,17 @@ class PlaylistInteractiveApp(App):
             self._update_top_bar()
             if not self._setup_mode:
                 self.append_log(Text("Setup complete. Type /help to continue.", style="green"))
+
+    def _show_debug(self) -> None:
+        if not self._error_log:
+            self.append_log(Text("No errors captured yet.", style="dim"))
+            return
+        text = Text()
+        text.append("Copy/paste the errors below:\n\n", style="bold")
+        for entry in reversed(self._error_log):
+            text.append(entry.rstrip())
+            text.append("\n\n")
+        self.append_log(Panel(text, title="Debug Log", border_style="red"))
 
     def _env_table(self) -> Table:
         table = Table(title="Environment Keys", box=box.SIMPLE, show_header=True, header_style="bold", expand=True)

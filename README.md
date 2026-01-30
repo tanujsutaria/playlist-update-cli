@@ -114,6 +114,7 @@ To broaden the last search (expanded source policy):
 ### Help and exit
 ```bash
 /help
+/debug
 /quit
 ```
 
