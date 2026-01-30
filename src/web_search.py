@@ -50,13 +50,13 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
     if claude_cmd:
         commands["claude"] = claude_cmd
     elif env.get("ANTHROPIC_API_KEY") or env.get("CLAUDE_API_KEY"):
-        commands["claude"] = "claude --json"
+        commands["claude"] = "claude"
 
     codex_cmd = env.get("WEB_SEARCH_CODEX_CMD") or env.get("WEB_SCORE_CODEX_CMD")
     if codex_cmd:
         commands["codex"] = codex_cmd
     elif env.get("OPENAI_API_KEY"):
-        commands["codex"] = "codex --json"
+        commands["codex"] = "codex"
 
     if not commands:
         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
@@ -250,16 +250,74 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
         logger.warning("Search command for %s exited with %s", label, result.returncode)
         if result.stderr:
             logger.warning("%s stderr: %s", label, result.stderr.strip())
+            if "--json" in args and _stderr_has_unknown_json(result.stderr):
+                logger.info("Retrying %s without --json flag", label)
+                args = [arg for arg in args if arg != "--json"]
+                return _run_command(label, " ".join(args), payload, timeout_sec)
         return [], ""
 
-    try:
-        output = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        logger.warning("Search command for %s returned invalid JSON: %s", label, exc)
+    output = _parse_json_output(result.stdout)
+    if output is None:
+        logger.warning("Search command for %s returned invalid JSON.", label)
         return [], ""
 
     results, summary = _extract_output(output)
     return results, summary
+
+
+def _stderr_has_unknown_json(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return "unknown option" in lowered and "--json" in lowered
+
+
+def _parse_json_output(text: str) -> Optional[object]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```json\\s*([\\s\\S]*?)```", text, flags=re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed
+
+    fenced = re.search(r"```\\s*([\\s\\S]*?)```", text)
+    if fenced:
+        candidate = fenced.group(1).strip()
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed
+
+    brace_match = _extract_json_block(text, "{", "}")
+    if brace_match:
+        parsed = _try_parse_json(brace_match)
+        if parsed is not None:
+            return parsed
+
+    bracket_match = _extract_json_block(text, "[", "]")
+    if bracket_match:
+        parsed = _try_parse_json(bracket_match)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def _try_parse_json(candidate: str) -> Optional[object]:
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[str]:
+    start = text.find(open_char)
+    end = text.rfind(close_char)
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1].strip()
 
 
 def _extract_output(output: object) -> Tuple[List[dict], str]:

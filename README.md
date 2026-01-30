@@ -139,9 +139,11 @@ Bohemian Rhapsody,Queen
 The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
 - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
 - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude --json` / `codex --json`)
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex`)
 
 You can also set a generic command for search via `WEB_SEARCH_CMD`.
+If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
+with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
 
 ## Validation rules for /search
 - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
@@ -158,11 +160,12 @@ The web and hybrid strategies for `/update`, `/plan`, and `/diff` can call exter
 for scoring candidates. Provide one or more commands via environment variables:
 ```bash
 export WEB_SCORE_CMD="path/to/your-web-score-wrapper"
-export WEB_SCORE_CLAUDE_CMD="claude --json"
-export WEB_SCORE_CODEX_CMD="codex --json"
+export WEB_SCORE_CLAUDE_CMD="claude"
+export WEB_SCORE_CODEX_CMD="codex"
 ```
 Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
 (`artist|||song`) to a 0-1 relevance score.
+If your CLI supports JSON flags, add them here (for example, `claude --json`).
 
 If no web command is configured, the app falls back to local scoring.
 
