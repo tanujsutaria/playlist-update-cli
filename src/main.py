@@ -910,6 +910,8 @@ class PlaylistCLI:
             self.last_search_results = None
             return
 
+        self._attach_spotify_urls(results)
+
         rows = []
         metric_columns = requested_metrics or []
         if constraints.get("max_monthly_listeners") and "monthly_listeners" not in metric_columns:
@@ -924,6 +926,8 @@ class PlaylistCLI:
                 sources_preview += " ..."
             metrics = item.get("metrics") or {}
             metric_values = [str(metrics.get(metric, "")) for metric in metric_columns]
+            spotify_url = item.get("spotify_url") or ""
+            spotify_display = spotify_url if spotify_url else "Not found"
             rows.append([
                 idx,
                 item.get("song", ""),
@@ -931,11 +935,12 @@ class PlaylistCLI:
                 item.get("year", "") or "-",
                 *metric_values,
                 ", ".join(item.get("providers", [])),
+                spotify_display,
                 item.get("why", ""),
                 sources_preview,
             ])
 
-        headers = ["#", "Song", "Artist", "Year", *metric_headers, "Providers", "Why", "Sources"]
+        headers = ["#", "Song", "Artist", "Year", *metric_headers, "Providers", "Spotify", "Why", "Sources"]
         table(headers, rows)
         self.last_search_results = results
         self.last_search_query = query_text
@@ -975,6 +980,50 @@ class PlaylistCLI:
             return float(text) * multiplier
         except ValueError:
             return None
+
+    def _attach_spotify_urls(self, results: List[Dict]) -> None:
+        if not results:
+            return
+        try:
+            spotify = self.spotify
+        except Exception as e:
+            logger.warning("Spotify validation unavailable: %s", e)
+            return
+        info("Validating Spotify availability...")
+        for item in results:
+            if item.get("spotify_url") or item.get("spotify_uri"):
+                if not item.get("spotify_url") and item.get("spotify_uri"):
+                    item["spotify_url"] = self._spotify_url_from_uri(item.get("spotify_uri"))
+                continue
+            song = self._song_from_result(item)
+            if not song:
+                continue
+            try:
+                query = f"track:{song.name} artist:{song.artist}"
+                search_results = spotify.sp.search(query, type="track", limit=1)
+                items = search_results.get("tracks", {}).get("items", [])
+                if not items:
+                    item["spotify_url"] = ""
+                    continue
+                track = items[0]
+                item["spotify_uri"] = track.get("uri")
+                item["spotify_url"] = track.get("external_urls", {}).get("spotify", "")
+                artists = track.get("artists", [])
+                if artists:
+                    item["spotify_artist_id"] = artists[0].get("id")
+            except Exception as exc:
+                logger.warning("Spotify lookup failed for %s by %s: %s", song.name, song.artist, exc)
+
+    def _spotify_url_from_uri(self, uri: Optional[str]) -> str:
+        if not uri:
+            return ""
+        if uri.startswith("http"):
+            return uri
+        if uri.startswith("spotify:track:"):
+            track_id = uri.split(":")[-1]
+            if track_id:
+                return f"https://open.spotify.com/track/{track_id}"
+        return uri
 
     def _obscurity_mode(self) -> str:
         mode = (os.getenv("OBSCURITY_VALIDATION_MODE") or "strict").lower()
@@ -1086,6 +1135,7 @@ class PlaylistCLI:
             return [], {"error": len(results) if results else 0}
 
         constraints = self.last_search_constraints or {}
+        require_spotify = (os.getenv("SEARCH_SPOTIFY_REQUIRED") or "").strip().lower() in {"1", "true", "yes", "on"}
         max_listeners = constraints.get("max_monthly_listeners")
         min_listeners = constraints.get("min_monthly_listeners")
         similarity_required = bool(constraints.get("similarity_requested"))
@@ -1099,6 +1149,7 @@ class PlaylistCLI:
             "validated": 0,
             "not_found": 0,
             "popular_artist": 0,
+            "spotify_required_failed": 0,
             "obscurity_failed": 0,
             "obscurity_unverified": 0,
             "similarity_failed": 0,
@@ -1118,6 +1169,10 @@ class PlaylistCLI:
             if song.id in seen:
                 continue
             seen.add(song.id)
+
+            if require_spotify and not (item.get("spotify_url") or item.get("spotify_uri")):
+                stats["spotify_required_failed"] += 1
+                continue
 
             similarity_value = self._parse_metric_number(metrics.get("similarity"))
             if similarity_required:
@@ -1147,16 +1202,24 @@ class PlaylistCLI:
                     pending_obscurity_proxy = True
 
             try:
-                query = f"track:{song.name} artist:{song.artist}"
-                search_results = spotify.sp.search(query, type='track', limit=1)
-                if not search_results['tracks']['items']:
-                    stats["not_found"] += 1
-                    continue
+                artist_id = item.get("spotify_artist_id")
+                if item.get("spotify_uri"):
+                    song.spotify_uri = item.get("spotify_uri")
 
-                track = search_results['tracks']['items'][0]
-                song.spotify_uri = track['uri']
+                if not artist_id:
+                    if require_spotify and not (item.get("spotify_url") or item.get("spotify_uri")):
+                        stats["spotify_required_failed"] += 1
+                        continue
+                    query = f"track:{song.name} artist:{song.artist}"
+                    search_results = spotify.sp.search(query, type='track', limit=1)
+                    if not search_results['tracks']['items']:
+                        stats["not_found"] += 1
+                        continue
 
-                artist_id = track['artists'][0]['id']
+                    track = search_results['tracks']['items'][0]
+                    song.spotify_uri = track['uri']
+                    artist_id = track['artists'][0]['id']
+
                 artist_info = spotify.sp.artist(artist_id)
                 follower_count = artist_info['followers']['total']
 
@@ -1272,6 +1335,8 @@ class PlaylistCLI:
         rows = [["Total results processed", stats.get("total", 0)]]
         if "validated" in stats:
             rows.append(["Validated by Spotify", stats.get("validated", 0)])
+        if "spotify_required_failed" in stats:
+            rows.append(["Spotify required (missing URL)", stats.get("spotify_required_failed", 0)])
         if "added" in stats:
             rows.append(["Songs added", stats.get("added", 0)])
         if "already_exists" in stats:

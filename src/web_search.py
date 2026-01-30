@@ -24,7 +24,8 @@ DEFAULT_INSTRUCTIONS = (
     "URLs), and metrics (object) for any user-requested metrics. If the query implies similarity "
     "(e.g., 'like X'), include a 'similarity' metric (0-1). If the query includes monthly listeners "
     "constraints, include a 'monthly_listeners' metric and cite sources. Optionally include a "
-    "score 0-1 indicating fit confidence."
+    "score 0-1 indicating fit confidence. If you can find a Spotify URL, include it as "
+    "'spotify_url'."
 )
 
 KNOWN_METRICS = {
@@ -574,6 +575,8 @@ def _normalize_item(item: object) -> Optional[dict]:
         "sources": [str(s) for s in sources if s],
         "metrics": metrics,
         "score": _safe_float(item.get("score") or item.get("confidence")),
+        "spotify_url": item.get("spotify_url") or item.get("spotify") or "",
+        "spotify_uri": item.get("spotify_uri") or item.get("uri") or "",
     }
 
 

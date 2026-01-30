@@ -168,11 +168,13 @@ export ANTHROPIC_WEB_SEARCH_MODEL_FALLBACKS="claude-opus-4-1,claude-sonnet-4-202
 - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
   results must include a `monthly_listeners` metric or they will be skipped.
 - Set `OBSCURITY_VALIDATION_MODE=followers` to approximate monthly listeners using Spotify follower counts.
+- Set `SEARCH_SPOTIFY_REQUIRED=1` to drop any search results that do not resolve to a Spotify URL.
 - If your query implies similarity (for example, "like Royel Otis"), the workflow expects a `similarity` metric.
   Control the minimum similarity with `SEARCH_SIMILARITY_MIN` (default: 0.55).
 - Audio similarity validation uses Spotify audio features as an additional filter when similarity is requested.
   Control the minimum with `SEARCH_AUDIO_SIMILARITY_MIN` and the mode with `SEARCH_AUDIO_SIMILARITY_MODE`
   (`strict` or `soft`).
+- Search results now include a Spotify URL when a track is found. Entries without a URL are not on Spotify.
 
 ## Match scoring (web + hybrid)
 The web and hybrid strategies for `/update`, `/plan`, and `/diff` can call external Claude/Codex commands
