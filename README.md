@@ -139,12 +139,19 @@ Bohemian Rhapsody,Queen
 The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
 - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
 - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex exec --search --output-schema ...`)
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (uses `claude` and an OpenAI API wrapper)
 
 You can also set a generic command for search via `WEB_SEARCH_CMD`.
 If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
-with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`. If you see
-`stdin is not a terminal`, use `codex exec --search --output-schema ... -`.
+with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
+
+OpenAI API wrapper (recommended for Codex search):
+```bash
+export WEB_SEARCH_CODEX_CMD="python -m src.openai_web_search_wrapper"
+export WEB_SEARCH_MODEL="gpt-4o"
+export WEB_SEARCH_TOOL_CHOICE="required"  # optional: auto|required|none
+export WEB_SEARCH_TOOL="web_search"        # optional: web_search|web_search_preview
+```
 
 ## Validation rules for /search
 - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
@@ -167,6 +174,14 @@ export WEB_SCORE_CODEX_CMD="codex exec --search -"
 Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
 (`artist|||song`) to a 0-1 relevance score.
 If your CLI supports JSON flags, add them here (for example, `claude --json`).
+
+OpenAI API wrapper (recommended for scoring):
+```bash
+export WEB_SCORE_CODEX_CMD="python -m src.openai_web_score_wrapper"
+export WEB_SCORE_MODEL="gpt-4o"
+export WEB_SCORE_TOOL_CHOICE="required"  # optional: auto|required|none
+export WEB_SCORE_TOOL="web_search"       # optional: web_search|web_search_preview
+```
 
 If no web command is configured, the app falls back to local scoring.
 

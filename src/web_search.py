@@ -6,6 +6,8 @@ import os
 import re
 import shlex
 import subprocess
+import sys
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -56,7 +58,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
     if codex_cmd:
         commands["codex"] = codex_cmd
     elif env.get("OPENAI_API_KEY"):
-        commands["codex"] = _default_codex_command()
+        commands["codex"] = _default_openai_web_search_command()
 
     if not commands:
         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
@@ -235,7 +237,8 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
         return [], ""
 
     input_text = json.dumps(payload)
-    if label == "codex":
+    is_codex_cli = label == "codex" and _is_codex_cli(args)
+    if is_codex_cli:
         args, input_text = _prepare_codex_command(args, payload)
 
     try:
@@ -258,11 +261,25 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
                 logger.info("Retrying %s without --json flag", label)
                 args = [arg for arg in args if arg != "--json"]
                 return _run_command(label, " ".join(args), payload, timeout_sec)
-            if label == "codex" and _stderr_needs_tty(result.stderr):
+            if is_codex_cli and _stderr_needs_tty(result.stderr):
                 logger.info("Retrying %s with codex exec (non-interactive)", label)
                 args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
                 return _run_command(label, " ".join(args), payload, timeout_sec)
-            if label == "codex" and _stderr_unknown_argument(result.stderr):
+            if is_codex_cli and _stderr_unknown_argument(result.stderr):
+                flag = _stderr_unknown_argument_flag(result.stderr)
+                if flag:
+                    logger.info("Retrying %s without unsupported flag %s", label, flag)
+                    if flag == "--search" and os.getenv("OPENAI_API_KEY"):
+                        wrapper_cmd = _default_openai_web_search_command()
+                        if wrapper_cmd != command:
+                            logger.info(
+                                "Codex CLI does not support --search; falling back to OpenAI web search wrapper."
+                            )
+                            return _run_command(label, wrapper_cmd, payload, timeout_sec)
+                    args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
+                    if flag == "--search":
+                        logger.warning("Codex CLI does not support --search; running without web search.")
+                    return _run_command(label, " ".join(args), payload, timeout_sec)
                 logger.info("Retrying %s without unsupported codex flags", label)
                 args = _strip_flag(args, "--search", takes_value=False)
                 args = _strip_flag(args, "--output-schema", takes_value=True)
@@ -287,9 +304,20 @@ def _prepare_codex_command(args: List[str], payload: dict) -> Tuple[List[str], s
     return args, prompt
 
 
+def _is_codex_cli(args: List[str]) -> bool:
+    if not args:
+        return False
+    return Path(args[0]).name == "codex"
+
+
 def _default_codex_command() -> str:
     schema = _codex_schema()
     return f'codex exec --search --output-schema {schema} -'
+
+
+def _default_openai_web_search_command() -> str:
+    script_path = Path(__file__).resolve().with_name("openai_web_search_wrapper.py")
+    return shlex.join([sys.executable, str(script_path)])
 
 
 def _codex_schema() -> str:
@@ -322,6 +350,13 @@ def _stderr_needs_tty(stderr: str) -> bool:
 def _stderr_unknown_argument(stderr: str) -> bool:
     lowered = (stderr or "").lower()
     return "unexpected argument" in lowered
+
+
+def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
+    match = re.search(r"unexpected argument '([^']+)'", stderr, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _parse_json_output(text: str) -> Optional[object]:

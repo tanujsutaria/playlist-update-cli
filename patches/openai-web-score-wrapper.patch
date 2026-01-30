@@ -1,0 +1,179 @@
+diff --git a/README.md b/README.md
+index d01eb62..c3bcc06 100644
+--- a/README.md
++++ b/README.md
+@@ -139,12 +139,19 @@ Bohemian Rhapsody,Queen
+ The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
+ - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
+ - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
+-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex exec --search --output-schema ...`)
++- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (uses `claude` and an OpenAI API wrapper)
+ 
+ You can also set a generic command for search via `WEB_SEARCH_CMD`.
+ If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
+-with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`. If you see
+-`stdin is not a terminal`, use `codex exec --search --output-schema ... -`.
++with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
++
++OpenAI API wrapper (recommended for Codex search):
++```bash
++export WEB_SEARCH_CODEX_CMD="python -m src.openai_web_search_wrapper"
++export WEB_SEARCH_MODEL="gpt-4o"
++export WEB_SEARCH_TOOL_CHOICE="required"  # optional: auto|required|none
++export WEB_SEARCH_TOOL="web_search"        # optional: web_search|web_search_preview
++```
+ 
+ ## Validation rules for /search
+ - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
+@@ -168,6 +175,14 @@ Each command should read JSON from stdin and write JSON to stdout with a `scores
+ (`artist|||song`) to a 0-1 relevance score.
+ If your CLI supports JSON flags, add them here (for example, `claude --json`).
+ 
++OpenAI API wrapper (recommended for scoring):
++```bash
++export WEB_SCORE_CODEX_CMD="python -m src.openai_web_score_wrapper"
++export WEB_SCORE_MODEL="gpt-4o"
++export WEB_SCORE_TOOL_CHOICE="required"  # optional: auto|required|none
++export WEB_SCORE_TOOL="web_search"       # optional: web_search|web_search_preview
++```
++
+ If no web command is configured, the app falls back to local scoring.
+ 
+ ## Notes
+diff --git a/pyproject.toml b/pyproject.toml
+index da31f52..cb63cf2 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -16,6 +16,7 @@ dependencies = [
+     "tqdm>=4.65.0",
+     "rich>=13.7.0",
+     "textual>=0.52.1",
++    "openai>=1.40.0",
+     "scikit-learn>=1.3.0",
+     "matplotlib>=3.7.1",
+     "pytest>=7.3.1",
+diff --git a/src/scoring.py b/src/scoring.py
+index 14b8014..3f9a274 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -3,8 +3,11 @@ from __future__ import annotations
+ import json
+ import logging
+ import os
++import re
+ import shlex
+ import subprocess
++import sys
++from pathlib import Path
+ from dataclasses import dataclass
+ from datetime import datetime
+ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+@@ -296,6 +299,11 @@ class WebSearchScoreProvider(ScoreProvider):
+                     logger.info("Retrying %s with codex exec (non-interactive)", label)
+                     return self._run_command(label, "codex exec -", payload)
+                 if label == "codex" and self._stderr_unknown_argument(result.stderr):
++                    flag = self._stderr_unknown_argument_flag(result.stderr)
++                    if flag:
++                        logger.info("Retrying %s without unsupported flag %s", label, flag)
++                        stripped = self._strip_flag(args, flag, takes_value=(flag == "--output-schema"))
++                        return self._run_command(label, " ".join(stripped), payload)
+                     logger.info("Retrying %s without unsupported codex flags", label)
+                     stripped = self._strip_flag(args, "--search", takes_value=False)
+                     return self._run_command(label, " ".join(stripped), payload)
+@@ -343,6 +351,13 @@ class WebSearchScoreProvider(ScoreProvider):
+         lowered = (stderr or "").lower()
+         return "unexpected argument" in lowered
+ 
++    @staticmethod
++    def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
++        match = re.search(r"unexpected argument '([^']+)'", stderr, flags=re.IGNORECASE)
++        if match:
++            return match.group(1)
++        return None
++
+     @staticmethod
+     def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
+         if flag not in args:
+@@ -387,6 +402,11 @@ class WebSearchScoreProvider(ScoreProvider):
+         return {song_id: score / divisor for song_id, score in combined.items()}
+ 
+ 
++def _default_openai_web_score_command() -> str:
++    script_path = Path(__file__).resolve().with_name("openai_web_score_wrapper.py")
++    return shlex.join([sys.executable, str(script_path)])
++
++
+ class ScorePipeline:
+     def __init__(self, providers: Sequence[ScoreProvider], weights: Optional[Dict[str, float]] = None):
+         self.providers = list(providers)
+@@ -490,6 +510,8 @@ class MatchScorer:
+         codex = os.getenv("WEB_SCORE_CODEX_CMD")
+         if codex:
+             commands["codex"] = codex
++        if not commands and os.getenv("OPENAI_API_KEY"):
++            commands["codex"] = _default_openai_web_score_command()
+         return commands
+ 
+     def _providers(self) -> Sequence[ScoreProvider]:
+diff --git a/src/web_search.py b/src/web_search.py
+index 3c67174..c9bd35c 100644
+--- a/src/web_search.py
++++ b/src/web_search.py
+@@ -6,6 +6,8 @@ import os
+ import re
+ import shlex
+ import subprocess
++import sys
++from pathlib import Path
+ from datetime import datetime
+ from typing import Dict, Iterable, List, Optional, Tuple
+ 
+@@ -56,7 +58,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
+     if codex_cmd:
+         commands["codex"] = codex_cmd
+     elif env.get("OPENAI_API_KEY"):
+-        commands["codex"] = _default_codex_command()
++        commands["codex"] = _default_openai_web_search_command()
+ 
+     if not commands:
+         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
+@@ -263,6 +265,13 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
+                 args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
+                 return _run_command(label, " ".join(args), payload, timeout_sec)
+             if label == "codex" and _stderr_unknown_argument(result.stderr):
++                flag = _stderr_unknown_argument_flag(result.stderr)
++                if flag:
++                    logger.info("Retrying %s without unsupported flag %s", label, flag)
++                    args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
++                    if flag == "--search":
++                        logger.warning("Codex CLI does not support --search; running without web search.")
++                    return _run_command(label, " ".join(args), payload, timeout_sec)
+                 logger.info("Retrying %s without unsupported codex flags", label)
+                 args = _strip_flag(args, "--search", takes_value=False)
+                 args = _strip_flag(args, "--output-schema", takes_value=True)
+@@ -292,6 +301,11 @@ def _default_codex_command() -> str:
+     return f'codex exec --search --output-schema {schema} -'
+ 
+ 
++def _default_openai_web_search_command() -> str:
++    script_path = Path(__file__).resolve().with_name("openai_web_search_wrapper.py")
++    return shlex.join([sys.executable, str(script_path)])
++
++
+ def _codex_schema() -> str:
+     return (
+         '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
+@@ -324,6 +338,13 @@ def _stderr_unknown_argument(stderr: str) -> bool:
+     return "unexpected argument" in lowered
+ 
+ 
++def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
++    match = re.search(r"unexpected argument '([^']+)'", stderr, flags=re.IGNORECASE)
++    if match:
++        return match.group(1)
++    return None
++
++
+ def _parse_json_output(text: str) -> Optional[object]:
+     if text:
+         candidate = text.strip()

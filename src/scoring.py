@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import sys
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -273,7 +276,8 @@ class WebSearchScoreProvider(ScoreProvider):
             return {}
 
         input_text = json.dumps(payload)
-        if label == "codex":
+        is_codex_cli = label == "codex" and self._is_codex_cli(args)
+        if is_codex_cli:
             args, input_text = self._prepare_codex_command(args, payload)
 
         try:
@@ -292,10 +296,22 @@ class WebSearchScoreProvider(ScoreProvider):
             logger.warning("Web scoring command for %s exited with %s", label, result.returncode)
             if result.stderr:
                 logger.warning("%s stderr: %s", label, result.stderr.strip())
-                if label == "codex" and self._stderr_needs_tty(result.stderr):
+                if is_codex_cli and self._stderr_needs_tty(result.stderr):
                     logger.info("Retrying %s with codex exec (non-interactive)", label)
                     return self._run_command(label, "codex exec -", payload)
-                if label == "codex" and self._stderr_unknown_argument(result.stderr):
+                if is_codex_cli and self._stderr_unknown_argument(result.stderr):
+                    flag = self._stderr_unknown_argument_flag(result.stderr)
+                    if flag:
+                        logger.info("Retrying %s without unsupported flag %s", label, flag)
+                        if flag == "--search" and os.getenv("OPENAI_API_KEY"):
+                            wrapper_cmd = _default_openai_web_score_command()
+                            if wrapper_cmd != command:
+                                logger.info(
+                                    "Codex CLI does not support --search; falling back to OpenAI web scoring wrapper."
+                                )
+                                return self._run_command(label, wrapper_cmd, payload)
+                        stripped = self._strip_flag(args, flag, takes_value=(flag == "--output-schema"))
+                        return self._run_command(label, " ".join(stripped), payload)
                     logger.info("Retrying %s without unsupported codex flags", label)
                     stripped = self._strip_flag(args, "--search", takes_value=False)
                     return self._run_command(label, " ".join(stripped), payload)
@@ -334,6 +350,12 @@ class WebSearchScoreProvider(ScoreProvider):
         return args, prompt
 
     @staticmethod
+    def _is_codex_cli(args: List[str]) -> bool:
+        if not args:
+            return False
+        return Path(args[0]).name == "codex"
+
+    @staticmethod
     def _stderr_needs_tty(stderr: str) -> bool:
         lowered = (stderr or "").lower()
         return "stdin is not a terminal" in lowered
@@ -342,6 +364,13 @@ class WebSearchScoreProvider(ScoreProvider):
     def _stderr_unknown_argument(stderr: str) -> bool:
         lowered = (stderr or "").lower()
         return "unexpected argument" in lowered
+
+    @staticmethod
+    def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
+        match = re.search(r"unexpected argument '([^']+)'", stderr, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
 
     @staticmethod
     def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
@@ -385,6 +414,11 @@ class WebSearchScoreProvider(ScoreProvider):
 
         divisor = float(len(collected))
         return {song_id: score / divisor for song_id, score in combined.items()}
+
+
+def _default_openai_web_score_command() -> str:
+    script_path = Path(__file__).resolve().with_name("openai_web_score_wrapper.py")
+    return shlex.join([sys.executable, str(script_path)])
 
 
 class ScorePipeline:
@@ -490,6 +524,8 @@ class MatchScorer:
         codex = os.getenv("WEB_SCORE_CODEX_CMD")
         if codex:
             commands["codex"] = codex
+        if not commands and os.getenv("OPENAI_API_KEY"):
+            commands["codex"] = _default_openai_web_score_command()
         return commands
 
     def _providers(self) -> Sequence[ScoreProvider]:
