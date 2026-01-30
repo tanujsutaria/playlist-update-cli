@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -230,7 +231,13 @@ def build_search_payload(
     }
 
 
-def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> Tuple[List[dict], str]:
+def _run_command(
+    label: str,
+    command: str,
+    payload: dict,
+    timeout_sec: int,
+    env_overrides: Optional[dict] = None,
+) -> Tuple[List[dict], str]:
     try:
         args = shlex.split(command)
     except ValueError as exc:
@@ -242,6 +249,10 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
     if is_codex_cli:
         args, input_text = _prepare_codex_command(args, payload)
 
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+
     try:
         result = subprocess.run(
             args,
@@ -249,7 +260,21 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
             text=True,
             capture_output=True,
             timeout=timeout_sec,
+            env=env,
         )
+    except subprocess.TimeoutExpired:
+        logger.warning("Search command for %s timed out after %ss.", label, timeout_sec)
+        fallback_model = env.get("WEB_SEARCH_FALLBACK_MODEL", "").strip()
+        if fallback_model and _is_openai_wrapper_command(command) and not env_overrides:
+            logger.info("Retrying %s with fallback model %s.", label, fallback_model)
+            return _run_command(
+                label,
+                command,
+                payload,
+                timeout_sec,
+                env_overrides={"WEB_SEARCH_MODEL": fallback_model},
+            )
+        return [], ""
     except Exception as exc:
         logger.warning("Search command failed for %s: %s", label, exc)
         return [], ""
@@ -261,11 +286,11 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
             if "--json" in args and _stderr_has_unknown_json(result.stderr):
                 logger.info("Retrying %s without --json flag", label)
                 args = [arg for arg in args if arg != "--json"]
-                return _run_command(label, " ".join(args), payload, timeout_sec)
+                return _run_command(label, " ".join(args), payload, timeout_sec, env_overrides=env_overrides)
             if is_codex_cli and _stderr_needs_tty(result.stderr):
                 logger.info("Retrying %s with codex exec (non-interactive)", label)
                 args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
-                return _run_command(label, " ".join(args), payload, timeout_sec)
+                return _run_command(label, " ".join(args), payload, timeout_sec, env_overrides=env_overrides)
             if is_codex_cli and _stderr_unknown_argument(result.stderr):
                 flag = _stderr_unknown_argument_flag(result.stderr)
                 if flag:
@@ -276,15 +301,15 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
                             logger.info(
                                 "Codex CLI does not support --search; falling back to OpenAI web search wrapper."
                             )
-                            return _run_command(label, wrapper_cmd, payload, timeout_sec)
+                            return _run_command(label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides)
                     args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
                     if flag == "--search":
                         logger.warning("Codex CLI does not support --search; running without web search.")
-                    return _run_command(label, " ".join(args), payload, timeout_sec)
+                    return _run_command(label, " ".join(args), payload, timeout_sec, env_overrides=env_overrides)
                 logger.info("Retrying %s without unsupported codex flags", label)
                 args = _strip_flag(args, "--search", takes_value=False)
                 args = _strip_flag(args, "--output-schema", takes_value=True)
-                return _run_command(label, " ".join(args), payload, timeout_sec)
+                return _run_command(label, " ".join(args), payload, timeout_sec, env_overrides=env_overrides)
         return [], ""
 
     output = _parse_json_output(result.stdout)
@@ -309,6 +334,11 @@ def _is_codex_cli(args: List[str]) -> bool:
     if not args:
         return False
     return Path(args[0]).name == "codex"
+
+
+def _is_openai_wrapper_command(command: str) -> bool:
+    lowered = command.lower()
+    return "openai_web_search_wrapper" in lowered
 
 
 def _default_codex_command() -> str:
@@ -443,6 +473,17 @@ def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
             continue
         cleaned.append(arg)
     return cleaned
+
+
+def _parse_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%s; using %s.", name, raw, default)
+        return default
 
 
 def _extract_output(output: object) -> Tuple[List[dict], str]:
@@ -632,6 +673,17 @@ def run_deep_search(
     if not selected:
         return [], {}, [], "No search providers configured.", [], "", {}, build_source_policy(expanded)
 
+    env_timeout = os.getenv("WEB_SEARCH_TIMEOUT_SEC")
+    if env_timeout:
+        try:
+            timeout_sec = int(env_timeout)
+        except ValueError:
+            logger.warning("Invalid WEB_SEARCH_TIMEOUT_SEC=%s; using default.", env_timeout)
+    else:
+        model_hint = (os.getenv("WEB_SEARCH_MODEL") or "").lower()
+        if "deep" in model_hint and timeout_sec < 1200:
+            timeout_sec = 1200
+
     resolved_limit = limit if limit is not None else extract_limit(query)
     if expanded:
         resolved_limit = min(30, resolved_limit + 5)
@@ -651,30 +703,65 @@ def run_deep_search(
     logger.info("Using providers: %s", ", ".join(selected.keys()))
     logger.info("Each provider may take up to %ss.", timeout_sec)
     payload = build_search_payload(query, resolved_limit, requested_metrics, constraints, expanded)
-    provider_results: Dict[str, List[dict]] = {}
+    provider_results: Dict[str, List[dict]] = {label: [] for label in selected.keys()}
     provider_summaries: Dict[str, str] = {}
     started_at = time.monotonic()
-    for label, command in selected.items():
-        logger.info("Searching with %s...", label)
-        provider_start = time.monotonic()
-        results, summary = _run_command(label, command, payload, timeout_sec)
-        elapsed = time.monotonic() - provider_start
-        logger.info("%s returned %s results in %.1fs.", label, len(results), elapsed)
-        if results:
-            provider_results[label] = results
-        if summary:
-            provider_summaries[label] = summary
 
-    if not provider_results:
+    parallel_per_provider = _parse_env_int("WEB_SEARCH_PARALLEL_PER_PROVIDER", default=5)
+    if parallel_per_provider < 1:
+        parallel_per_provider = 1
+    total_runs = parallel_per_provider * len(selected)
+    if total_runs > 1:
+        logger.info(
+            "Launching %s parallel searches (%s per provider).",
+            total_runs,
+            parallel_per_provider,
+        )
+
+    future_to_meta = {}
+    with ThreadPoolExecutor(max_workers=total_runs) as executor:
+        for label, command in selected.items():
+            logger.info("Submitting %s parallel searches for %s.", parallel_per_provider, label)
+            for idx in range(parallel_per_provider):
+                started = time.monotonic()
+                future = executor.submit(_run_command, label, command, payload, timeout_sec)
+                future_to_meta[future] = (label, idx, started)
+        for future in as_completed(future_to_meta):
+            label, idx, started = future_to_meta[future]
+            try:
+                results, summary = future.result()
+            except Exception as exc:
+                logger.warning("Search run %s-%s failed: %s", label, idx + 1, exc)
+                continue
+            elapsed = time.monotonic() - started
+            logger.info(
+                "%s run %s/%s finished in %.1fs (%s results).",
+                label,
+                idx + 1,
+                parallel_per_provider,
+                elapsed,
+                len(results),
+            )
+            if results:
+                provider_results[label].extend(results)
+            if summary:
+                if label in provider_summaries and summary not in provider_summaries[label]:
+                    provider_summaries[label] = f"{provider_summaries[label]} | {summary}"
+                else:
+                    provider_summaries[label] = summary
+
+    filtered_results = {label: results for label, results in provider_results.items() if results}
+    if not filtered_results:
         return [], {}, [], "No results returned by providers.", requested_metrics, "", constraints, build_source_policy(expanded)
 
     logger.info("Synthesizing results across providers...")
-    combined = synthesize_results(provider_results, resolved_limit)
+    combined = synthesize_results(filtered_results, resolved_limit)
     total_elapsed = time.monotonic() - started_at
     logger.info("Deep search complete (%s results, %.1fs).", len(combined), total_elapsed)
-    providers = list(provider_results.keys())
-    summary = synthesize_summary(provider_summaries, query)
-    return combined, provider_results, providers, None, requested_metrics, summary, constraints, build_source_policy(expanded)
+    providers = list(filtered_results.keys())
+    filtered_summaries = {label: summary for label, summary in provider_summaries.items() if label in filtered_results}
+    summary = synthesize_summary(filtered_summaries, query)
+    return combined, filtered_results, providers, None, requested_metrics, summary, constraints, build_source_policy(expanded)
 
 
 def synthesize_summary(provider_summaries: Dict[str, str], query: str) -> str:

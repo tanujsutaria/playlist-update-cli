@@ -38,7 +38,7 @@ def main() -> int:
         os.getenv("ANTHROPIC_WEB_SEARCH_MODEL")
         or os.getenv("ANTHROPIC_MODEL")
         or os.getenv("WEB_SEARCH_MODEL")
-        or "claude-sonnet-4-20250514"
+        or "claude-opus-4-5"
     )
     tool_type = os.getenv("ANTHROPIC_WEB_SEARCH_TOOL", "web_search_20250305")
     max_uses = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_USES", "5"))
@@ -47,7 +47,7 @@ def main() -> int:
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     response = _run_with_fallbacks(
         client=client,
-        model=model,
+        models=_resolve_model_candidates(model),
         prompt=prompt,
         max_tokens=max_tokens,
         tool_type=tool_type,
@@ -71,7 +71,7 @@ def main() -> int:
 
 def _run_with_fallbacks(
     client: anthropic.Anthropic,
-    model: str,
+    models: List[str],
     prompt: str,
     max_tokens: int,
     tool_type: str,
@@ -86,28 +86,49 @@ def _run_with_fallbacks(
         tool_types.append("web_search")
     tool_types.append(None)
 
-    for candidate in tool_types:
-        try:
-            if candidate:
-                tools = [{"type": candidate, "name": "web_search", "max_uses": max_uses}]
+    for model in models:
+        tool_failed = True
+        for candidate in tool_types:
+            try:
+                if candidate:
+                    tools = [{"type": candidate, "name": "web_search", "max_uses": max_uses}]
+                    return client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        messages=[{"role": "user", "content": prompt}],
+                        tools=tools,
+                    )
+                tool_failed = False
                 return client.messages.create(
                     model=model,
                     max_tokens=max_tokens,
                     messages=[{"role": "user", "content": prompt}],
-                    tools=tools,
                 )
-            return client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except Exception as exc:
-            if candidate and _is_tool_type_error(exc, candidate):
-                continue
-            print(f"Anthropic API error: {exc}", file=sys.stderr)
+            except Exception as exc:
+                if _is_model_error(exc):
+                    break
+                if candidate and _is_tool_type_error(exc, candidate):
+                    continue
+                print(f"Anthropic API error: {exc}", file=sys.stderr)
+                return None
+        if not tool_failed:
             return None
 
     return None
+
+
+def _resolve_model_candidates(primary: str) -> List[str]:
+    candidates = [primary]
+    extra = os.getenv("ANTHROPIC_WEB_SEARCH_MODEL_FALLBACKS", "").strip()
+    if extra:
+        for token in extra.split(","):
+            name = token.strip()
+            if name and name not in candidates:
+                candidates.append(name)
+    for fallback in ("claude-opus-4-1", "claude-sonnet-4-20250514"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates
 
 
 def _build_prompt(payload: dict) -> str:
@@ -215,6 +236,11 @@ def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[
 def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
     message = str(exc).lower()
     return "tool" in message and tool_type.replace("_", " ")[:8] in message and "invalid" in message
+
+
+def _is_model_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "model" in message and ("not found" in message or "invalid" in message or "unknown" in message)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,7 @@ class PlaylistInteractiveApp(App):
     ]
 
     status = reactive("Idle")
+    SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
     def __init__(self, cli: PlaylistCLI, parser: argparse.ArgumentParser) -> None:
         super().__init__()
@@ -115,6 +116,8 @@ class PlaylistInteractiveApp(App):
         self._setup_mode = False
         self._mounted = False
         self._error_log: List[str] = []
+        self._spinner_index = 0
+        self._spinner_timer = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -158,6 +161,10 @@ class PlaylistInteractiveApp(App):
         self._update_input_placeholder()
 
     def watch_status(self, value: str) -> None:
+        if value.startswith("Running") and not self._setup_mode:
+            self._start_spinner()
+        else:
+            self._stop_spinner()
         self._update_top_bar()
 
     def on_key(self, event) -> None:
@@ -366,13 +373,35 @@ class PlaylistInteractiveApp(App):
             status_style = "red"
         if max_status_width < 8:
             return Text(label_text, style="bold cyan")
-        status_text = Text(self.status, style=status_style)
+        status_label = self.status
+        if self._spinner_timer is not None:
+            status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
+        status_text = Text(status_label, style=status_style)
         status_text.truncate(max_status_width, overflow="ellipsis")
         table = Table.grid(expand=True)
         table.add_column(justify="left")
         table.add_column(justify="right")
         table.add_row(Text(label_text, style="bold cyan"), status_text)
         return table
+
+    def _start_spinner(self) -> None:
+        if self._spinner_timer is not None or not self._mounted:
+            return
+        self._spinner_timer = self.set_interval(0.2, self._tick_spinner)
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer is None:
+            return
+        try:
+            self._spinner_timer.stop()
+        finally:
+            self._spinner_timer = None
+            self._spinner_index = 0
+            self._update_top_bar()
+
+    def _tick_spinner(self) -> None:
+        self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
+        self._update_top_bar()
 
     def _refresh_env_status(self) -> None:
         status = {}

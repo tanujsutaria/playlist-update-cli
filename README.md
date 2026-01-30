@@ -148,9 +148,20 @@ with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
 OpenAI API wrapper (recommended for Codex search):
 ```bash
 export WEB_SEARCH_CODEX_CMD="python -m src.openai_web_search_wrapper"
-export WEB_SEARCH_MODEL="o3-deep-research"  # alt: o4-mini-deep-research
+export WEB_SEARCH_MODEL="gpt-5.2"           # default: fast frontier model
+# export WEB_SEARCH_MODEL="o3-deep-research"  # optional: deeper/longer searches
 export WEB_SEARCH_TOOL_CHOICE="required"  # optional: auto|required|none
 export WEB_SEARCH_TOOL="web_search"        # optional: web_search|web_search_preview
+export WEB_SEARCH_TIMEOUT_SEC="1200"       # optional: override per-provider timeout
+export WEB_SEARCH_FALLBACK_MODEL="gpt-4o"  # optional: retry if deep research times out
+export WEB_SEARCH_PARALLEL_PER_PROVIDER="5"  # optional: parallel searches per provider
+```
+
+Anthropic API wrapper (recommended for Claude search):
+```bash
+export WEB_SEARCH_CLAUDE_CMD="python -m src.anthropic_web_search_wrapper"
+export ANTHROPIC_WEB_SEARCH_MODEL="claude-opus-4-5"  # default: opus 4.5
+export ANTHROPIC_WEB_SEARCH_MODEL_FALLBACKS="claude-opus-4-1,claude-sonnet-4-20250514"
 ```
 
 ## Validation rules for /search
@@ -178,7 +189,7 @@ If your CLI supports JSON flags, add them here (for example, `claude --json`).
 OpenAI API wrapper (recommended for scoring):
 ```bash
 export WEB_SCORE_CODEX_CMD="python -m src.openai_web_score_wrapper"
-export WEB_SCORE_MODEL="gpt-4o"
+export WEB_SCORE_MODEL="gpt-5.2"
 export WEB_SCORE_TOOL_CHOICE="required"  # optional: auto|required|none
 export WEB_SCORE_TOOL="web_search"       # optional: web_search|web_search_preview
 ```

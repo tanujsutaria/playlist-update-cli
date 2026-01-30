@@ -22,7 +22,7 @@ def main() -> int:
         return 1
 
     prompt = _build_prompt(payload)
-    model = os.getenv("WEB_SCORE_MODEL") or os.getenv("WEB_SEARCH_MODEL") or "gpt-4o"
+    model = os.getenv("WEB_SCORE_MODEL") or os.getenv("WEB_SEARCH_MODEL") or "gpt-5.2"
     tool_type = os.getenv("WEB_SCORE_TOOL", os.getenv("WEB_SEARCH_TOOL", "web_search"))
     tool_choice = os.getenv("WEB_SCORE_TOOL_CHOICE", "").strip().lower()
 

@@ -34,7 +34,7 @@ def main() -> int:
         return 1
 
     prompt = _build_prompt(payload)
-    model = os.getenv("WEB_SEARCH_MODEL", "o3-deep-research")
+    model = os.getenv("WEB_SEARCH_MODEL", "gpt-5.2")
     tool_type = os.getenv("WEB_SEARCH_TOOL", "web_search")
     tool_choice = os.getenv("WEB_SEARCH_TOOL_CHOICE", "").strip().lower()
 
