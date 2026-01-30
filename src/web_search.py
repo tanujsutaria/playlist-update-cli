@@ -56,7 +56,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
     if codex_cmd:
         commands["codex"] = codex_cmd
     elif env.get("OPENAI_API_KEY"):
-        commands["codex"] = "codex"
+        commands["codex"] = "codex exec -"
 
     if not commands:
         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
@@ -234,10 +234,14 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
         logger.warning("Invalid search command for %s: %s", label, exc)
         return [], ""
 
+    input_text = json.dumps(payload)
+    if label == "codex":
+        args, input_text = _prepare_codex_command(args, payload)
+
     try:
         result = subprocess.run(
             args,
-            input=json.dumps(payload),
+            input=input_text,
             text=True,
             capture_output=True,
             timeout=timeout_sec,
@@ -254,6 +258,10 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
                 logger.info("Retrying %s without --json flag", label)
                 args = [arg for arg in args if arg != "--json"]
                 return _run_command(label, " ".join(args), payload, timeout_sec)
+            if label == "codex" and _stderr_needs_tty(result.stderr):
+                logger.info("Retrying %s with codex exec (non-interactive)", label)
+                args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
+                return _run_command(label, " ".join(args), payload, timeout_sec)
         return [], ""
 
     output = _parse_json_output(result.stdout)
@@ -265,9 +273,34 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
     return results, summary
 
 
+def _prepare_codex_command(args: List[str], payload: dict) -> Tuple[List[str], str]:
+    prompt = _build_prompt_from_payload(payload)
+    if args and args[0] == "codex" and "exec" not in args:
+        args = ["codex", "exec", "-"]
+    elif args and args[0] == "codex" and "exec" in args and "-" not in args:
+        args = args + ["-"]
+    return args, prompt
+
+
+def _build_prompt_from_payload(payload: dict) -> str:
+    instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
+    filtered = {key: value for key, value in payload.items() if key != "instructions"}
+    return (
+        f"{instructions}\n\n"
+        "Input JSON:\n"
+        f"{json.dumps(filtered, indent=2)}\n\n"
+        "Return JSON only."
+    )
+
+
 def _stderr_has_unknown_json(stderr: str) -> bool:
     lowered = (stderr or "").lower()
     return "unknown option" in lowered and "--json" in lowered
+
+
+def _stderr_needs_tty(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return "stdin is not a terminal" in lowered
 
 
 def _parse_json_output(text: str) -> Optional[object]:

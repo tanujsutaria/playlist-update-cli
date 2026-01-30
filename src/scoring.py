@@ -272,10 +272,14 @@ class WebSearchScoreProvider(ScoreProvider):
             logger.warning("Invalid command for %s: %s", label, exc)
             return {}
 
+        input_text = json.dumps(payload)
+        if label == "codex":
+            args, input_text = self._prepare_codex_command(args, payload)
+
         try:
             result = subprocess.run(
                 args,
-                input=json.dumps(payload),
+                input=input_text,
                 text=True,
                 capture_output=True,
                 timeout=self.timeout_sec,
@@ -288,6 +292,9 @@ class WebSearchScoreProvider(ScoreProvider):
             logger.warning("Web scoring command for %s exited with %s", label, result.returncode)
             if result.stderr:
                 logger.warning("%s stderr: %s", label, result.stderr.strip())
+                if label == "codex" and self._stderr_needs_tty(result.stderr):
+                    logger.info("Retrying %s with codex exec (non-interactive)", label)
+                    return self._run_command(label, "codex exec -", payload)
             return {}
 
         try:
@@ -307,6 +314,25 @@ class WebSearchScoreProvider(ScoreProvider):
             except (TypeError, ValueError):
                 continue
         return cleaned
+
+    def _prepare_codex_command(self, args: List[str], payload: dict) -> Tuple[List[str], str]:
+        prompt = (
+            "Use web search to judge how well each candidate fits the playlist theme. "
+            "Return JSON with a 'scores' object mapping song id to a 0-1 score.\n\n"
+            "Input JSON:\n"
+            f"{json.dumps(payload, indent=2)}\n\n"
+            "Return JSON only."
+        )
+        if args and args[0] == "codex" and "exec" not in args:
+            args = ["codex", "exec", "-"]
+        elif args and args[0] == "codex" and "exec" in args and "-" not in args:
+            args = args + ["-"]
+        return args, prompt
+
+    @staticmethod
+    def _stderr_needs_tty(stderr: str) -> bool:
+        lowered = (stderr or "").lower()
+        return "stdin is not a terminal" in lowered
 
     def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
         if not self.commands:

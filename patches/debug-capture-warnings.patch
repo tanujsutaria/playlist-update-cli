@@ -1,0 +1,174 @@
+diff --git a/README.md b/README.md
+index a36eb1b..742582c 100644
+--- a/README.md
++++ b/README.md
+@@ -139,11 +139,12 @@ Bohemian Rhapsody,Queen
+ The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
+ - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
+ - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
+-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex`)
++- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (falls back to `claude` / `codex exec -`)
+ 
+ You can also set a generic command for search via `WEB_SEARCH_CMD`.
+ If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
+-with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`.
++with `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`. If you see
++`stdin is not a terminal`, use `codex exec -`.
+ 
+ ## Validation rules for /search
+ - If your query includes a monthly listeners constraint (for example, "under 50k monthly listeners"),
+@@ -161,7 +162,7 @@ for scoring candidates. Provide one or more commands via environment variables:
+ ```bash
+ export WEB_SCORE_CMD="path/to/your-web-score-wrapper"
+ export WEB_SCORE_CLAUDE_CMD="claude"
+-export WEB_SCORE_CODEX_CMD="codex"
++export WEB_SCORE_CODEX_CMD="codex exec -"
+ ```
+ Each command should read JSON from stdin and write JSON to stdout with a `scores` object mapping song IDs
+ (`artist|||song`) to a 0-1 relevance score.
+diff --git a/src/interactive_app.py b/src/interactive_app.py
+index 90c8946..d5f0ef2 100644
+--- a/src/interactive_app.py
++++ b/src/interactive_app.py
+@@ -56,7 +56,7 @@ class UILogHandler(logging.Handler):
+                 style = "dim"
+             text = Text(message, style=style)
+             self.app.call_from_thread(self.app.append_log, text)
+-            if record.levelno >= logging.ERROR:
++            if record.levelno >= logging.WARNING:
+                 self.app.call_from_thread(self.app.record_error, message)
+         except Exception:
+             self.handleError(record)
+diff --git a/src/scoring.py b/src/scoring.py
+index c7bcf48..783211c 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -272,10 +272,14 @@ class WebSearchScoreProvider(ScoreProvider):
+             logger.warning("Invalid command for %s: %s", label, exc)
+             return {}
+ 
++        input_text = json.dumps(payload)
++        if label == "codex":
++            args, input_text = self._prepare_codex_command(args, payload)
++
+         try:
+             result = subprocess.run(
+                 args,
+-                input=json.dumps(payload),
++                input=input_text,
+                 text=True,
+                 capture_output=True,
+                 timeout=self.timeout_sec,
+@@ -288,6 +292,9 @@ class WebSearchScoreProvider(ScoreProvider):
+             logger.warning("Web scoring command for %s exited with %s", label, result.returncode)
+             if result.stderr:
+                 logger.warning("%s stderr: %s", label, result.stderr.strip())
++                if label == "codex" and self._stderr_needs_tty(result.stderr):
++                    logger.info("Retrying %s with codex exec (non-interactive)", label)
++                    return self._run_command(label, "codex exec -", payload)
+             return {}
+ 
+         try:
+@@ -308,6 +315,25 @@ class WebSearchScoreProvider(ScoreProvider):
+                 continue
+         return cleaned
+ 
++    def _prepare_codex_command(self, args: List[str], payload: dict) -> Tuple[List[str], str]:
++        prompt = (
++            "Use web search to judge how well each candidate fits the playlist theme. "
++            "Return JSON with a 'scores' object mapping song id to a 0-1 score.\n\n"
++            "Input JSON:\n"
++            f"{json.dumps(payload, indent=2)}\n\n"
++            "Return JSON only."
++        )
++        if args and args[0] == "codex" and "exec" not in args:
++            args = ["codex", "exec", "-"]
++        elif args and args[0] == "codex" and "exec" in args and "-" not in args:
++            args = args + ["-"]
++        return args, prompt
++
++    @staticmethod
++    def _stderr_needs_tty(stderr: str) -> bool:
++        lowered = (stderr or "").lower()
++        return "stdin is not a terminal" in lowered
++
+     def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
+         if not self.commands:
+             return {}
+diff --git a/src/web_search.py b/src/web_search.py
+index 63aaa3b..bdd4a7f 100644
+--- a/src/web_search.py
++++ b/src/web_search.py
+@@ -56,7 +56,7 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
+     if codex_cmd:
+         commands["codex"] = codex_cmd
+     elif env.get("OPENAI_API_KEY"):
+-        commands["codex"] = "codex"
++        commands["codex"] = "codex exec -"
+ 
+     if not commands:
+         generic_cmd = env.get("WEB_SEARCH_CMD") or env.get("WEB_SCORE_CMD")
+@@ -234,10 +234,14 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
+         logger.warning("Invalid search command for %s: %s", label, exc)
+         return [], ""
+ 
++    input_text = json.dumps(payload)
++    if label == "codex":
++        args, input_text = _prepare_codex_command(args, payload)
++
+     try:
+         result = subprocess.run(
+             args,
+-            input=json.dumps(payload),
++            input=input_text,
+             text=True,
+             capture_output=True,
+             timeout=timeout_sec,
+@@ -254,6 +258,10 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
+                 logger.info("Retrying %s without --json flag", label)
+                 args = [arg for arg in args if arg != "--json"]
+                 return _run_command(label, " ".join(args), payload, timeout_sec)
++            if label == "codex" and _stderr_needs_tty(result.stderr):
++                logger.info("Retrying %s with codex exec (non-interactive)", label)
++                args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
++                return _run_command(label, " ".join(args), payload, timeout_sec)
+         return [], ""
+ 
+     output = _parse_json_output(result.stdout)
+@@ -265,11 +273,36 @@ def _run_command(label: str, command: str, payload: dict, timeout_sec: int) -> T
+     return results, summary
+ 
+ 
++def _prepare_codex_command(args: List[str], payload: dict) -> Tuple[List[str], str]:
++    prompt = _build_prompt_from_payload(payload)
++    if args and args[0] == "codex" and "exec" not in args:
++        args = ["codex", "exec", "-"]
++    elif args and args[0] == "codex" and "exec" in args and "-" not in args:
++        args = args + ["-"]
++    return args, prompt
++
++
++def _build_prompt_from_payload(payload: dict) -> str:
++    instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
++    filtered = {key: value for key, value in payload.items() if key != "instructions"}
++    return (
++        f"{instructions}\n\n"
++        "Input JSON:\n"
++        f"{json.dumps(filtered, indent=2)}\n\n"
++        "Return JSON only."
++    )
++
++
+ def _stderr_has_unknown_json(stderr: str) -> bool:
+     lowered = (stderr or "").lower()
+     return "unknown option" in lowered and "--json" in lowered
+ 
+ 
++def _stderr_needs_tty(stderr: str) -> bool:
++    lowered = (stderr or "").lower()
++    return "stdin is not a terminal" in lowered
++
++
+ def _parse_json_output(text: str) -> Optional[object]:
+     try:
+         return json.loads(text)

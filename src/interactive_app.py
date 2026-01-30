@@ -56,7 +56,7 @@ class UILogHandler(logging.Handler):
                 style = "dim"
             text = Text(message, style=style)
             self.app.call_from_thread(self.app.append_log, text)
-            if record.levelno >= logging.ERROR:
+            if record.levelno >= logging.WARNING:
                 self.app.call_from_thread(self.app.record_error, message)
         except Exception:
             self.handleError(record)
