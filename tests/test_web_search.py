@@ -72,3 +72,23 @@ def test_extract_output_from_claude_json_response():
     assert summary == "ok"
     assert len(results) == 1
     assert results[0]["song"] == "Track A"
+
+
+def test_normalize_item_with_artists_list():
+    results, _ = _extract_output(
+        {
+            "summary": "ok",
+            "results": [
+                {
+                    "title": "Track A",
+                    "artists": ["Artist 1"],
+                    "sources": [],
+                    "metrics": {},
+                }
+            ],
+        }
+    )
+
+    assert len(results) == 1
+    assert results[0]["song"] == "Track A"
+    assert results[0]["artist"] == "Artist 1"

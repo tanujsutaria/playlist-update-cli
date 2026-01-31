@@ -610,6 +610,31 @@ def _normalize_item(item: object) -> Optional[dict]:
     song = item.get("song") or item.get("title") or item.get("track") or item.get("name")
     artist = item.get("artist") or item.get("artist_name")
 
+    if isinstance(song, dict):
+        song_name = song.get("name") or song.get("title") or song.get("track") or song.get("song")
+        if not artist:
+            artist = (
+                song.get("artist")
+                or song.get("artist_name")
+                or song.get("primary_artist")
+                or song.get("by")
+            )
+        song = song_name or song
+
+    if not artist:
+        artists = item.get("artists")
+        if isinstance(artists, list) and artists:
+            first = artists[0]
+            if isinstance(first, dict):
+                artist = first.get("name") or first.get("artist")
+            else:
+                artist = first
+        elif isinstance(artists, dict):
+            artist = artists.get("name") or artists.get("artist")
+
+    if isinstance(artist, dict):
+        artist = artist.get("name") or artist.get("artist") or artist.get("primary_artist")
+
     if not artist and isinstance(song, str):
         song, artist = _split_song_artist(song)
 
