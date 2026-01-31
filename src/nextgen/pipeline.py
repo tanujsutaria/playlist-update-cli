@@ -82,6 +82,7 @@ class SearchPipeline:
         self.lenient_threshold = lenient_threshold
         self.score_config = score_config or ScoreConfig()
         self.last_cached = False
+        self.last_score_config: Optional[ScoreConfig] = None
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
@@ -374,6 +375,7 @@ class SearchPipeline:
             source_cap=base_config.source_cap,
             year_target=_extract_year_target(query),
         )
+        self.last_score_config = score_config
         scores = score_candidates(
             query_vector,
             track_vectors,

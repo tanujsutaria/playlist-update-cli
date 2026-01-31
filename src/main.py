@@ -11,6 +11,7 @@ import json
 import csv
 import shutil
 import uuid
+from dataclasses import asdict
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import Optional, Dict, List, Union, Tuple
@@ -21,7 +22,7 @@ from models import Song
 from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from rotation_manager import RotationManager
-from scoring import ScoreConfig
+from scoring import ScoreConfig as PlaylistScoreConfig
 from ui import (
     console,
     section,
@@ -30,6 +31,7 @@ from ui import (
     key_value_table,
     info,
     warning,
+    json_output,
     preview_table,
     clear_preview,
 )
@@ -38,6 +40,7 @@ from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.vectors import decode_vector, vector_norm
 from nextgen.pipeline import SearchPipeline, SearchResult
+from nextgen.scoring import ScoreConfig as SearchScoreConfig
 from nextgen.embeddings import EmbeddingModel
 
 logger = logging.getLogger(__name__)
@@ -142,7 +145,7 @@ class PlaylistCLI:
             model_name = os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2")
             strict_threshold = _env_float("SEARCH_STRICT_THRESHOLD", 0.6)
             lenient_threshold = _env_float("SEARCH_LENIENT_THRESHOLD", 0.75)
-            score_config = ScoreConfig(
+            score_config = SearchScoreConfig(
                 strict_weight=_env_float("SEARCH_SCORE_STRICT_WEIGHT", 0.4),
                 base_weight=_env_float("SEARCH_SCORE_BASE_WEIGHT", 0.6),
                 source_weight=_env_float("SEARCH_SCORE_SOURCE_WEIGHT", 0.05),
@@ -318,7 +321,7 @@ class PlaylistCLI:
         """
         try:
             rm = self._get_rotation_manager(playlist_name)
-            score_config = ScoreConfig(strategy=score_strategy, query=query)
+            score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
             
             # Select songs
             logger.info(f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)...")
@@ -978,32 +981,92 @@ class PlaylistCLI:
         def _progress(stage: str) -> None:
             info(f"Stage: {stage}")
 
+        def _env_int(name: str, default: int) -> int:
+            value = os.getenv(name)
+            if not value:
+                return default
+            try:
+                return int(value)
+            except ValueError:
+                return default
+
+        def _env_flag(name: str, default: bool = False) -> bool:
+            value = os.getenv(name)
+            if value is None or value == "":
+                return default
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+
+        interactive = os.getenv("TUNR_INTERACTIVE") == "1"
         status_label = "fresh"
+        live_mode = os.getenv("SEARCH_LIVE_MODE", "full").strip().lower()
+        if live_mode not in {"full", "compact"}:
+            live_mode = "full"
         preview_rows: List[List[object]] = []
-        preview_limit = 10
-        preview_stride = 5
+        preview_limit = max(0, _env_int("SEARCH_PREVIEW_LIMIT", 20))
+        preview_stride = max(1, _env_int("SEARCH_PREVIEW_STRIDE", 5))
+        live_page_size = max(1, _env_int("SEARCH_LIVE_PAGE_SIZE", 50))
+        live_page = max(1, _env_int("SEARCH_LIVE_PAGE", 1))
+        stream_full = _env_flag("SEARCH_STREAM_FULL", interactive)
+        final_table_mode = os.getenv("SEARCH_FINAL_TABLE_MODE", "").strip().lower()
+        if not final_table_mode:
+            final_table_mode = "none" if (interactive and stream_full) else "full"
+        if final_table_mode not in {"full", "compact", "none"}:
+            final_table_mode = "full"
+
+        if live_mode == "compact":
+            live_headers = ["#", "Song", "Artist", "Score", "Strict", "Sources"]
+
+            def _live_row(item: SearchResult, rank: int) -> List[object]:
+                return [
+                    rank,
+                    item.song,
+                    item.artist,
+                    f"{item.score:.3f}",
+                    f"{item.strict_ratio:.2f}",
+                    len(item.sources or []),
+                ]
+
+        else:
+            live_headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Status", "Providers", "Sources"]
+
+            def _live_row(item: SearchResult, rank: int) -> List[object]:
+                return [
+                    rank,
+                    item.song,
+                    item.artist,
+                    item.year or "-",
+                    f"{item.score:.3f}",
+                    f"{item.strict_ratio:.2f}",
+                    status_label,
+                    len(item.providers or []),
+                    len(item.sources or []),
+                ]
+
+        def _page_slice(rows: List[List[object]]) -> List[List[object]]:
+            start = (live_page - 1) * live_page_size
+            end = start + live_page_size
+            if len(rows) <= start:
+                return []
+            return rows[start:end]
 
         def _on_result(item: SearchResult, rank: int, total: int) -> None:
-            if os.getenv("TUNR_INTERACTIVE") == "1":
-                if rank <= preview_limit:
-                    preview_rows.append(
-                        [
-                            rank,
-                            item.song,
-                            item.artist,
-                            item.year or "-",
-                            f"{item.score:.3f}",
-                            f"{item.strict_ratio:.2f}",
-                            len(item.sources or []),
-                            len(item.providers or []),
-                        ]
-                    )
-                    if rank % preview_stride == 0 or rank == preview_limit or rank == total:
-                        preview_table(
-                            ["#", "Song", "Artist", "Year", "Score", "Strict", "Sources", "Providers"],
-                            preview_rows,
-                            title=f"Search Preview • {status_label} ({min(rank, preview_limit)}/{total})",
-                        )
+            if interactive and (stream_full or preview_limit > 0):
+                effective_limit = total if stream_full else preview_limit
+                if rank <= effective_limit:
+                    preview_rows.append(_live_row(item, rank))
+                    if rank % preview_stride == 0 or rank == effective_limit or rank == total:
+                        paged_rows = _page_slice(preview_rows)
+                        if paged_rows:
+                            shown_start = (live_page - 1) * live_page_size + 1
+                            shown_end = shown_start + len(paged_rows) - 1
+                            preview_table(
+                                live_headers,
+                                paged_rows,
+                                title=(
+                                    f"Live Results • {status_label} "
+                                    f"(rows {shown_start}-{shown_end} of {min(rank, effective_limit)})"
+                                ),
+                            )
                 if rank % 25 == 0:
                     info(f"Scored {rank}/{total} candidates")
 
@@ -1043,8 +1106,40 @@ class PlaylistCLI:
             ])
 
         headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Status", "Providers", "Sources"]
-        table(headers, rows)
-        clear_preview()
+        if not (interactive and stream_full):
+            if final_table_mode == "compact":
+                table(
+                    ["#", "Song", "Artist", "Score", "Strict", "Status"],
+                    [
+                        [row[0], row[1], row[2], row[4], row[5], row[6]]
+                        for row in rows
+                    ],
+                )
+            elif final_table_mode != "none":
+                table(headers, rows)
+            clear_preview()
+        else:
+            live_rows = [_live_row(item, idx) for idx, item in enumerate(results, 1)]
+            paged_rows = _page_slice(live_rows)
+            if paged_rows:
+                shown_start = (live_page - 1) * live_page_size + 1
+                shown_end = shown_start + len(paged_rows) - 1
+                preview_table(
+                    live_headers,
+                    paged_rows,
+                    title=f"Live Results • {status_label} (rows {shown_start}-{shown_end} of {len(results)})",
+                )
+            if final_table_mode == "compact":
+                table(
+                    ["#", "Song", "Artist", "Score", "Strict", "Status"],
+                    [
+                        [row[0], row[1], row[2], row[4], row[5], row[6]]
+                        for row in rows
+                    ],
+                )
+            elif final_table_mode == "full":
+                table(headers, rows)
+            info(f"Live results complete: {len(results)} candidates.")
 
         self.last_search_results = [
             {
@@ -1849,6 +1944,7 @@ class PlaylistCLI:
             else:
                 missing_context += 1
         avg_strict = sum(strict_ratios) / len(strict_ratios) if strict_ratios else 0.0
+        score_config = getattr(self.search_pipeline, "last_score_config", None)
         return {
             "run": run,
             "candidates": candidates,
@@ -1857,11 +1953,21 @@ class PlaylistCLI:
                 "avg_strict_ratio": avg_strict,
                 "missing_context": missing_context,
                 "cached": bool(self.last_search_cached),
+                "model_name": getattr(self.search_pipeline, "model_name", None),
+                "score_config": asdict(score_config) if score_config else None,
             },
         }
 
     def debug_track(self, track_id: str) -> Optional[Dict[str, object]]:
         """Return track + context + sources for debug display."""
+        raw_target = track_id.strip()
+        resolved_rank = None
+        if raw_target.isdigit() and self.last_search_results:
+            rank = int(raw_target)
+            if 1 <= rank <= len(self.last_search_results):
+                entry = self.last_search_results[rank - 1]
+                track_id = entry.get("track_id") or track_id
+                resolved_rank = rank
         record = self.repos.tracks.get(track_id)
         if not record:
             return None
@@ -1869,13 +1975,16 @@ class PlaylistCLI:
         sources = list(self.repos.sources.list_by_track(track_id))
         embedding = self.repos.embeddings.get(track_id)
         listens = list(self.repos.listen_events.list_by_track(track_id))
-        return {
+        payload = {
             "track": record,
             "context": context,
             "sources": sources,
             "embedding": embedding,
             "listens": listens,
         }
+        if resolved_rank:
+            payload["resolved_rank"] = resolved_rank
+        return payload
 
     def _show_search_validation_summary(self, stats: Dict[str, int], title: str) -> None:
         section(title)
@@ -1925,7 +2034,7 @@ class PlaylistCLI:
         """Preview future generations without updating Spotify."""
         try:
             rm = self._get_rotation_manager(playlist_name)
-            score_config = ScoreConfig(strategy=score_strategy, query=query)
+            score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
             plans = rm.simulate_generations(
                 count=song_count,
                 fresh_days=fresh_days,
@@ -1952,7 +2061,7 @@ class PlaylistCLI:
         try:
             rm = self._get_rotation_manager(playlist_name)
             logger.info(f"Selecting {song_count} songs for diff (fresh_days={fresh_days})...")
-            score_config = ScoreConfig(strategy=score_strategy, query=query)
+            score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
             selected = rm.select_songs_for_today(
                 count=song_count,
                 fresh_days=fresh_days,
@@ -2097,6 +2206,124 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
             cli.search_songs(
                 args.query
             )
+        elif command == 'debug':
+            topic = getattr(args, "topic", "last")
+            fmt = getattr(args, "format", "json")
+            if topic == "track":
+                if not getattr(args, "value", None):
+                    warning("Track ID required for debug track.")
+                    return 1
+                payload = cli.debug_track(args.value)
+            else:
+                payload = cli.debug_last_search()
+            if not payload:
+                warning("No debug data available.")
+                return 1
+            if fmt == "table":
+                if topic == "track":
+                    track = payload.get("track") or {}
+                    context = payload.get("context") or {}
+                    sources = payload.get("sources") or []
+                    embedding = payload.get("embedding") or {}
+                    listens = payload.get("listens") or []
+                    section("Debug", "Track")
+                    rows = [
+                        ["Track ID", track.get("track_id") or ""],
+                        ["Name", track.get("name") or ""],
+                        ["Artist ID", track.get("artist_id") or ""],
+                        ["Spotify ID", track.get("spotify_id") or ""],
+                        ["Spotify URL", track.get("spotify_url") or ""],
+                        ["Release", track.get("release_date") or ""],
+                        ["Status", track.get("status") or ""],
+                    ]
+                    if payload.get("resolved_rank"):
+                        rows.append(["Resolved Rank", payload.get("resolved_rank")])
+                    key_value_table(rows)
+                    if context:
+                        subsection("Context")
+                        key_value_table(
+                            [
+                                ["Strict Ratio", context.get("strict_ratio")],
+                                ["Context Text", (context.get("context_text") or "")[:200]],
+                            ]
+                        )
+                    if sources:
+                        subsection("Sources")
+                        table(
+                            ["#", "URL", "Title", "Snippet", "Provider", "Strict"],
+                            [
+                                [
+                                    idx,
+                                    s.get("url") or "",
+                                    s.get("title") or "",
+                                    s.get("snippet") or "",
+                                    s.get("provider") or "",
+                                    "yes" if s.get("is_strict") else "no",
+                                ]
+                                for idx, s in enumerate(sources, 1)
+                            ],
+                        )
+                    if embedding:
+                        subsection("Embedding")
+                        key_value_table(
+                            [
+                                ["Model", embedding.get("model_name") or ""],
+                                ["Dimensions", embedding.get("embedding_dim") or ""],
+                                ["Norm", embedding.get("embedding_norm")],
+                            ]
+                        )
+                    if listens:
+                        subsection("Listen Events")
+                        table(
+                            ["#", "Played At", "Source"],
+                            [
+                                [idx, event.get("played_at") or "", event.get("source") or ""]
+                                for idx, event in enumerate(listens[:10], 1)
+                            ],
+                        )
+                else:
+                    run = payload.get("run") or {}
+                    candidates = payload.get("candidates") or []
+                    summary = payload.get("summary") or {}
+                    section("Debug", "Last Search")
+                    key_value_table(
+                        [
+                            ["Run ID", run.get("run_id")],
+                            ["Started", run.get("started_at")],
+                            ["Finished", run.get("finished_at")],
+                            ["Status", run.get("status")],
+                            ["Results", len(candidates)],
+                            ["Cached", summary.get("cached")],
+                            ["Avg strict ratio", f"{summary.get('avg_strict_ratio', 0):.2f}"],
+                            ["Missing context", summary.get("missing_context", 0)],
+                            ["Model", summary.get("model_name") or ""],
+                        ]
+                    )
+                    score_config = summary.get("score_config") or {}
+                    if score_config:
+                        subsection("Score Config")
+                        key_value_table(
+                            [
+                                ["Base", score_config.get("base_weight")],
+                                ["Strict", score_config.get("strict_weight")],
+                                ["Source", score_config.get("source_weight")],
+                                ["Year", score_config.get("year_weight")],
+                                ["Year tol", score_config.get("year_tolerance")],
+                                ["Source cap", score_config.get("source_cap")],
+                                ["Year target", score_config.get("year_target")],
+                            ]
+                        )
+                    if candidates:
+                        preview_rows = []
+                        for idx, candidate in enumerate(candidates[:10], 1):
+                            track = candidate.get("track") or {}
+                            artist_label = track.get("artist_name") or track.get("artist_id") or ""
+                            label = f"{track.get('name', '')} — {artist_label}".strip(" —")
+                            preview_rows.append([idx, label, candidate.get("track_id") or ""])
+                        subsection("Top Results (IDs)")
+                        table(["#", "Track", "Track ID"], preview_rows)
+                return 0
+            json_output(payload)
         elif command == 'ingest':
             cli.ingest_tracks(args.source, args.name, args.time_range)
         elif command == 'listen-sync':

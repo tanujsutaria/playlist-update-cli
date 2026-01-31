@@ -25,7 +25,7 @@ class TestSetupParsers:
             'import', 'update', 'stats', 'view', 'sync', 'extract',
             'clean', 'backup', 'restore', 'restore-previous-rotation',
             'list-rotations', 'list-backups', 'plan', 'diff',
-            'auth-status', 'auth-refresh', 'search', 'interactive',
+            'auth-status', 'auth-refresh', 'search', 'debug', 'interactive',
             'ingest', 'listen-sync', 'rotate', 'rotate-played'
         ]
 
@@ -154,6 +154,36 @@ class TestViewCommand:
 
         with pytest.raises(SystemExit):
             parser.parse_args(['view'])
+
+
+class TestDebugCommand:
+    """Tests for debug command parsing"""
+
+    def test_parse_debug_last_default(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['debug'])
+
+        assert args.command == 'debug'
+        assert args.topic == 'last'
+        assert args.value is None
+        assert args.format == 'json'
+
+    def test_parse_debug_track(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['debug', 'track', 'artist|||song'])
+
+        assert args.command == 'debug'
+        assert args.topic == 'track'
+        assert args.value == 'artist|||song'
+        assert args.format == 'json'
+
+    def test_parse_debug_with_format(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['debug', 'last', '--format', 'table'])
+
+        assert args.command == 'debug'
+        assert args.topic == 'last'
+        assert args.format == 'table'
 
 
 class TestSyncCommand:
