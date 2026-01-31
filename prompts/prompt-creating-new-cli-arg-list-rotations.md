@@ -1,1 +1,0 @@
-"New cli arg called `list-rotations` that takes in a playlist name input parameter to list all rotations and songs within each rotation. Example Usage: python src/main.py list-rotations 'My Daily Mix'."

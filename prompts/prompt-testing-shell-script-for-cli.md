@@ -1,1 +1,0 @@
-"New cli arg called `restore-previous-rotation` that takes in an `n` input parameter to restore the `n` rotation that was previously pushed. Should default to the previous rotation. Example Usage: python src/main.py restore-previous-rotation -5. In case the index of n is out of bounds inform the user."
