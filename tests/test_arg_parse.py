@@ -25,7 +25,8 @@ class TestSetupParsers:
             'import', 'update', 'stats', 'view', 'sync', 'extract',
             'clean', 'backup', 'restore', 'restore-previous-rotation',
             'list-rotations', 'list-backups', 'plan', 'diff',
-            'auth-status', 'auth-refresh', 'search', 'interactive'
+            'auth-status', 'auth-refresh', 'search', 'interactive',
+            'ingest', 'listen-sync', 'rotate', 'rotate-played'
         ]
 
         # Get subparsers
