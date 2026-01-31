@@ -1,13 +1,28 @@
 import argparse
 import inspect
-from typing import Tuple, Any, Optional
+from typing import Tuple, Any, Optional, Type
 
-def setup_parsers(exit_on_error: bool = True) -> argparse.ArgumentParser:
+
+class _NoExitArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that raises instead of exiting (for interactive UI)."""
+
+    def error(self, message: str) -> None:
+        raise argparse.ArgumentError(None, message)
+
+    def exit(self, status: int = 0, message: Optional[str] = None) -> None:
+        if message:
+            raise argparse.ArgumentError(None, message)
+        raise argparse.ArgumentError(None, "Invalid command.")
+
+def setup_parsers(
+    exit_on_error: bool = True,
+    parser_class: Type[argparse.ArgumentParser] = argparse.ArgumentParser,
+) -> argparse.ArgumentParser:
     """Create and configure argument parser"""
     parser_kwargs = {"description": "Spotify Playlist Manager CLI"}
     if "exit_on_error" in inspect.signature(argparse.ArgumentParser).parameters:
         parser_kwargs["exit_on_error"] = exit_on_error
-    parser = argparse.ArgumentParser(**parser_kwargs)
+    parser = parser_class(**parser_kwargs)
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
     # Import command
@@ -129,15 +144,13 @@ def parse_args() -> Tuple[str, Any]:
 
 def parse_tokens(tokens: list[str]) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Parse tokens for interactive /command input."""
-    parser = setup_parsers(exit_on_error=False)
+    parser = setup_parsers(exit_on_error=False, parser_class=_NoExitArgumentParser)
     if not tokens:
         return None, None, "No command provided."
     try:
         args = parser.parse_args(tokens)
     except argparse.ArgumentError as exc:
         return None, None, str(exc)
-    except SystemExit:
-        return None, None, "Invalid command."
 
     if not getattr(args, "command", None):
         return None, None, "No command provided."

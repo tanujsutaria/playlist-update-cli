@@ -20,7 +20,7 @@ from textual.widgets import Input, RichLog, Static
 
 from arg_parse import setup_parsers, parse_tokens
 from main import PlaylistCLI, dispatch_command, configure_logging
-from ui import set_output_sink
+from ui import set_output_sink, section, subsection, table, key_value_table, info, warning, json_output
 from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
@@ -265,8 +265,14 @@ class PlaylistInteractiveApp(App):
         if text in ("env", "keys"):
             self._show_env()
             return
-        if text in ("debug", "errors"):
-            self._show_debug()
+        if text == "debug":
+            self._show_debug_errors()
+            return
+        if text.startswith("debug "):
+            self._handle_debug(text)
+            return
+        if text in ("errors",):
+            self._show_debug_errors()
             return
         if text in ("expand", "search-more"):
             self._expand_search()
@@ -338,7 +344,7 @@ class PlaylistInteractiveApp(App):
         table.add_row("/help", "Show this help screen")
         table.add_row("/setup", "Show first-time setup instructions")
         table.add_row("/env", "Show detected environment keys")
-        table.add_row("/debug", "Show recent errors for copy/paste")
+        table.add_row("/debug", "Show debug info (errors, last, track <id>)")
         table.add_row("/expand", "Expand the last search")
         table.add_row("/clear", "Clear the output pane")
         table.add_row("/quit", "Exit the app")
@@ -434,7 +440,7 @@ class PlaylistInteractiveApp(App):
             if not self._setup_mode:
                 self.append_log(Text("Setup complete. Type /help to continue.", style="green"))
 
-    def _show_debug(self) -> None:
+    def _show_debug_errors(self) -> None:
         if not self._error_log:
             self.append_log(Text("No errors captured yet.", style="dim"))
             return
@@ -444,6 +450,144 @@ class PlaylistInteractiveApp(App):
             text.append(entry.rstrip())
             text.append("\n\n")
         self.append_log(Panel(text, title="Debug Log", border_style="red"))
+
+    def _handle_debug(self, raw: str) -> None:
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            self.append_log(Panel(Text(f"Invalid debug command: {exc}", style="red"), title="Error", border_style="red"))
+            return
+        if not tokens:
+            return
+        if len(tokens) == 1 or tokens[1] in {"errors", "error"}:
+            self._show_debug_errors()
+            return
+        subcommand = tokens[1].lower()
+        if subcommand in {"last", "search"}:
+            self._show_debug_last()
+            return
+        if subcommand == "track":
+            track_id = " ".join(tokens[2:]).strip()
+            if not track_id:
+                self.append_log(Text("Usage: /debug track <track_id>", style="yellow"))
+                return
+            self._show_debug_track(track_id)
+            return
+        self.append_log(Text("Usage: /debug [errors|last|track <id>]", style="yellow"))
+
+    def _show_debug_last(self) -> None:
+        if not self.cli.last_search_query:
+            self.append_log(Text("No previous search to inspect.", style="dim"))
+            return
+        results = self.cli.last_search_results or []
+        providers = sorted({p for item in results for p in (item.get("providers") or [])})
+        rows = [
+            ["Query", self.cli.last_search_query],
+            ["Results", len(results)],
+            ["Expanded", "yes" if self.cli.last_search_expanded else "no"],
+            ["Providers", ", ".join(providers) if providers else "unknown"],
+            ["Metrics", ", ".join(self.cli.last_search_metrics or []) or "none"],
+        ]
+        section("Debug", "Last Search")
+        key_value_table(rows)
+        if self.cli.last_search_summary:
+            info(f"Summary: {self.cli.last_search_summary}")
+        if self.cli.last_search_constraints:
+            subsection("Constraints")
+            json_output(self.cli.last_search_constraints)
+        if self.cli.last_search_policy:
+            subsection("Source Policy")
+            json_output(self.cli.last_search_policy)
+
+        if results:
+            preview_rows = []
+            for idx, item in enumerate(results[:10], 1):
+                song = item.get("song") or item.get("name") or ""
+                artist = item.get("artist") or ""
+                if not song or not artist:
+                    continue
+                track_id = f"{artist.lower()}|||{song.lower()}"
+                preview_rows.append([idx, f"{song} — {artist}", track_id])
+            if preview_rows:
+                subsection("Top Results (IDs)")
+                table(["#", "Track", "Track ID"], preview_rows)
+                info("Use /debug track <id> or /debug track <rank> to inspect a specific entry.")
+
+    def _show_debug_track(self, track_id: str) -> None:
+        raw_target = track_id.strip()
+        results = self.cli.last_search_results or []
+
+        if raw_target.isdigit():
+            if not results:
+                self.append_log(Text("No previous search to inspect.", style="dim"))
+                return
+            rank = int(raw_target)
+            if rank < 1 or rank > len(results):
+                self.append_log(Text(f"Rank out of range. Valid: 1-{len(results)}", style="yellow"))
+                return
+            item = results[rank - 1]
+            song = item.get("song") or item.get("name") or ""
+            artist = item.get("artist") or ""
+            if song and artist:
+                track_id = f"{artist.lower()}|||{song.lower()}"
+            else:
+                track_id = raw_target
+        else:
+            track_id = raw_target
+
+        target = track_id.lower()
+        found = None
+        resolved_id = None
+        for item in results:
+            song = item.get("song") or item.get("name") or ""
+            artist = item.get("artist") or ""
+            if not song or not artist:
+                continue
+            candidate_id = f"{artist.lower()}|||{song.lower()}"
+            if candidate_id == target:
+                found = item
+                resolved_id = candidate_id
+                break
+
+        if found:
+            rows = [
+                ["Track ID", resolved_id],
+                ["Song", found.get("song") or found.get("name") or ""],
+                ["Artist", found.get("artist") or ""],
+                ["Year", found.get("year") or "-"],
+                ["Spotify", found.get("spotify_url") or found.get("spotify_uri") or "Not found"],
+                ["Providers", ", ".join(found.get("providers") or []) or "unknown"],
+                ["Why", found.get("why") or ""],
+            ]
+            section("Debug", "Track")
+            key_value_table(rows)
+            metrics = found.get("metrics") or {}
+            if metrics:
+                subsection("Metrics")
+                json_output(metrics)
+            sources = found.get("sources") or []
+            if sources:
+                subsection("Sources")
+                table(["#", "Source"], [[i, s] for i, s in enumerate(sources, 1)])
+            return
+
+        try:
+            song = self.cli.db.get_song_by_id(target)
+        except Exception:
+            song = None
+        if song:
+            rows = [
+                ["Track ID", target],
+                ["Song", song.name],
+                ["Artist", song.artist],
+                ["Spotify URI", song.spotify_uri or "Unknown"],
+                ["First Added", song.first_added.isoformat() if song.first_added else "Unknown"],
+            ]
+            section("Debug", "Track (Database)")
+            key_value_table(rows)
+            return
+
+        warning(f"No track found for id: {track_id}")
 
     def _env_table(self) -> Table:
         table = Table(title="Environment Keys", box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
