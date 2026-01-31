@@ -48,3 +48,12 @@ def test_simulate_generations_does_not_mutate_history():
     assert all(len(gen) == 2 for gen in plans)
     assert rm.history.generations == []
     assert rm.history.current_generation == 0
+
+
+def test_select_songs_empty_database_returns_empty_list():
+    songs = []
+    rm = InMemoryRotationManager("Empty Playlist", db=FakeDB(songs), spotify=object())
+
+    selected = rm.select_songs_for_today(count=3, fresh_days=30)
+
+    assert selected == []

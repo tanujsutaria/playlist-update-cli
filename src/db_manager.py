@@ -1,11 +1,14 @@
 import os
 import pickle
+import logging
 import numpy as np
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Set
 from sklearn.feature_extraction.text import TfidfVectorizer
 from models import Song
+
+logger = logging.getLogger(__name__)
 
 class DatabaseManager:
     """Manages the song database and embeddings using numpy for similarity search"""
@@ -22,31 +25,48 @@ class DatabaseManager:
         self.embeddings_dir = self.data_dir / "embeddings"
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"Checking data directories:")
-        print(f"- Data dir: {self.data_dir.absolute()}")
-        print(f"- Embeddings dir: {self.embeddings_dir.absolute()}")
+        logger.debug("Checking data directories:")
+        logger.debug("- Data dir: %s", self.data_dir.absolute())
+        logger.debug("- Embeddings dir: %s", self.embeddings_dir.absolute())
         
         # Check if files exist
         songs_path = self.embeddings_dir / "songs.pkl"
         embeddings_path = self.embeddings_dir / "embeddings.npy"
-        print(f"\nChecking files:")
-        print(f"- songs.pkl exists: {songs_path.exists()}")
-        print(f"- embeddings.npy exists: {embeddings_path.exists()}")
+        logger.debug("Checking files:")
+        logger.debug("- songs.pkl exists: %s", songs_path.exists())
+        logger.debug("- embeddings.npy exists: %s", embeddings_path.exists())
         
         if not songs_path.exists() or not embeddings_path.exists():
-            print(f"\nWARNING: Expected database files in: {self.embeddings_dir}")
-            print(f"Current directory: {os.getcwd()}")
+            logger.warning("Expected database files in: %s", self.embeddings_dir)
+            logger.debug("Current directory: %s", os.getcwd())
         
-        print("\nInitializing embedding model...")
+        logger.debug("Initializing embedding model...")
         self.model = TfidfVectorizer(stop_words='english')
         # Initialize the model with sample text to ensure non-empty vocabulary
         self.model.fit(["song artist music playlist track album"])
         
         self.songs = self._load_songs()
-        print(f"\nLoaded {len(self.songs)} songs from database")
+        logger.debug("Loaded %s songs from database", len(self.songs))
         
         self.embeddings = self._load_embeddings()
-        print(f"Loaded embeddings shape: {self.embeddings.shape if len(self.embeddings) > 0 else 'empty'}")
+        logger.debug(
+            "Loaded embeddings shape: %s",
+            self.embeddings.shape if len(self.embeddings) > 0 else "empty",
+        )
+
+    def _embedding_array(self, embedding: object, expected_dim: Optional[int] = None) -> np.ndarray:
+        arr = np.asarray(embedding, dtype=float)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if arr.size == 0:
+            fallback_dim = expected_dim if expected_dim is not None else 384
+            return np.zeros(fallback_dim)
+        if expected_dim is not None and arr.size != expected_dim:
+            if arr.size < expected_dim:
+                arr = np.pad(arr, (0, expected_dim - arr.size))
+            else:
+                arr = arr[:expected_dim]
+        return arr
 
     def _load_songs(self) -> dict:
         """Load song database from disk"""
@@ -142,7 +162,7 @@ class DatabaseManager:
                 return vector
             except Exception as e:
                 # Fallback to a zero vector of the right size if all else fails
-                print(f"Error generating embedding: {str(e)}")
+                logger.warning("Error generating embedding: %s", str(e))
                 return np.zeros(384)
 
     def add_song(self, song: Song) -> bool:
@@ -159,7 +179,7 @@ class DatabaseManager:
             try:
                 song.embedding = self.generate_embedding(song)
             except Exception as e:
-                print(f"Error generating embedding for {song.name}: {str(e)}")
+                logger.warning("Error generating embedding for %s: %s", song.name, str(e))
                 # Create a zero vector of the right size
                 if len(self.embeddings) > 0:
                     expected_dim = self.embeddings.shape[1]
@@ -168,24 +188,24 @@ class DatabaseManager:
                     song.embedding = np.zeros(384)  # Default size
 
         # Add to embeddings array
-        embedding = song.embedding.reshape(1, -1)
+        expected_dim = self.embeddings.shape[1] if len(self.embeddings) > 0 else None
+        embedding_vec = self._embedding_array(song.embedding, expected_dim=expected_dim)
+        song.embedding = embedding_vec.tolist()
+        embedding = embedding_vec.reshape(1, -1)
         if len(self.embeddings) == 0:
             self.embeddings = embedding
         else:
             try:
                 self.embeddings = np.vstack([self.embeddings, embedding])
             except ValueError as e:
-                print(f"Error adding embedding: {str(e)}")
+                logger.warning("Error adding embedding: %s", str(e))
                 # Try to fix the embedding and try again
                 if "shape" in str(e):
                     expected_dim = self.embeddings.shape[1]
-                    if len(song.embedding) != expected_dim:
-                        if len(song.embedding) < expected_dim:
-                            song.embedding = np.pad(song.embedding, (0, expected_dim - len(song.embedding)))
-                        else:
-                            song.embedding = song.embedding[:expected_dim]
-                        embedding = song.embedding.reshape(1, -1)
-                        self.embeddings = np.vstack([self.embeddings, embedding])
+                    embedding_vec = self._embedding_array(song.embedding, expected_dim=expected_dim)
+                    song.embedding = embedding_vec.tolist()
+                    embedding = embedding_vec.reshape(1, -1)
+                    self.embeddings = np.vstack([self.embeddings, embedding])
         
         # Add to songs database
         self.songs[song.id] = song
@@ -209,7 +229,7 @@ class DatabaseManager:
             song.embedding = self.generate_embedding(song)
 
         # Calculate cosine similarity
-        query_embedding = song.embedding.reshape(1, -1)
+        query_embedding = self._embedding_array(song.embedding).reshape(1, -1)
         # Handle zero vectors to avoid division by zero
         norms1 = np.linalg.norm(self.embeddings, axis=1)
         norms2 = np.linalg.norm(query_embedding)

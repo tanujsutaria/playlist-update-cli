@@ -8,6 +8,8 @@ import shlex
 import subprocess
 import sys
 import time
+import importlib.util
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -55,7 +57,10 @@ def detect_search_commands(env: Optional[dict] = None) -> Dict[str, str]:
     if claude_cmd:
         commands["claude"] = claude_cmd
     elif env.get("ANTHROPIC_API_KEY") or env.get("CLAUDE_API_KEY"):
-        commands["claude"] = "claude"
+        if _module_available("anthropic"):
+            commands["claude"] = _default_anthropic_web_search_command()
+        elif _command_exists("claude"):
+            commands["claude"] = "claude --json"
 
     codex_cmd = env.get("WEB_SEARCH_CODEX_CMD") or env.get("WEB_SCORE_CODEX_CMD")
     if codex_cmd:
@@ -226,6 +231,8 @@ def build_search_payload(
                     "sources": ["url"],
                     "metrics": {"metric_name": "value"},
                     "score": "float 0-1 (optional)",
+                    "spotify_url": "string (optional)",
+                    "spotify_uri": "string (optional)",
                 }
             ]
         },
@@ -316,6 +323,16 @@ def _run_command(
     output = _parse_json_output(result.stdout)
     if output is None:
         logger.warning("Search command for %s returned invalid JSON.", label)
+        if label == "claude" and _should_retry_claude_with_wrapper(command):
+            wrapper_cmd = _default_anthropic_web_search_command()
+            if wrapper_cmd != command:
+                logger.info("Retrying %s via Anthropic web search wrapper.", label)
+                return _run_command(label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides)
+        if label == "claude" and not _module_available("anthropic"):
+            logger.info(
+                "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m src.anthropic_web_search_wrapper' "
+                "or install the anthropic package for structured JSON output."
+            )
         return [], ""
 
     results, summary = _extract_output(output)
@@ -342,6 +359,15 @@ def _is_openai_wrapper_command(command: str) -> bool:
     return "openai_web_search_wrapper" in lowered
 
 
+def _should_retry_claude_with_wrapper(command: str) -> bool:
+    lowered = command.lower()
+    if "anthropic_web_search_wrapper" in lowered:
+        return False
+    if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
+        return False
+    return _module_available("anthropic")
+
+
 def _default_codex_command() -> str:
     schema = _codex_schema()
     return f'codex exec --search --output-schema {schema} -'
@@ -352,10 +378,23 @@ def _default_openai_web_search_command() -> str:
     return shlex.join([sys.executable, str(script_path)])
 
 
+def _default_anthropic_web_search_command() -> str:
+    script_path = Path(__file__).resolve().with_name("anthropic_web_search_wrapper.py")
+    return shlex.join([sys.executable, str(script_path)])
+
+
 def _codex_schema() -> str:
     return (
-        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
+        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]},"spotify_url":{"type":["string","null"]},"spotify_uri":{"type":["string","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
     )
+
+
+def _module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def _command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
 
 
 def _build_prompt_from_payload(payload: dict) -> str:

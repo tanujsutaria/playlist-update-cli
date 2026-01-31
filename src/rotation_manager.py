@@ -94,6 +94,9 @@ class RotationManager:
         """Select songs using a provided history snapshot."""
         today = datetime.now()
         all_songs = self.db.get_all_songs()
+        if not all_songs:
+            logger.warning("No songs available in the database for selection.")
+            return []
         used_songs = history.all_used_songs
 
         scores_by_id: Dict[str, float] = {}

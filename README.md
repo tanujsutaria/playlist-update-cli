@@ -49,6 +49,7 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 ## First-time setup
 - On launch, `tunr` auto-detects keys in your environment.
 - If any Spotify keys are missing, the app enters setup mode.
+- Non-Spotify commands (for example, `/stats`, `/backup`, `/list-backups`, `/search` if configured) still run in setup mode.
 - Use `/setup` to see instructions and `/env` to confirm detected keys.
 - `/help` is available on demand and is not shown automatically.
 
@@ -139,7 +140,7 @@ Bohemian Rhapsody,Queen
 The `/search` command uses Claude/Codex CLIs if available. It checks, in order:
 - `WEB_SEARCH_CLAUDE_CMD` / `WEB_SEARCH_CODEX_CMD`
 - `WEB_SCORE_CLAUDE_CMD` / `WEB_SCORE_CODEX_CMD`
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (uses `claude` and an OpenAI API wrapper)
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (uses the Anthropic API wrapper when available, plus the OpenAI API wrapper)
 
 You can also set a generic command for search via `WEB_SEARCH_CMD`.
 If your CLI needs extra flags (or doesn't support `--json`), set the full command explicitly
@@ -157,7 +158,7 @@ export WEB_SEARCH_FALLBACK_MODEL="gpt-4o"  # optional: retry if deep research ti
 export WEB_SEARCH_PARALLEL_PER_PROVIDER="5"  # optional: parallel searches per provider
 ```
 
-Anthropic API wrapper (recommended for Claude search):
+Anthropic API wrapper (recommended for Claude search). Requires the `anthropic` Python package (install with `pip install anthropic`):
 ```bash
 export WEB_SEARCH_CLAUDE_CMD="python -m src.anthropic_web_search_wrapper"
 export ANTHROPIC_WEB_SEARCH_MODEL="claude-opus-4-5"  # default: opus 4.5

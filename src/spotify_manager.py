@@ -293,27 +293,13 @@ class SpotifyManager:
             track_uris = []
             failed_songs = set()
             
-            # For testing with empty songs, add some real songs that will be found
-            if not any(song.spotify_uri for song in songs):
-                # Add some popular songs that will definitely be found
-                test_songs = [
-                    {"name": "Bohemian Rhapsody", "artist": "Queen"},
-                    {"name": "Billie Jean", "artist": "Michael Jackson"},
-                    {"name": "Hotel California", "artist": "Eagles"}
-                ]
-                
-                logger.info("No valid songs found. Adding test songs for demonstration...")
-                for test_song in test_songs:
-                    query = f"track:{test_song['name']} artist:{test_song['artist']}"
-                    results = self.sp.search(query, type='track', limit=1)
-                    if results['tracks']['items']:
-                        track = results['tracks']['items'][0]
-                        track_uris.append(track['uri'])
-                        logger.info(f"Added test song: {test_song['name']} by {test_song['artist']}")
-            
             # Process the original songs
             logger.info(f"Processing {len(songs)} new tracks...")
-            with tqdm(total=len(songs), desc="Processing tracks") as pbar:
+            with tqdm(
+                total=len(songs),
+                desc="Processing tracks",
+                disable=os.getenv("TUNR_INTERACTIVE") == "1",
+            ) as pbar:
                 for song in songs:
                     uri = None
                     try:
@@ -386,7 +372,11 @@ class SpotifyManager:
             failed_songs = set()
             
             logger.info(f"Processing {len(songs)} tracks to append...")
-            with tqdm(total=len(songs), desc="Processing tracks") as pbar:
+            with tqdm(
+                total=len(songs),
+                desc="Processing tracks",
+                disable=os.getenv("TUNR_INTERACTIVE") == "1",
+            ) as pbar:
                 for song in songs:
                     uri = None
                     try:

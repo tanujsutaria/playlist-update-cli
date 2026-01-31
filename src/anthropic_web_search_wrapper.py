@@ -17,7 +17,8 @@ DEFAULT_INSTRUCTIONS = (
     "URLs), and metrics (object) for any user-requested metrics. If the query implies similarity "
     "(e.g., 'like X'), include a 'similarity' metric (0-1). If the query includes monthly listeners "
     "constraints, include a 'monthly_listeners' metric and cite sources. Optionally include a "
-    "score 0-1 indicating fit confidence."
+    "score 0-1 indicating fit confidence. If you can find a Spotify URL, include it as "
+    "'spotify_url'."
 )
 
 

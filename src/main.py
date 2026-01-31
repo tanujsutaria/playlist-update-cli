@@ -778,7 +778,11 @@ class PlaylistCLI:
             
             # Check each song
             from tqdm import tqdm
-            for song in tqdm(all_songs, desc="Checking songs"):
+            for song in tqdm(
+                all_songs,
+                desc="Checking songs",
+                disable=os.getenv("TUNR_INTERACTIVE") == "1",
+            ):
                 stats["checked"] += 1
                 
                 # Skip songs that already have a Spotify URI (optimization)

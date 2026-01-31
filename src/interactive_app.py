@@ -21,6 +21,7 @@ from textual.widgets import Input, RichLog, Static
 from arg_parse import setup_parsers, parse_tokens
 from main import PlaylistCLI, dispatch_command, configure_logging
 from ui import set_output_sink
+from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
 SPOTIFY_REQUIRED_KEYS = [
@@ -33,6 +34,17 @@ SEARCH_OPTIONAL_KEYS = [
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
 ]
+
+COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
+    "backup",
+    "list-backups",
+    "restore",
+    "list-rotations",
+    "stats",
+    "plan",
+    "search",
+    "interactive",
+}
 
 
 class UILogHandler(logging.Handler):
@@ -266,7 +278,15 @@ class PlaylistInteractiveApp(App):
             self.action_quit()
             return
 
-        if self._setup_mode:
+        tokens = shlex.split(text)
+        command, args, error = parse_tokens(tokens)
+        if error:
+            self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
+            return
+        if command == "interactive":
+            self.append_log(Text("Already in interactive mode.", style="yellow"))
+            return
+        if self._setup_mode and command not in COMMANDS_ALLOWED_WITHOUT_SPOTIFY:
             missing = ", ".join(self._missing_spotify_keys)
             self.append_log(
                 Panel(
@@ -278,15 +298,6 @@ class PlaylistInteractiveApp(App):
                     border_style="red",
                 )
             )
-            return
-
-        tokens = shlex.split(text)
-        command, args, error = parse_tokens(tokens)
-        if error:
-            self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
-            return
-        if command == "interactive":
-            self.append_log(Text("Already in interactive mode.", style="yellow"))
             return
         self._run_command(command, args)
 
@@ -454,11 +465,7 @@ class PlaylistInteractiveApp(App):
             self._update_setup_screen()
             return
         self.append_log(self._env_table())
-        providers = []
-        if self._env_status.get("ANTHROPIC_API_KEY"):
-            providers.append("claude")
-        if self._env_status.get("OPENAI_API_KEY"):
-            providers.append("codex")
+        providers = sorted(detect_search_commands().keys())
         if providers:
             self.append_log(Text(f"Deep search providers: {', '.join(providers)}", style="dim"))
         else:
@@ -480,11 +487,7 @@ class PlaylistInteractiveApp(App):
         setup.append("   SPOTIFY_REDIRECT_URI=http://localhost:8888/callback\n", style="dim")
         setup.append("2) Restart tunr after editing .env\n", style="dim")
         setup.append("3) Optional: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY for /search\n", style="dim")
-        providers = []
-        if self._env_status.get("ANTHROPIC_API_KEY"):
-            providers.append("claude")
-        if self._env_status.get("OPENAI_API_KEY"):
-            providers.append("codex")
+        providers = sorted(detect_search_commands().keys())
         provider_text = Text(
             f"Deep search providers: {', '.join(providers) if providers else 'none detected'}",
             style="dim",
@@ -597,6 +600,7 @@ class PlaylistInteractiveApp(App):
 
 
 def run_interactive() -> int:
+    os.environ.setdefault("TUNR_INTERACTIVE", "1")
     parser = setup_parsers()
     cli = PlaylistCLI()
     app = PlaylistInteractiveApp(cli=cli, parser=parser)
