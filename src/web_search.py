@@ -288,17 +288,6 @@ def _run_command(
         logger.warning("Search command failed for %s: %s", label, exc)
         return [], ""
 
-    if label == "claude" and _env_truthy("WEB_SEARCH_LOG_CLAUDE_RAW", default=False):
-        logger.warning(
-            "Claude raw stdout (truncated): %s",
-            _truncate_log(result.stdout),
-        )
-        if result.stderr:
-            logger.warning(
-                "Claude raw stderr (truncated): %s",
-                _truncate_log(result.stderr),
-            )
-
     if result.returncode != 0:
         logger.warning("Search command for %s exited with %s", label, result.returncode)
         if result.stderr:
@@ -474,13 +463,6 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _truncate_log(text: Optional[str], limit: int = 4000) -> str:
-    if not text:
-        return ""
-    cleaned = text.strip()
-    if len(cleaned) <= limit:
-        return cleaned
-    return f"{cleaned[:limit]} ... (truncated {len(cleaned) - limit} chars)"
 
 
 def _build_prompt_from_payload(payload: dict) -> str:
