@@ -392,7 +392,7 @@ class PlaylistInteractiveApp(App):
             if isinstance(action, argparse._SubParsersAction):
                 for choice in action._choices_actions:
                     name = choice.dest
-                    if name == "interactive":
+                    if name in {"interactive", "debug"}:
                         continue
                     help_text = choice.help or ""
                     if help_text.lower().startswith("legacy:"):
@@ -528,9 +528,26 @@ class PlaylistInteractiveApp(App):
                 ["Provider", run.get("provider") or "combined"],
                 ["Status", run.get("status") or "unknown"],
                 ["Cached", "yes" if summary.get("cached") else "no"],
+                ["Model", summary.get("model_name") or "unknown"],
                 ["Avg strict ratio", f"{summary.get('avg_strict_ratio', 0):.2f}"],
                 ["Missing context", summary.get("missing_context", 0)],
             ]
+            score_config = summary.get("score_config") or {}
+            if score_config:
+                rows.append(
+                    [
+                        "Score Config",
+                        (
+                            f"base {score_config.get('base_weight', 0):.2f} / "
+                            f"strict {score_config.get('strict_weight', 0):.2f} / "
+                            f"source {score_config.get('source_weight', 0):.2f} / "
+                            f"year {score_config.get('year_weight', 0):.2f} / "
+                            f"tol {score_config.get('year_tolerance', 0)} / "
+                            f"cap {score_config.get('source_cap', 0)} / "
+                            f"target {score_config.get('year_target') or '-'}"
+                        ),
+                    ]
+                )
             section("Debug", "Last Search")
             key_value_table(rows)
             if candidates:
@@ -608,6 +625,8 @@ class PlaylistInteractiveApp(App):
         if found:
             rows = [
                 ["Track ID", resolved_id],
+                ["Run ID", self.cli.last_search_run_id or "unknown"],
+                ["Cached Run", "yes" if self.cli.last_search_cached else "no"],
                 ["Song", found.get("song") or found.get("name") or ""],
                 ["Artist", found.get("artist") or ""],
                 ["Year", found.get("year") or "-"],
@@ -626,6 +645,7 @@ class PlaylistInteractiveApp(App):
         if debug_payload:
             context = debug_payload.get("context") or {}
             sources = debug_payload.get("sources") or []
+            embedding = debug_payload.get("embedding") or {}
             listens = debug_payload.get("listens") or []
             if context:
                 fields_payload = context.get("fields_json")
@@ -651,9 +671,35 @@ class PlaylistInteractiveApp(App):
                 })
             if sources:
                 subsection("Sources (DB)")
+                def _shorten(value: object, limit: int = 120) -> str:
+                    text = str(value or "").replace("\n", " ").strip()
+                    if len(text) <= limit:
+                        return text
+                    return f"{text[:limit - 3]}..."
+
                 table(
-                    ["#", "URL", "Provider"],
-                    [[i, s.get("url") or "", s.get("provider") or ""] for i, s in enumerate(sources, 1)],
+                    ["#", "URL", "Title", "Snippet", "Provider", "Strict"],
+                    [
+                        [
+                            i,
+                            s.get("url") or "",
+                            _shorten(s.get("title")),
+                            _shorten(s.get("snippet")),
+                            s.get("provider") or "",
+                            "yes" if s.get("is_strict") else "no",
+                        ]
+                        for i, s in enumerate(sources, 1)
+                    ],
+                )
+            if embedding:
+                subsection("Embedding")
+                key_value_table(
+                    [
+                        ["Model", embedding.get("model_name") or ""],
+                        ["Dimensions", embedding.get("embedding_dim") or ""],
+                        ["Norm", f"{embedding.get('embedding_norm', 0):.4f}" if embedding.get("embedding_norm") is not None else ""],
+                        ["Created", embedding.get("created_at") or ""],
+                    ]
                 )
             if listens:
                 subsection("Listen Events")

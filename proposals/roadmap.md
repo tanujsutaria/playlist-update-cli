@@ -96,6 +96,38 @@ Similarity is computed locally via sentence embeddings. Rich context is hidden i
 - Rank candidates using cached semantic similarity + metadata.
 - Preserve playlist ID (no delete/recreate).
 
+## Dependency Graph (Current)
+**Nodes**
+- A: Decisions (model choice, strict/lenient thresholds, provider schema)
+- B: Storage foundation (SQLite + repos + migrations)
+- C: Provider pipeline + context extraction
+- D: Local embeddings + scoring
+- E: UX + streaming UI
+- F: Command consolidation
+- G: Rotation rethink (listen ledger + played policy)
+- H: Debug tooling (last/track, sources, score config)
+
+**Edges**
+- A → B, C, D
+- B → C, D, H
+- C → D, H
+- D → E, F, G
+- F → E
+- H → E
+
+**Status**
+- A: Done (defaults locked, provider schema updated for context + source details)
+- B: Done
+- C: Done
+- D: Done (metadata boosts + configurable weights)
+- E: Done (live in-place table streaming in interactive mode)
+- F: Done
+- G: Done
+- H: Done (interactive + CLI debug)
+
+**Critical Path (Remaining)**
+- None (all phases complete; only optional enhancements remain)
+
 ## Deliverables Summary
 - SQLite storage + repositories.
 - Strict/lenient context extraction with sources.

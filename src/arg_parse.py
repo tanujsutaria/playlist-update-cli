@@ -94,6 +94,15 @@ def setup_parsers(
     search_parser = subparsers.add_parser('search', help='Deep web search for new songs')
     search_parser.add_argument('query', nargs='+', help='Search criteria (freeform)')
 
+    # Debug command (non-interactive)
+    debug_parser = subparsers.add_parser('debug', help='Show debug info (last search or track)')
+    debug_parser.add_argument('topic', nargs='?', choices=['last', 'track'], default='last',
+                              help='Debug topic (last or track)')
+    debug_parser.add_argument('value', nargs='?', default=None,
+                              help='Track ID for debug track')
+    debug_parser.add_argument('--format', choices=['json', 'table'], default='json',
+                              help='Output format (default: json)')
+
     # Ingest command
     ingest_parser = subparsers.add_parser('ingest', help='Ingest tracks into the cache')
     ingest_parser.add_argument('source', choices=['liked', 'playlist', 'top', 'recent'],

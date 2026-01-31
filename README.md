@@ -76,6 +76,13 @@ export SEARCH_SCORE_SOURCE_WEIGHT="0.05"
 export SEARCH_SCORE_YEAR_WEIGHT="0.05"
 export SEARCH_SCORE_YEAR_TOLERANCE="10"
 export SEARCH_SCORE_SOURCE_CAP="5"
+export SEARCH_PREVIEW_LIMIT="20"
+export SEARCH_PREVIEW_STRIDE="5"
+export SEARCH_STREAM_FULL="0"  # default is 1 in interactive mode
+export SEARCH_LIVE_MODE="full" # full | compact (affects live table only)
+export SEARCH_LIVE_PAGE_SIZE="50"
+export SEARCH_LIVE_PAGE="1"
+export SEARCH_FINAL_TABLE_MODE="full" # full | compact | none
 ```
 
 To broaden the last search (expanded source policy):
@@ -155,6 +162,7 @@ To broaden the last search (expanded source policy):
 /debug last
 /debug track "artist|||song"
 /debug track 3
+/debug last --format table
 /quit
 ```
 
