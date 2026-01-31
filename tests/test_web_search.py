@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from web_search import (
     detect_search_commands,
@@ -6,6 +7,7 @@ from web_search import (
     extract_constraints,
     extract_requested_metrics,
     _extract_output,
+    _run_command,
 )
 
 
@@ -92,3 +94,39 @@ def test_normalize_item_with_artists_list():
     assert len(results) == 1
     assert results[0]["song"] == "Track A"
     assert results[0]["artist"] == "Artist 1"
+
+
+def test_claude_wrapper_fallbacks_to_cli(monkeypatch):
+    if shutil.which("claude") is None:
+        return
+
+    empty_wrapper_output = '{"summary":"","results":[]}'
+    cli_output = '{"summary":"ok","results":[{"song":"Track A","artist":"Artist 1","sources":[],"metrics":{}}]}'
+
+    class DummyResult:
+        def __init__(self, stdout: str):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    calls = {"count": 0}
+
+    def fake_run(args, input=None, text=None, capture_output=None, timeout=None, env=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return DummyResult(empty_wrapper_output)
+        return DummyResult(cli_output)
+
+    monkeypatch.setattr("web_search.subprocess.run", fake_run)
+    monkeypatch.setenv("WEB_SEARCH_CLAUDE_FALLBACK_CLI", "1")
+    monkeypatch.setattr("web_search._is_anthropic_wrapper_command", lambda command: True)
+
+    results, summary = _run_command(
+        "claude",
+        "python -m src.anthropic_web_search_wrapper",
+        {"query": "x"},
+        10,
+    )
+
+    assert summary == "ok"
+    assert len(results) == 1
