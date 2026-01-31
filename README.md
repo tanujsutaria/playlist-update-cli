@@ -116,6 +116,9 @@ To broaden the last search (expanded source policy):
 ```bash
 /help
 /debug
+/debug last
+/debug track "artist|||song"
+/debug track 3
 /quit
 ```
 
