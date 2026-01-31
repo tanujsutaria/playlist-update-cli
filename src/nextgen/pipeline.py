@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +19,34 @@ from .extract import extract_context
 from .embeddings import EmbeddingModel
 from .providers import run_providers
 from .scoring import ScoreConfig, rank_scores, score_candidates
+
+
+logger = logging.getLogger(__name__)
+
+
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_DECADE_RE = re.compile(r"\b((?:19|20)?\d{2})s\b")
+
+
+def _extract_year_target(query: str) -> Optional[int]:
+    match = _YEAR_RE.search(query)
+    if match:
+        return int(match.group(0))
+    match = _DECADE_RE.search(query.lower())
+    if not match:
+        return None
+    token = match.group(1)
+    if len(token) == 2:
+        decade = int(token)
+        if decade >= 50:
+            base = 1900 + decade
+        else:
+            base = 2000 + decade
+    else:
+        base = int(token)
+        if base < 1900:
+            base += 1900
+    return base + 5
 
 
 ProgressCallback = Callable[[str], None]
@@ -44,11 +74,14 @@ class SearchPipeline:
         model_name: str = "all-mpnet-base-v2",
         strict_threshold: float = 0.6,
         lenient_threshold: float = 0.75,
+        score_config: Optional[ScoreConfig] = None,
     ) -> None:
         self.repos = repos
         self.model_name = model_name
         self.strict_threshold = strict_threshold
         self.lenient_threshold = lenient_threshold
+        self.score_config = score_config or ScoreConfig()
+        self.last_cached = False
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
@@ -112,12 +145,14 @@ class SearchPipeline:
         if progress:
             progress("cache")
 
-        query_hash = compute_query_hash(query, {"expanded": expanded})
+        query_hash = compute_query_hash(query, {"expanded": expanded, "model": self.model_name})
         cached_run_id = self._latest_run_id(query_hash)
         if cached_run_id:
             cached_results = self._load_cached_results(cached_run_id)
             if cached_results:
+                self.last_cached = True
                 return cached_results, cached_run_id
+        self.last_cached = False
 
         if progress:
             progress("search")
@@ -161,6 +196,7 @@ class SearchPipeline:
         track_ids: List[str] = []
         context_texts: List[str] = []
         strict_ratios: List[float] = []
+        metadata_items: List[Dict[str, object]] = []
         processed_items: List[Dict[str, object]] = []
 
         if progress:
@@ -182,6 +218,8 @@ class SearchPipeline:
                 strict_threshold=self.strict_threshold,
                 lenient_threshold=self.lenient_threshold,
             )
+            if item.get("_context_missing"):
+                logger.warning("Missing context fields for %s by %s", song, artist)
             context_card = build_context_card(
                 song=song,
                 artist=artist,
@@ -232,23 +270,56 @@ class SearchPipeline:
                 }
             )
 
+            provider_label = ",".join(item.get("providers") or provider_run.providers)
+            detail_map: Dict[str, Dict[str, object]] = {}
+            for detail in item.get("source_details") or []:
+                if not isinstance(detail, dict):
+                    continue
+                url = detail.get("url")
+                if url:
+                    detail_map[str(url)] = detail
+
             for source in extracted.sources:
                 source_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{track_id}|{source}").hex
+                detail = detail_map.get(source, {})
                 self.repos.sources.upsert(
                     {
                         "source_id": source_id,
                         "track_id": track_id,
                         "url": source,
-                        "title": None,
-                        "snippet": None,
-                        "provider": ",".join(item.get("providers") or provider_run.providers),
+                        "title": detail.get("title"),
+                        "snippet": detail.get("snippet"),
+                        "provider": provider_label,
                         "is_strict": 1,
+                        "retrieved_at": now,
+                    }
+                )
+
+            for url, detail in detail_map.items():
+                if url in extracted.sources:
+                    continue
+                source_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{track_id}|{url}").hex
+                self.repos.sources.upsert(
+                    {
+                        "source_id": source_id,
+                        "track_id": track_id,
+                        "url": url,
+                        "title": detail.get("title"),
+                        "snippet": detail.get("snippet"),
+                        "provider": provider_label,
+                        "is_strict": 0,
                         "retrieved_at": now,
                     }
                 )
 
             context_texts.append(context_card.context_text)
             strict_ratios.append(context_card.strict_ratio)
+            metadata_items.append(
+                {
+                    "year": year,
+                    "sources_count": len(item.get("sources") or []),
+                }
+            )
             processed_items.append(item)
 
             if progress and idx % 25 == 0:
@@ -293,11 +364,22 @@ class SearchPipeline:
         if progress:
             progress("score")
 
+        base_config = self.score_config or ScoreConfig()
+        score_config = ScoreConfig(
+            strict_weight=base_config.strict_weight,
+            base_weight=base_config.base_weight,
+            source_weight=base_config.source_weight,
+            year_weight=base_config.year_weight,
+            year_tolerance=base_config.year_tolerance,
+            source_cap=base_config.source_cap,
+            year_target=_extract_year_target(query),
+        )
         scores = score_candidates(
             query_vector,
             track_vectors,
             strict_ratios,
-            ScoreConfig(),
+            score_config,
+            metadata=metadata_items,
         )
         order = rank_scores(scores)
 

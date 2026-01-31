@@ -44,6 +44,34 @@ def test_synthesize_results_merges_providers():
     assert len(first["sources"]) == 2
 
 
+def test_synthesize_results_merges_source_details():
+    provider_results = {
+        "claude": [
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "sources": ["https://example.com/a"],
+                "source_details": [{"url": "https://example.com/a", "title": "Source A"}],
+            }
+        ],
+        "codex": [
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "sources": ["https://example.com/b"],
+                "source_details": [{"url": "https://example.com/b", "snippet": "Snippet B"}],
+            }
+        ],
+    }
+
+    combined = synthesize_results(provider_results, limit=5)
+    details = combined[0]["source_details"]
+
+    urls = {detail.get("url") for detail in details}
+    assert "https://example.com/a" in urls
+    assert "https://example.com/b" in urls
+
+
 def test_extract_constraints_monthly_listeners():
     constraints = extract_constraints("artists under 50k monthly listeners")
     assert constraints["max_monthly_listeners"] == 50000
@@ -94,6 +122,27 @@ def test_normalize_item_with_artists_list():
     assert len(results) == 1
     assert results[0]["song"] == "Track A"
     assert results[0]["artist"] == "Artist 1"
+
+
+def test_normalize_item_with_source_details():
+    results, _ = _extract_output(
+        {
+            "summary": "ok",
+            "results": [
+                {
+                    "song": "Track A",
+                    "artist": "Artist 1",
+                    "sources": [
+                        {"url": "https://example.com/a", "title": "Source A", "snippet": "Snippet A"}
+                    ],
+                    "metrics": {},
+                }
+            ],
+        }
+    )
+
+    assert results[0]["sources"] == ["https://example.com/a"]
+    assert results[0]["source_details"][0]["title"] == "Source A"
 
 
 def test_claude_wrapper_fallbacks_to_cli(monkeypatch):

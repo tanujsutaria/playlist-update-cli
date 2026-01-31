@@ -23,7 +23,7 @@ DEFAULT_INSTRUCTIONS = (
     "(e.g., max monthly listeners). Return JSON only with a top-level 'summary' and a 'results' "
     "list. The summary should explain why these recommendations fit the user's criteria. Each "
     "result must include: song, artist, year (if known), why (short rationale), sources (list of "
-    "URLs), and metrics (object) for any user-requested metrics. If the query implies similarity "
+    "URLs or objects with url/title/snippet), and metrics (object) for any user-requested metrics. If the query implies similarity "
     "(e.g., 'like X'), include a 'similarity' metric (0-1). If the query includes monthly listeners "
     "constraints, include a 'monthly_listeners' metric and cite sources. Optionally include a "
     "score 0-1 indicating fit confidence. If you can find a Spotify URL, include it as "
@@ -731,8 +731,28 @@ def _normalize_item(item: object) -> Optional[dict]:
         return None
 
     sources = item.get("sources") or item.get("source_urls") or item.get("links") or []
+    if isinstance(sources, dict):
+        sources = [sources]
     if isinstance(sources, str):
         sources = [sources]
+    source_details: List[dict] = []
+    normalized_sources: List[str] = []
+    for source in sources:
+        if isinstance(source, dict):
+            url = source.get("url") or source.get("link") or source.get("source") or source.get("href")
+            if url:
+                normalized_sources.append(str(url))
+                detail = {"url": str(url)}
+                title = source.get("title") or source.get("name")
+                snippet = source.get("snippet") or source.get("summary") or source.get("description")
+                if title:
+                    detail["title"] = str(title)
+                if snippet:
+                    detail["snippet"] = str(snippet)
+                source_details.append(detail)
+        else:
+            if source:
+                normalized_sources.append(str(source))
 
     metrics = {}
     if isinstance(item.get("metrics"), dict):
@@ -764,7 +784,8 @@ def _normalize_item(item: object) -> Optional[dict]:
         "artist": str(artist),
         "year": item.get("year") or item.get("release_year") or item.get("released") or "",
         "why": item.get("why") or item.get("reason") or item.get("rationale") or item.get("notes") or "",
-        "sources": [str(s) for s in sources if s],
+        "sources": normalized_sources,
+        "source_details": source_details,
         "metrics": metrics,
         "score": _safe_float(item.get("score") or item.get("confidence")),
         "spotify_url": item.get("spotify_url") or item.get("spotify") or "",
@@ -808,6 +829,7 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                     "year": item.get("year") or "",
                     "why": [],
                     "sources": set(),
+                    "source_details": {},
                     "metrics": {},
                     "providers": [],
                     "scores": [],
@@ -822,6 +844,23 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                 combined[key]["why"].append(f"{provider}: {item['why']}")
             combined[key]["providers"].append(provider)
             combined[key]["sources"].update(item.get("sources") or [])
+            details = item.get("source_details") or []
+            if isinstance(details, list):
+                for detail in details:
+                    if not isinstance(detail, dict):
+                        continue
+                    url = detail.get("url")
+                    if not url:
+                        continue
+                    existing_detail = combined[key]["source_details"].get(url) or {}
+                    if not existing_detail:
+                        combined[key]["source_details"][url] = detail
+                        continue
+                    if detail.get("title") and not existing_detail.get("title"):
+                        existing_detail["title"] = detail.get("title")
+                    if detail.get("snippet") and not existing_detail.get("snippet"):
+                        existing_detail["snippet"] = detail.get("snippet")
+                    combined[key]["source_details"][url] = existing_detail
             metrics = item.get("metrics") or {}
             if isinstance(metrics, dict):
                 for metric_key, metric_value in metrics.items():
@@ -864,6 +903,7 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                 "year": entry["year"],
                 "why": " | ".join(entry["why"]).strip(),
                 "sources": sorted(entry["sources"]),
+                "source_details": list(entry["source_details"].values()),
                 "metrics": entry["metrics"],
                 "providers": sorted(set(entry["providers"])),
                 "mentions": mentions,
