@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import shlex
+import json
 from typing import Iterable, Tuple, List, Optional
 
 from rich.console import Group
@@ -479,6 +480,34 @@ class PlaylistInteractiveApp(App):
         if not self.cli.last_search_query:
             self.append_log(Text("No previous search to inspect.", style="dim"))
             return
+
+        payload = self.cli.debug_last_search()
+        if payload:
+            run = payload.get("run") or {}
+            candidates = payload.get("candidates") or []
+            rows = [
+                ["Query", self.cli.last_search_query],
+                ["Run ID", run.get("run_id")],
+                ["Results", len(candidates)],
+                ["Expanded", "yes" if self.cli.last_search_expanded else "no"],
+                ["Provider", run.get("provider") or "combined"],
+                ["Status", run.get("status") or "unknown"],
+            ]
+            section("Debug", "Last Search")
+            key_value_table(rows)
+            if candidates:
+                preview_rows = []
+                for idx, candidate in enumerate(candidates[:10], 1):
+                    track = candidate.get("track") or {}
+                    track_id = candidate.get("track_id")
+                    artist_label = track.get("artist_name") or track.get("artist_id", "")
+                    label = f"{track.get('name', '')} — {artist_label}".strip(" —")
+                    preview_rows.append([idx, label, track_id])
+                subsection("Top Results (IDs)")
+                table(["#", "Track", "Track ID"], preview_rows)
+                info("Use /debug track <id> or /debug track <rank> to inspect a specific entry.")
+            return
+
         results = self.cli.last_search_results or []
         providers = sorted({p for item in results for p in (item.get("providers") or [])})
         rows = [
@@ -490,23 +519,12 @@ class PlaylistInteractiveApp(App):
         ]
         section("Debug", "Last Search")
         key_value_table(rows)
-        if self.cli.last_search_summary:
-            info(f"Summary: {self.cli.last_search_summary}")
-        if self.cli.last_search_constraints:
-            subsection("Constraints")
-            json_output(self.cli.last_search_constraints)
-        if self.cli.last_search_policy:
-            subsection("Source Policy")
-            json_output(self.cli.last_search_policy)
-
         if results:
             preview_rows = []
             for idx, item in enumerate(results[:10], 1):
                 song = item.get("song") or item.get("name") or ""
                 artist = item.get("artist") or ""
-                if not song or not artist:
-                    continue
-                track_id = f"{artist.lower()}|||{song.lower()}"
+                track_id = item.get("track_id") or f"{artist.lower()}|||{song.lower()}"
                 preview_rows.append([idx, f"{song} — {artist}", track_id])
             if preview_rows:
                 subsection("Top Results (IDs)")
@@ -555,20 +573,59 @@ class PlaylistInteractiveApp(App):
                 ["Song", found.get("song") or found.get("name") or ""],
                 ["Artist", found.get("artist") or ""],
                 ["Year", found.get("year") or "-"],
-                ["Spotify", found.get("spotify_url") or found.get("spotify_uri") or "Not found"],
                 ["Providers", ", ".join(found.get("providers") or []) or "unknown"],
-                ["Why", found.get("why") or ""],
+                ["Score", f"{found.get('score', 0):.3f}" if isinstance(found.get("score"), (int, float)) else found.get("score")],
+                ["Strict Ratio", f"{found.get('strict_ratio', 0):.2f}" if isinstance(found.get("strict_ratio"), (int, float)) else found.get("strict_ratio")],
             ]
             section("Debug", "Track")
             key_value_table(rows)
-            metrics = found.get("metrics") or {}
-            if metrics:
-                subsection("Metrics")
-                json_output(metrics)
             sources = found.get("sources") or []
             if sources:
                 subsection("Sources")
                 table(["#", "Source"], [[i, s] for i, s in enumerate(sources, 1)])
+
+        debug_payload = self.cli.debug_track(target)
+        if debug_payload:
+            context = debug_payload.get("context") or {}
+            sources = debug_payload.get("sources") or []
+            listens = debug_payload.get("listens") or []
+            if context:
+                fields_payload = context.get("fields_json")
+                sources_payload = context.get("sources_json")
+                try:
+                    if isinstance(fields_payload, str):
+                        fields_payload = json.loads(fields_payload)
+                except Exception:
+                    pass
+                try:
+                    if isinstance(sources_payload, str):
+                        sources_payload = json.loads(sources_payload)
+                except Exception:
+                    pass
+                subsection("Context")
+                json_output({
+                    "context_text": context.get("context_text"),
+                    "strict_text": context.get("strict_text"),
+                    "lenient_text": context.get("lenient_text"),
+                    "strict_ratio": context.get("strict_ratio"),
+                    "fields": fields_payload,
+                    "sources": sources_payload,
+                })
+            if sources:
+                subsection("Sources (DB)")
+                table(
+                    ["#", "URL", "Provider"],
+                    [[i, s.get("url") or "", s.get("provider") or ""] for i, s in enumerate(sources, 1)],
+                )
+            if listens:
+                subsection("Listen Events")
+                table(
+                    ["#", "Played At", "Source"],
+                    [
+                        [i, event.get("played_at") or "", event.get("source") or ""]
+                        for i, event in enumerate(listens[:10], 1)
+                    ],
+                )
             return
 
         try:
@@ -641,10 +698,10 @@ class PlaylistInteractiveApp(App):
     def _prompt_search_followup(self) -> None:
         self._pending_action = "search_confirm"
         self._pending_payload = {
-            "results": self.cli.last_search_results,
+            "track_ids": self.cli.last_search_track_ids or [],
             "query": self.cli.last_search_query,
         }
-        self.append_log(Text("Add these recommendations to the database and/or create a playlist? (yes/no)", style="bold"))
+        self.append_log(Text("Cached. Mark these recommendations and/or create a playlist? (yes/no)", style="bold"))
         self.append_log(Text("Or run /expand to broaden the search.", style="dim"))
 
     def _handle_pending_input(self, raw: str) -> None:
@@ -694,23 +751,20 @@ class PlaylistInteractiveApp(App):
         if self.status != "Idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
-        results = self._pending_payload.get("results") or []
-        if not results:
+        track_ids = self._pending_payload.get("track_ids") or []
+        if not track_ids:
             self.append_log(Text("No search results available.", style="yellow"))
             self._clear_pending()
             return
 
         def _worker() -> None:
             try:
-                songs_for_playlist = []
                 if mode in {"db", "both"}:
-                    songs_for_playlist = self.cli.add_search_results_to_db(results)
+                    self.cli.mark_search_tracks(track_ids, status="accepted")
                 if mode in {"playlist", "both"}:
                     if not playlist_name:
                         return
-                    if not songs_for_playlist:
-                        songs_for_playlist = self.cli.resolve_search_results_for_playlist(results)
-                    self.cli.create_playlist_from_search_results(playlist_name, songs_for_playlist)
+                    self.cli.create_playlist_from_track_ids(playlist_name, track_ids)
             finally:
                 self.call_from_thread(self._set_idle)
 

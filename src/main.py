@@ -10,6 +10,7 @@ if str(SRC_DIR) not in sys.path:
 import json
 import csv
 import shutil
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import Optional, Dict, List, Union, Tuple
@@ -22,6 +23,12 @@ from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cache
 from rotation_manager import RotationManager
 from scoring import ScoreConfig
 from ui import console, section, subsection, table, key_value_table, info, warning
+from storage.db import Database
+from storage.migrations import ensure_schema
+from storage.repos import Repositories
+from storage.vectors import decode_vector, vector_norm
+from nextgen.pipeline import SearchPipeline, SearchResult
+from nextgen.embeddings import EmbeddingModel
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +58,9 @@ class PlaylistCLI:
         # Initialize managers as needed
         self._db = None
         self._spotify = None
+        self._storage = None
+        self._repos = None
+        self._search_pipeline = None
         self._rotation_managers = {}
         self.last_search_results = None
         self.last_search_query = None
@@ -59,6 +69,8 @@ class PlaylistCLI:
         self.last_search_constraints = None
         self.last_search_expanded = False
         self.last_search_policy = None
+        self.last_search_run_id = None
+        self.last_search_track_ids = None
 
     @property
     def db(self) -> DatabaseManager:
@@ -75,6 +87,49 @@ class PlaylistCLI:
         if self._spotify is None:
             self._spotify = SpotifyManager()
         return self._spotify
+
+    @property
+    def storage(self) -> Database:
+        if not hasattr(self, "_storage"):
+            self._storage = None
+        if self._storage is None:
+            self._storage = Database()
+            conn = self._storage.connect()
+            ensure_schema(conn)
+        return self._storage
+
+    @property
+    def repos(self) -> Repositories:
+        if not hasattr(self, "_repos"):
+            self._repos = None
+        if self._repos is None:
+            self._repos = Repositories(self.storage.connect())
+        return self._repos
+
+    @property
+    def search_pipeline(self) -> SearchPipeline:
+        if not hasattr(self, "_search_pipeline"):
+            self._search_pipeline = None
+        if self._search_pipeline is None:
+            def _env_float(name: str, default: float) -> float:
+                value = os.getenv(name)
+                if not value:
+                    return default
+                try:
+                    return float(value)
+                except ValueError:
+                    return default
+
+            model_name = os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2")
+            strict_threshold = _env_float("SEARCH_STRICT_THRESHOLD", 0.6)
+            lenient_threshold = _env_float("SEARCH_LENIENT_THRESHOLD", 0.75)
+            self._search_pipeline = SearchPipeline(
+                self.repos,
+                model_name=model_name,
+                strict_threshold=strict_threshold,
+                lenient_threshold=lenient_threshold,
+            )
+        return self._search_pipeline
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
@@ -96,6 +151,7 @@ class PlaylistCLI:
         1. The song exists in Spotify
         2. The artist has less than 1 million monthly listeners
         """
+        logger.warning("Legacy import: consider using /ingest for Spotify-based sources.")
         path = Path(file_path)
         if not path.exists():
             logger.error(f"File not found: {file_path}")
@@ -875,84 +931,390 @@ class PlaylistCLI:
         query: Union[List[str], str],
         expanded: bool = False,
     ):
-        """Deep web search for new songs based on criteria."""
-        from web_search import run_deep_search
-
+        """Deep web search for new songs based on criteria (next-gen pipeline)."""
+        if not hasattr(self, "last_search_results"):
+            self.last_search_results = None
+            self.last_search_query = None
+            self.last_search_summary = None
+            self.last_search_metrics = None
+            self.last_search_constraints = None
+            self.last_search_expanded = False
+            self.last_search_policy = None
+            self.last_search_run_id = None
+            self.last_search_track_ids = None
         query_text = " ".join(query) if isinstance(query, list) else str(query)
         section("Deep Search", query_text)
-        results, _, providers, error, requested_metrics, summary, constraints, source_policy = run_deep_search(
-            query=query_text,
-            expanded=expanded,
-        )
-        if error:
-            warning(error)
+
+        def _progress(stage: str) -> None:
+            info(f"Stage: {stage}")
+
+        def _on_result(item: SearchResult, rank: int, total: int) -> None:
+            if os.getenv("TUNR_INTERACTIVE") == "1":
+                info(f"[{rank}/{total}] {item.song} — {item.artist} ({item.score:.3f})")
+
+        try:
+            results, run_id = self.search_pipeline.run(
+                query=query_text,
+                expanded=expanded,
+                progress=_progress,
+                on_result=_on_result,
+            )
+        except Exception as exc:
+            warning(str(exc))
             self.last_search_results = None
             return
-
-        info(f"Providers: {', '.join(providers)}")
-        if summary:
-            info(summary)
-        if constraints.get("max_monthly_listeners"):
-            info(f"Constraint: monthly listeners <= {constraints['max_monthly_listeners']:,}")
-        if constraints.get("min_monthly_listeners"):
-            info(f"Constraint: monthly listeners >= {constraints['min_monthly_listeners']:,}")
-        info(
-            f"Source policy: {source_policy.get('path', 'hybrid')} "
-            f"(expanded={'yes' if source_policy.get('expanded') else 'no'})"
-        )
-        info(
-            "Validation defaults: "
-            f"obscurity={self._obscurity_mode()} "
-            f"(fallback={'followers' if self._obscurity_mode() == 'followers' else 'none'}), "
-            f"similarity_web>={self._similarity_min():.2f}, "
-            f"similarity_audio>={self._audio_similarity_min():.2f} "
-            f"({self._audio_similarity_mode()})"
-        )
 
         if not results:
             info("No results returned.")
             self.last_search_results = None
             return
 
-        self._attach_spotify_urls(results)
-
         rows = []
-        metric_columns = requested_metrics or []
-        if constraints.get("max_monthly_listeners") and "monthly_listeners" not in metric_columns:
-            metric_columns.append("monthly_listeners")
-        if constraints.get("min_monthly_listeners") and "monthly_listeners" not in metric_columns:
-            metric_columns.append("monthly_listeners")
-        metric_headers = [metric.replace("_", " ").title() for metric in metric_columns]
         for idx, item in enumerate(results, 1):
-            sources = item.get("sources") or []
-            sources_preview = ", ".join(sources[:2])
-            if len(sources) > 2:
+            sources_preview = ", ".join(item.sources[:2])
+            if len(item.sources) > 2:
                 sources_preview += " ..."
-            metrics = item.get("metrics") or {}
-            metric_values = [str(metrics.get(metric, "")) for metric in metric_columns]
-            spotify_url = item.get("spotify_url") or ""
-            spotify_display = spotify_url if spotify_url else "Not found"
             rows.append([
                 idx,
-                item.get("song", ""),
-                item.get("artist", ""),
-                item.get("year", "") or "-",
-                *metric_values,
-                ", ".join(item.get("providers", [])),
-                spotify_display,
-                item.get("why", ""),
+                item.song,
+                item.artist,
+                item.year or "-",
+                f"{item.score:.3f}",
+                f"{item.strict_ratio:.2f}",
+                ", ".join(item.providers) if item.providers else "-",
                 sources_preview,
             ])
 
-        headers = ["#", "Song", "Artist", "Year", *metric_headers, "Providers", "Spotify", "Why", "Sources"]
+        headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Providers", "Sources"]
         table(headers, rows)
-        self.last_search_results = results
+
+        self.last_search_results = [
+            {
+                "song": item.song,
+                "artist": item.artist,
+                "year": item.year,
+                "score": item.score,
+                "strict_ratio": item.strict_ratio,
+                "providers": item.providers,
+                "sources": item.sources,
+                "track_id": item.track_id,
+            }
+            for item in results
+        ]
         self.last_search_query = query_text
-        self.last_search_summary = summary
-        self.last_search_metrics = requested_metrics
-        self.last_search_constraints = constraints
+        self.last_search_summary = None
+        self.last_search_metrics = []
+        self.last_search_constraints = {}
         self.last_search_expanded = expanded
-        self.last_search_policy = source_policy
+        self.last_search_policy = {"path": "nextgen", "expanded": expanded}
+        self.last_search_run_id = run_id
+        self.last_search_track_ids = [item.track_id for item in results]
+
+    def ingest_tracks(self, source: str, name: Optional[str] = None, time_range: str = "medium_term"):
+        """Ingest tracks from Spotify into the SQLite cache."""
+        now = datetime.utcnow().isoformat() + "Z"
+        ingested = 0
+
+        def upsert_track(track: dict, artist: dict) -> None:
+            nonlocal ingested
+            track_id = self._upsert_spotify_track(track, artist, now)
+            if track_id:
+                ingested += 1
+
+        try:
+            sp = self.spotify.sp
+            if source == "liked":
+                section("Ingest", "Liked Tracks")
+                offset = 0
+                while True:
+                    batch = sp.current_user_saved_tracks(limit=50, offset=offset)
+                    items = batch.get("items") or []
+                    if not items:
+                        break
+                    for item in items:
+                        track = item.get("track") or {}
+                        artists = track.get("artists") or []
+                        if artists:
+                            upsert_track(track, artists[0])
+                    offset += len(items)
+                    if len(items) < 50:
+                        break
+            elif source == "playlist":
+                if not name:
+                    warning("Playlist name required for ingest playlist.")
+                    return
+                section("Ingest", f"Playlist: {name}")
+                tracks = self.spotify.get_playlist_tracks(name)
+                for entry in tracks:
+                    track = {
+                        "name": entry.get("name"),
+                        "uri": entry.get("uri"),
+                        "album": {},
+                        "external_urls": {"spotify": entry.get("uri")},
+                    }
+                    artist = {"name": entry.get("artist")}
+                    upsert_track(track, artist)
+            elif source == "top":
+                section("Ingest", f"Top Tracks ({time_range})")
+                offset = 0
+                while True:
+                    batch = sp.current_user_top_tracks(limit=50, offset=offset, time_range=time_range)
+                    items = batch.get("items") or []
+                    if not items:
+                        break
+                    for track in items:
+                        artists = track.get("artists") or []
+                        if artists:
+                            upsert_track(track, artists[0])
+                    offset += len(items)
+                    if len(items) < 50:
+                        break
+            elif source == "recent":
+                section("Ingest", "Recently Played")
+                batch = sp.current_user_recently_played(limit=50)
+                items = batch.get("items") or []
+                for item in items:
+                    track = item.get("track") or {}
+                    artists = track.get("artists") or []
+                    if artists:
+                        upsert_track(track, artists[0])
+            else:
+                warning(f"Unknown ingest source: {source}")
+                return
+        except Exception as exc:
+            warning(f"Ingest failed: {exc}")
+            return
+
+        info(f"Ingested {ingested} tracks.")
+
+    def _upsert_spotify_track(self, track: dict, artist: dict, now: str) -> Optional[str]:
+        track_name = track.get("name") or ""
+        artist_name = artist.get("name") or ""
+        if not track_name or not artist_name:
+            return None
+        track_id = f"{artist_name.lower()}|||{track_name.lower()}"
+        artist_id = artist_name.lower()
+        self.repos.artists.upsert(
+            artist_id=artist_id,
+            name=artist_name,
+            genres_json=json.dumps(artist.get("genres") or []),
+            popularity=artist.get("popularity"),
+            updated_at=now,
+        )
+        self.repos.tracks.upsert(
+            {
+                "track_id": track_id,
+                "spotify_id": track.get("uri") or track.get("id"),
+                "name": track_name,
+                "artist_id": artist_id,
+                "album_name": (track.get("album") or {}).get("name"),
+                "release_date": (track.get("album") or {}).get("release_date"),
+                "duration_ms": track.get("duration_ms"),
+                "explicit": 1 if track.get("explicit") else 0,
+                "popularity": track.get("popularity"),
+                "spotify_url": (track.get("external_urls") or {}).get("spotify"),
+                "status": "candidate",
+                "last_decision": None,
+                "decision_reason": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return track_id
+
+    def sync_listen_history(self, limit: int = 50) -> None:
+        """Sync recently played tracks into the listen ledger."""
+        now = datetime.utcnow().isoformat() + "Z"
+        section("Listen Ledger", "Recently Played")
+        try:
+            sp = self.spotify.sp
+            payload = sp.current_user_recently_played(limit=limit)
+            items = payload.get("items") or []
+        except Exception as exc:
+            warning(f"Listen sync failed: {exc}")
+            return
+
+        added = 0
+        for item in items:
+            track = item.get("track") or {}
+            artists = track.get("artists") or []
+            if not artists:
+                continue
+            track_id = self._upsert_spotify_track(track, artists[0], now)
+            if not track_id:
+                continue
+            played_at = item.get("played_at") or now
+            spotify_id = track.get("uri") or track.get("id")
+            event_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{spotify_id}|{played_at}").hex
+            self.repos.listen_events.upsert(
+                {
+                    "event_id": event_id,
+                    "track_id": track_id,
+                    "spotify_id": spotify_id,
+                    "played_at": played_at,
+                    "source": "recently_played",
+                    "created_at": now,
+                }
+            )
+            added += 1
+
+        info(f"Recorded {added} listen events.")
+
+    def rotate_playlist_played(self, playlist_name: str, max_replace: Optional[int] = None) -> None:
+        """Rotate a playlist by removing tracks played since they were added."""
+        section("Rotate (Played)", playlist_name)
+        try:
+            tracks = self.spotify.get_playlist_tracks(playlist_name)
+        except Exception as exc:
+            warning(f"Failed to load playlist: {exc}")
+            return
+
+        if not tracks:
+            warning("Playlist is empty.")
+            return
+
+        def parse_ts(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+
+        track_ids = []
+        added_map: Dict[str, datetime] = {}
+        for entry in tracks:
+            uri = entry.get("uri")
+            name = entry.get("name") or ""
+            artist = entry.get("artist") or ""
+            track_id = None
+            if uri:
+                record = self.repos.tracks.get_by_spotify_id(uri)
+                if record:
+                    track_id = record.get("track_id")
+            if not track_id and name and artist:
+                track_id = f"{artist.lower()}|||{name.lower()}"
+            if not track_id:
+                continue
+            track_ids.append(track_id)
+            added_at = parse_ts(entry.get("added_at"))
+            if added_at:
+                added_map[track_id] = added_at
+
+        if not track_ids:
+            warning("No recognizable tracks found in playlist.")
+            return
+
+        latest_map = self.repos.listen_events.list_by_track
+        played_ids = []
+        unplayed_ids = []
+
+        for track_id in track_ids:
+            added_at = added_map.get(track_id)
+            events = latest_map(track_id)
+            played_after = False
+            if added_at and events:
+                for event in events:
+                    played_at = parse_ts(event.get("played_at"))
+                    if played_at and played_at > added_at:
+                        played_after = True
+                        break
+            if played_after:
+                played_ids.append(track_id)
+            else:
+                unplayed_ids.append(track_id)
+
+        if not played_ids:
+            info("No played tracks detected since add time.")
+            return
+
+        if max_replace is not None:
+            played_ids = played_ids[:max_replace]
+
+        current_set = set(track_ids)
+        all_rows = self.repos.conn.execute(
+            "SELECT track_id, name, artist_id, spotify_id FROM tracks;"
+        ).fetchall()
+        candidate_rows = [row for row in all_rows if row["track_id"] not in current_set]
+
+        # Optional ranking using cached embeddings against playlist name.
+        similarity_map: Dict[str, float] = {}
+        try:
+            model_name = os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2")
+            model = EmbeddingModel(model_name)
+            query_vec = model.embed([playlist_name])[0]
+            query_norm = vector_norm(query_vec) or 1.0
+            rows = self.repos.conn.execute(
+                "SELECT track_id, embedding_blob FROM track_embeddings WHERE track_id IN ({})".format(
+                    ",".join(["?"] * len(candidate_rows))
+                ),
+                [row["track_id"] for row in candidate_rows],
+            ).fetchall() if candidate_rows else []
+            for row in rows:
+                vec = decode_vector(row["embedding_blob"])
+                denom = vector_norm(vec) * query_norm
+                if denom == 0:
+                    continue
+                similarity = sum(a * b for a, b in zip(vec, query_vec)) / denom
+                similarity_map[row["track_id"]] = similarity
+        except Exception:
+            similarity_map = {}
+
+        # Sort candidates by similarity (desc), fallback to most recently played (None first).
+        def candidate_key(row) -> tuple:
+            sim = similarity_map.get(row["track_id"])
+            if sim is not None:
+                return (0, -sim)
+            events = self.repos.listen_events.list_by_track(row["track_id"])
+            latest_played = None
+            for event in events:
+                played_at = parse_ts(event.get("played_at"))
+                if played_at and (latest_played is None or played_at > latest_played):
+                    latest_played = played_at
+            return (1, latest_played is not None, latest_played or datetime.min)
+
+        candidate_rows.sort(key=candidate_key)
+
+        needed = min(len(played_ids), len(candidate_rows))
+        replacements = candidate_rows[:needed]
+
+        songs_to_keep: List[Song] = []
+        for entry in tracks:
+            name = entry.get("name") or ""
+            artist = entry.get("artist") or ""
+            track_id = f"{artist.lower()}|||{name.lower()}" if name and artist else None
+            if not track_id or track_id in played_ids:
+                continue
+            songs_to_keep.append(
+                Song(
+                    id=track_id,
+                    name=name,
+                    artist=artist,
+                    spotify_uri=entry.get("uri"),
+                    first_added=datetime.now(),
+                )
+            )
+
+        replacement_songs: List[Song] = []
+        for row in replacements:
+            artist_record = self.repos.artists.get(row["artist_id"] or "")
+            artist_name = artist_record.get("name") if artist_record else row["artist_id"]
+            replacement_songs.append(
+                Song(
+                    id=row["track_id"],
+                    name=row["name"],
+                    artist=artist_name or "",
+                    spotify_uri=row["spotify_id"],
+                    first_added=datetime.now(),
+                )
+            )
+
+        new_songs = songs_to_keep + replacement_songs
+        success = self.spotify.replace_playlist_items(playlist_name, new_songs)
+        if success:
+            info(f"Replaced {len(replacements)} played tracks.")
+        else:
+            warning("Failed to update playlist.")
 
     def build_songs_from_search_results(self, results: List[Dict]) -> List[Song]:
         songs: List[Song] = []
@@ -1334,6 +1696,79 @@ class PlaylistCLI:
             warning(f"Failed to update playlist '{playlist_name}'.")
         return success
 
+    def mark_search_tracks(
+        self,
+        track_ids: List[str],
+        status: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Mark tracks from a search run as accepted/rejected."""
+        if not track_ids:
+            return
+        now = datetime.utcnow().isoformat() + "Z"
+        for track_id in track_ids:
+            self.repos.tracks.update_status(track_id, status, reason, now)
+
+    def create_playlist_from_track_ids(self, playlist_name: str, track_ids: List[str]) -> bool:
+        """Create or append to a playlist using cached track IDs."""
+        if not track_ids:
+            warning("No tracks available to create a playlist.")
+            return False
+        songs: List[Song] = []
+        for track_id in track_ids:
+            record = self.repos.tracks.get(track_id)
+            if not record:
+                continue
+            artist_name = record.get("artist_id") or ""
+            artist_record = self.repos.artists.get(record.get("artist_id") or "")
+            if artist_record and artist_record.get("name"):
+                artist_name = artist_record.get("name")
+            song = Song(
+                id=track_id,
+                name=record.get("name") or "",
+                artist=artist_name,
+                spotify_uri=record.get("spotify_id"),
+                first_added=datetime.now(),
+            )
+            songs.append(song)
+        return self.create_playlist_from_search_results(playlist_name, songs)
+
+    def debug_last_search(self) -> Optional[Dict[str, object]]:
+        """Return debug payload for the last search run."""
+        run_id = self.last_search_run_id
+        if not run_id:
+            return None
+        run = self.repos.runs.get(run_id)
+        candidates = self.repos.candidates.list_by_run(run_id)
+        for candidate in candidates:
+            track = self.repos.tracks.get(candidate["track_id"])
+            if track:
+                artist_record = self.repos.artists.get(track.get("artist_id") or "")
+                if artist_record and artist_record.get("name"):
+                    track["artist_name"] = artist_record.get("name")
+                candidate["track"] = track
+        return {
+            "run": run,
+            "candidates": candidates,
+        }
+
+    def debug_track(self, track_id: str) -> Optional[Dict[str, object]]:
+        """Return track + context + sources for debug display."""
+        record = self.repos.tracks.get(track_id)
+        if not record:
+            return None
+        context = self.repos.context.get(track_id)
+        sources = list(self.repos.sources.list_by_track(track_id))
+        embedding = self.repos.embeddings.get(track_id)
+        listens = list(self.repos.listen_events.list_by_track(track_id))
+        return {
+            "track": record,
+            "context": context,
+            "sources": sources,
+            "embedding": embedding,
+            "listens": listens,
+        }
+
     def _show_search_validation_summary(self, stats: Dict[str, int], title: str) -> None:
         section(title)
         rows = [["Total results processed", stats.get("total", 0)]]
@@ -1554,6 +1989,18 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
             cli.search_songs(
                 args.query
             )
+        elif command == 'ingest':
+            cli.ingest_tracks(args.source, args.name, args.time_range)
+        elif command == 'listen-sync':
+            cli.sync_listen_history(args.limit)
+        elif command == 'rotate-played':
+            cli.rotate_playlist_played(args.playlist, args.max_replace)
+        elif command == 'rotate':
+            if args.policy == 'played':
+                cli.rotate_playlist_played(args.playlist, args.max_replace)
+            else:
+                logger.error(f"Unknown rotate policy: {args.policy}")
+                return 1
         elif command == 'backup':
             cli.backup_data(args.backup_name)
         elif command == 'restore':

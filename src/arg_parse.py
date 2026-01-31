@@ -26,7 +26,7 @@ def setup_parsers(
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
     # Import command
-    import_parser = subparsers.add_parser('import', help='Import songs from a file')
+    import_parser = subparsers.add_parser('import', help='Legacy: import songs from a file')
     import_parser.add_argument('file', help='Path to the input file')
 
     # Update command
@@ -93,6 +93,35 @@ def setup_parsers(
     # Search command
     search_parser = subparsers.add_parser('search', help='Deep web search for new songs')
     search_parser.add_argument('query', nargs='+', help='Search criteria (freeform)')
+
+    # Ingest command
+    ingest_parser = subparsers.add_parser('ingest', help='Ingest tracks into the cache')
+    ingest_parser.add_argument('source', choices=['liked', 'playlist', 'top', 'recent'],
+                               help='Source to ingest from')
+    ingest_parser.add_argument('name', nargs='?', default=None,
+                               help='Optional name (required for playlist source)')
+    ingest_parser.add_argument('--time-range', choices=['short_term', 'medium_term', 'long_term'],
+                               default='medium_term',
+                               help='Time range for top tracks (default: medium_term)')
+
+    # Listen ledger sync
+    listen_parser = subparsers.add_parser('listen-sync', help='Sync recently played tracks into the listen ledger')
+    listen_parser.add_argument('--limit', type=int, default=50,
+                               help='Number of recent plays to pull (default: 50)')
+
+    # Rotation based on listen ledger
+    rotate_played_parser = subparsers.add_parser('rotate-played', help='Legacy: rotate by listen history (use rotate)')
+    rotate_played_parser.add_argument('playlist', help='Name of the playlist')
+    rotate_played_parser.add_argument('--max-replace', type=int, default=None,
+                                      help='Maximum number of played tracks to replace (default: all)')
+
+    # Consolidated rotate command
+    rotate_parser = subparsers.add_parser('rotate', help='Rotate a playlist')
+    rotate_parser.add_argument('playlist', help='Name of the playlist')
+    rotate_parser.add_argument('--policy', choices=['played'], default='played',
+                               help='Rotation policy (default: played)')
+    rotate_parser.add_argument('--max-replace', type=int, default=None,
+                               help='Maximum number of played tracks to replace (default: all)')
 
     # Backup command
     backup_parser = subparsers.add_parser('backup', help='Backup the data directory')

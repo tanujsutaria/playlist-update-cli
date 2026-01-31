@@ -58,11 +58,19 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 ### Output styling
 The UI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 
-### Search (deep web search)
+### Search (deep web search + local embeddings)
 ```bash
 /search "late night jazz with soft vocals"
 ```
-After results are shown, confirm whether to add them to the database and/or create a playlist.
+Results are cached in SQLite and scored locally via sentence embeddings. You can mark results
+and/or create a playlist after the table renders.
+
+Optional search tuning:
+```bash
+export SEARCH_EMBEDDING_MODEL="all-mpnet-base-v2"
+export SEARCH_STRICT_THRESHOLD="0.6"
+export SEARCH_LENIENT_THRESHOLD="0.75"
+```
 
 To broaden the last search (expanded source policy):
 ```bash
@@ -82,7 +90,29 @@ To broaden the last search (expanded source policy):
 /diff "My Playlist" --count 10 --fresh-days 30
 ```
 
-### Import songs
+### Ingest (Spotify sources → cache)
+```bash
+/ingest liked
+/ingest playlist "My Playlist"
+/ingest top --time-range short_term
+/ingest recent
+```
+
+### Listen ledger (recently played → cache)
+```bash
+/listen-sync
+/listen-sync --limit 100
+```
+
+### Rotation (played-since-added)
+```bash
+/rotate "My Playlist" --policy played
+/rotate "My Playlist" --policy played --max-replace 10
+/rotate-played "My Playlist"
+/rotate-played "My Playlist" --max-replace 10
+```
+
+### Legacy import (file-based)
 ```bash
 /import songs.csv
 /import songs.txt

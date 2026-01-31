@@ -27,7 +27,9 @@ DEFAULT_INSTRUCTIONS = (
     "(e.g., 'like X'), include a 'similarity' metric (0-1). If the query includes monthly listeners "
     "constraints, include a 'monthly_listeners' metric and cite sources. Optionally include a "
     "score 0-1 indicating fit confidence. If you can find a Spotify URL, include it as "
-    "'spotify_url'."
+    "'spotify_url'. Additionally include a 'context' object with either a 'fields' list or "
+    "keyed attributes (moods, genres, instrumentation, comparisons, era, themes). Each field "
+    "should include its sources and a confidence score; mark strict=true only when sourced."
 )
 
 KNOWN_METRICS = {
@@ -233,6 +235,25 @@ def build_search_payload(
                     "score": "float 0-1 (optional)",
                     "spotify_url": "string (optional)",
                     "spotify_uri": "string (optional)",
+                    "context": {
+                        "fields": [
+                            {
+                                "field": "string (mood|genre|instrumentation|comparisons|era|themes|summary)",
+                                "value": "string or list",
+                                "sources": ["url"],
+                                "confidence": "float 0-1",
+                                "strict": "bool (true if sourced)"
+                            }
+                        ],
+                        "moods": ["string"],
+                        "genres": ["string"],
+                        "instrumentation": ["string"],
+                        "comparisons": ["string"],
+                        "era": ["string"],
+                        "themes": ["string"],
+                        "sources": ["url"],
+                        "confidence": "float 0-1"
+                    },
                 }
             ]
         },
@@ -748,6 +769,7 @@ def _normalize_item(item: object) -> Optional[dict]:
         "score": _safe_float(item.get("score") or item.get("confidence")),
         "spotify_url": item.get("spotify_url") or item.get("spotify") or "",
         "spotify_uri": item.get("spotify_uri") or item.get("uri") or "",
+        "context": item.get("context") if isinstance(item.get("context"), dict) else {},
     }
 
 
@@ -789,6 +811,7 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                     "metrics": {},
                     "providers": [],
                     "scores": [],
+                    "context": {},
                     "first_seen": len(order),
                 }
                 order.append(key)
@@ -807,6 +830,27 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
             if item.get("score") is not None:
                 combined[key]["scores"].append(item["score"])
 
+            context = item.get("context") or {}
+            if isinstance(context, dict) and context:
+                existing = combined[key].get("context") or {}
+                if not existing:
+                    combined[key]["context"] = context
+                else:
+                    if isinstance(existing.get("fields"), list) and isinstance(context.get("fields"), list):
+                        existing_fields = existing.get("fields") or []
+                        existing_fields.extend(context.get("fields") or [])
+                        existing["fields"] = existing_fields
+                    for key_name in ("moods", "genres", "instrumentation", "comparisons", "era", "themes", "sources"):
+                        if context.get(key_name):
+                            existing.setdefault(key_name, [])
+                            existing[key_name] = list({
+                                *existing.get(key_name, []),
+                                *context.get(key_name, []),
+                            })
+                    if context.get("confidence") and not existing.get("confidence"):
+                        existing["confidence"] = context.get("confidence")
+                    combined[key]["context"] = existing
+
     results: List[dict] = []
     for key, entry in combined.items():
         mentions = len(set(entry["providers"]))
@@ -824,6 +868,7 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                 "providers": sorted(set(entry["providers"])),
                 "mentions": mentions,
                 "score": avg_score,
+                "context": entry.get("context") or {},
                 "_rank": (mentions, avg_score or 0.0, -entry["first_seen"]),
             }
         )

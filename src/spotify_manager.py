@@ -356,6 +356,64 @@ class SpotifyManager:
             logger.debug("Full error:", exc_info=True)
             return False
 
+    def replace_playlist_items(self, name: str, songs: List[Song]) -> bool:
+        """Replace playlist contents without deleting the playlist (preserve ID)."""
+        try:
+            playlist_id = self.get_playlist_id(name)
+            if not playlist_id:
+                playlist_id = self.create_playlist(name)
+                if not playlist_id:
+                    logger.error(f"Failed to create playlist '{name}'")
+                    return False
+
+            track_uris: List[str] = []
+            failed_songs = set()
+            logger.info(f"Processing {len(songs)} tracks for replacement...")
+            with tqdm(
+                total=len(songs),
+                desc="Processing tracks",
+                disable=os.getenv("TUNR_INTERACTIVE") == "1",
+            ) as pbar:
+                for song in songs:
+                    uri = None
+                    try:
+                        if song.spotify_uri:
+                            uri = song.spotify_uri
+                        else:
+                            uri = self.search_song(song)
+                            if uri:
+                                song.spotify_uri = uri
+                    except Exception as e:
+                        logger.warning(f"Failed to process song {song.name}: {str(e)}")
+                        failed_songs.add(song.name)
+                    finally:
+                        pbar.update(1)
+
+                    if uri:
+                        track_uris.append(uri)
+                    else:
+                        failed_songs.add(song.name)
+
+            if track_uris:
+                first_batch = track_uris[:100]
+                self.sp.playlist_replace_items(playlist_id, first_batch)
+                remaining = track_uris[100:]
+                batch_size = 50
+                for i in range(0, len(remaining), batch_size):
+                    batch = remaining[i:i + batch_size]
+                    self.sp.playlist_add_items(playlist_id, batch)
+            else:
+                self.sp.playlist_replace_items(playlist_id, [])
+
+            if failed_songs:
+                logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
+            logger.info(f"Playlist '{name}' updated without deletion.")
+            return True
+        except Exception as e:
+            logger.error(f"Error replacing playlist '{name}': {str(e)}")
+            logger.debug("Full error:", exc_info=True)
+            return False
+
     def append_to_playlist(self, name: str, songs: List[Song]) -> bool:
         """Append songs to an existing playlist without removing current tracks"""
         try:
