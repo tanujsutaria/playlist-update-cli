@@ -1,6 +1,12 @@
 import os
 
-from web_search import detect_search_commands, synthesize_results, extract_constraints, extract_requested_metrics
+from web_search import (
+    detect_search_commands,
+    synthesize_results,
+    extract_constraints,
+    extract_requested_metrics,
+    _extract_output,
+)
 
 
 def test_detect_search_commands_prefers_explicit(monkeypatch):
@@ -45,3 +51,24 @@ def test_requested_metrics_similarity():
     metrics = extract_requested_metrics("songs like Royel Otis with slow bpm")
     assert "similarity" in metrics
     assert "bpm" in metrics
+
+
+def test_extract_output_from_claude_json_response():
+    output = {
+        "type": "message",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    '{"summary":"ok","results":[{"song":"Track A","artist":"Artist 1",'
+                    '"sources":[],"metrics":{}}]}'
+                ),
+            }
+        ],
+    }
+
+    results, summary = _extract_output(output)
+
+    assert summary == "ok"
+    assert len(results) == 1
+    assert results[0]["song"] == "Track A"

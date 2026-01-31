@@ -498,6 +498,39 @@ def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[
     return text[start : end + 1].strip()
 
 
+def _extract_text_from_response(output: object) -> Optional[str]:
+    if not isinstance(output, dict):
+        return None
+    output_text = output.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+    completion = output.get("completion")
+    if isinstance(completion, str) and completion.strip():
+        return completion
+    message = output.get("message")
+    if isinstance(message, dict):
+        nested = _extract_text_from_response(message)
+        if nested:
+            return nested
+    content = output.get("content")
+    if not isinstance(content, list):
+        return None
+    texts: List[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") in {"text", "output_text"} and block.get("text"):
+                texts.append(str(block.get("text")))
+            elif "text" in block and block.get("text"):
+                texts.append(str(block.get("text")))
+        else:
+            text = getattr(block, "text", None)
+            if text:
+                texts.append(str(text))
+    if texts:
+        return "\n".join(texts)
+    return None
+
+
 def _strip_flag(args: List[str], flag: str, takes_value: bool) -> List[str]:
     if flag not in args:
         return args
@@ -538,6 +571,12 @@ def _extract_output(output: object) -> Tuple[List[dict], str]:
             or output.get("tracks")
             or []
         )
+        if not results and not summary:
+            extracted = _extract_text_from_response(output)
+            if extracted:
+                parsed = _parse_json_output(extracted)
+                if parsed is not None and parsed is not output:
+                    return _extract_output(parsed)
     elif isinstance(output, list):
         results = output
     else:
