@@ -21,7 +21,17 @@ from textual.widgets import Input, RichLog, Static
 
 from arg_parse import setup_parsers, parse_tokens
 from main import PlaylistCLI, dispatch_command, configure_logging
-from ui import set_output_sink, section, subsection, table, key_value_table, info, warning, json_output
+from ui import (
+    set_output_sink,
+    set_preview_sink,
+    section,
+    subsection,
+    table,
+    key_value_table,
+    info,
+    warning,
+    json_output,
+)
 from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
@@ -96,6 +106,11 @@ class PlaylistInteractiveApp(App):
         width: 1fr;
         height: 1fr;
     }
+    #search_preview {
+        padding: 1 2;
+        width: 1fr;
+        display: none;
+    }
     #setup_screen {
         padding: 2 4;
         width: 1fr;
@@ -135,6 +150,7 @@ class PlaylistInteractiveApp(App):
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
         with Container(id="body"):
+            yield Static(id="search_preview")
             yield RichLog(id="output", highlight=False, markup=False)
             yield Static(id="setup_screen")
         yield Input(placeholder="Type /help for commands", id="command_input")
@@ -142,6 +158,7 @@ class PlaylistInteractiveApp(App):
     def on_mount(self) -> None:
         self._mounted = True
         set_output_sink(self._emit_renderable)
+        set_preview_sink(self._emit_preview)
         configure_logging(handler=UILogHandler(self))
         self._refresh_env_status()
         self._update_top_bar()
@@ -154,6 +171,7 @@ class PlaylistInteractiveApp(App):
     def on_shutdown(self) -> None:
         self._mounted = False
         set_output_sink(None)
+        set_preview_sink(None)
 
     def on_resize(self) -> None:
         self._update_top_bar()
@@ -163,15 +181,28 @@ class PlaylistInteractiveApp(App):
         if not self._mounted:
             return
         output = self.query_one(RichLog)
+        preview = self.query_one("#search_preview", Static)
         setup_screen = self.query_one("#setup_screen", Static)
         if self._setup_mode:
             output.display = False
+            preview.display = False
             setup_screen.display = True
             setup_screen.update(self._render_setup_content())
         else:
             setup_screen.display = False
             output.display = True
         self._update_input_placeholder()
+
+    def _emit_preview(self, renderable) -> None:
+        if not self._mounted:
+            return
+        preview = self.query_one("#search_preview", Static)
+        if renderable is None:
+            preview.display = False
+            preview.update("")
+            return
+        preview.display = True
+        preview.update(renderable)
 
     def watch_status(self, value: str) -> None:
         if value.startswith("Running") and not self._setup_mode:
@@ -363,7 +394,10 @@ class PlaylistInteractiveApp(App):
                     name = choice.dest
                     if name == "interactive":
                         continue
-                    yield name, choice.help or ""
+                    help_text = choice.help or ""
+                    if help_text.lower().startswith("legacy:"):
+                        help_text = f"{help_text} (legacy)"
+                    yield name, help_text
 
     def _update_top_bar(self) -> None:
         if not self._mounted:
@@ -485,6 +519,7 @@ class PlaylistInteractiveApp(App):
         if payload:
             run = payload.get("run") or {}
             candidates = payload.get("candidates") or []
+            summary = payload.get("summary") or {}
             rows = [
                 ["Query", self.cli.last_search_query],
                 ["Run ID", run.get("run_id")],
@@ -492,6 +527,9 @@ class PlaylistInteractiveApp(App):
                 ["Expanded", "yes" if self.cli.last_search_expanded else "no"],
                 ["Provider", run.get("provider") or "combined"],
                 ["Status", run.get("status") or "unknown"],
+                ["Cached", "yes" if summary.get("cached") else "no"],
+                ["Avg strict ratio", f"{summary.get('avg_strict_ratio', 0):.2f}"],
+                ["Missing context", summary.get("missing_context", 0)],
             ]
             section("Debug", "Last Search")
             key_value_table(rows)

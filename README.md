@@ -70,6 +70,12 @@ Optional search tuning:
 export SEARCH_EMBEDDING_MODEL="all-mpnet-base-v2"
 export SEARCH_STRICT_THRESHOLD="0.6"
 export SEARCH_LENIENT_THRESHOLD="0.75"
+export SEARCH_SCORE_STRICT_WEIGHT="0.4"
+export SEARCH_SCORE_BASE_WEIGHT="0.6"
+export SEARCH_SCORE_SOURCE_WEIGHT="0.05"
+export SEARCH_SCORE_YEAR_WEIGHT="0.05"
+export SEARCH_SCORE_YEAR_TOLERANCE="10"
+export SEARCH_SCORE_SOURCE_CAP="5"
 ```
 
 To broaden the last search (expanded source policy):

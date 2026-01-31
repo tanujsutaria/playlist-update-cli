@@ -155,4 +155,8 @@ def extract_context(
         if strict_ratio >= strict_threshold:
             fields = strict_fields
 
+    if not fields:
+        # Signal missing context for debugging/logging.
+        item["_context_missing"] = True
+
     return ExtractedContext(fields=fields, sources=unique_sources)

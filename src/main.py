@@ -22,7 +22,17 @@ from db_manager import DatabaseManager
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from rotation_manager import RotationManager
 from scoring import ScoreConfig
-from ui import console, section, subsection, table, key_value_table, info, warning
+from ui import (
+    console,
+    section,
+    subsection,
+    table,
+    key_value_table,
+    info,
+    warning,
+    preview_table,
+    clear_preview,
+)
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
@@ -120,14 +130,32 @@ class PlaylistCLI:
                 except ValueError:
                     return default
 
+            def _env_int(name: str, default: int) -> int:
+                value = os.getenv(name)
+                if not value:
+                    return default
+                try:
+                    return int(value)
+                except ValueError:
+                    return default
+
             model_name = os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2")
             strict_threshold = _env_float("SEARCH_STRICT_THRESHOLD", 0.6)
             lenient_threshold = _env_float("SEARCH_LENIENT_THRESHOLD", 0.75)
+            score_config = ScoreConfig(
+                strict_weight=_env_float("SEARCH_SCORE_STRICT_WEIGHT", 0.4),
+                base_weight=_env_float("SEARCH_SCORE_BASE_WEIGHT", 0.6),
+                source_weight=_env_float("SEARCH_SCORE_SOURCE_WEIGHT", 0.05),
+                year_weight=_env_float("SEARCH_SCORE_YEAR_WEIGHT", 0.05),
+                year_tolerance=_env_int("SEARCH_SCORE_YEAR_TOLERANCE", 10),
+                source_cap=_env_int("SEARCH_SCORE_SOURCE_CAP", 5),
+            )
             self._search_pipeline = SearchPipeline(
                 self.repos,
                 model_name=model_name,
                 strict_threshold=strict_threshold,
                 lenient_threshold=lenient_threshold,
+                score_config=score_config,
             )
         return self._search_pipeline
 
@@ -932,6 +960,7 @@ class PlaylistCLI:
         expanded: bool = False,
     ):
         """Deep web search for new songs based on criteria (next-gen pipeline)."""
+        clear_preview()
         if not hasattr(self, "last_search_results"):
             self.last_search_results = None
             self.last_search_query = None
@@ -942,15 +971,41 @@ class PlaylistCLI:
             self.last_search_policy = None
             self.last_search_run_id = None
             self.last_search_track_ids = None
+            self.last_search_cached = None
         query_text = " ".join(query) if isinstance(query, list) else str(query)
         section("Deep Search", query_text)
 
         def _progress(stage: str) -> None:
             info(f"Stage: {stage}")
 
+        status_label = "fresh"
+        preview_rows: List[List[object]] = []
+        preview_limit = 10
+        preview_stride = 5
+
         def _on_result(item: SearchResult, rank: int, total: int) -> None:
             if os.getenv("TUNR_INTERACTIVE") == "1":
-                info(f"[{rank}/{total}] {item.song} — {item.artist} ({item.score:.3f})")
+                if rank <= preview_limit:
+                    preview_rows.append(
+                        [
+                            rank,
+                            item.song,
+                            item.artist,
+                            item.year or "-",
+                            f"{item.score:.3f}",
+                            f"{item.strict_ratio:.2f}",
+                            len(item.sources or []),
+                            len(item.providers or []),
+                        ]
+                    )
+                    if rank % preview_stride == 0 or rank == preview_limit or rank == total:
+                        preview_table(
+                            ["#", "Song", "Artist", "Year", "Score", "Strict", "Sources", "Providers"],
+                            preview_rows,
+                            title=f"Search Preview • {status_label} ({min(rank, preview_limit)}/{total})",
+                        )
+                if rank % 25 == 0:
+                    info(f"Scored {rank}/{total} candidates")
 
         try:
             results, run_id = self.search_pipeline.run(
@@ -961,19 +1016,20 @@ class PlaylistCLI:
             )
         except Exception as exc:
             warning(str(exc))
+            clear_preview()
             self.last_search_results = None
             return
 
         if not results:
             info("No results returned.")
+            clear_preview()
             self.last_search_results = None
             return
 
+        self.last_search_cached = getattr(self.search_pipeline, "last_cached", False)
+        status_label = "cached" if self.last_search_cached else "fresh"
         rows = []
         for idx, item in enumerate(results, 1):
-            sources_preview = ", ".join(item.sources[:2])
-            if len(item.sources) > 2:
-                sources_preview += " ..."
             rows.append([
                 idx,
                 item.song,
@@ -981,12 +1037,14 @@ class PlaylistCLI:
                 item.year or "-",
                 f"{item.score:.3f}",
                 f"{item.strict_ratio:.2f}",
-                ", ".join(item.providers) if item.providers else "-",
-                sources_preview,
+                status_label,
+                len(item.providers or []),
+                len(item.sources or []),
             ])
 
-        headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Providers", "Sources"]
+        headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Status", "Providers", "Sources"]
         table(headers, rows)
+        clear_preview()
 
         self.last_search_results = [
             {
@@ -1206,21 +1264,24 @@ class PlaylistCLI:
             return
 
         latest_map = self.repos.listen_events.list_by_track
-        played_ids = []
+        played_ids: List[Tuple[str, Optional[datetime], Optional[datetime]]] = []
         unplayed_ids = []
 
         for track_id in track_ids:
             added_at = added_map.get(track_id)
             events = latest_map(track_id)
             played_after = False
+            latest_played_after = None
             if added_at and events:
                 for event in events:
                     played_at = parse_ts(event.get("played_at"))
                     if played_at and played_at > added_at:
                         played_after = True
+                        if latest_played_after is None or played_at > latest_played_after:
+                            latest_played_after = played_at
                         break
             if played_after:
-                played_ids.append(track_id)
+                played_ids.append((track_id, added_at, latest_played_after))
             else:
                 unplayed_ids.append(track_id)
 
@@ -1283,7 +1344,7 @@ class PlaylistCLI:
             name = entry.get("name") or ""
             artist = entry.get("artist") or ""
             track_id = f"{artist.lower()}|||{name.lower()}" if name and artist else None
-            if not track_id or track_id in played_ids:
+            if not track_id or any(track_id == pid for pid, _, _ in played_ids):
                 continue
             songs_to_keep.append(
                 Song(
@@ -1313,6 +1374,35 @@ class PlaylistCLI:
         success = self.spotify.replace_playlist_items(playlist_name, new_songs)
         if success:
             info(f"Replaced {len(replacements)} played tracks.")
+            subsection("Removed (Played After Added)")
+            removed_rows = []
+            for idx, (track_id, added_at, played_at) in enumerate(played_ids[:needed], 1):
+                track = self.repos.tracks.get(track_id) or {}
+                artist_record = self.repos.artists.get(track.get("artist_id") or "")
+                artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
+                removed_rows.append([
+                    idx,
+                    track.get("name") or track_id,
+                    artist_name or "",
+                    added_at.isoformat() if added_at else "",
+                    played_at.isoformat() if played_at else "",
+                ])
+            if removed_rows:
+                table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
+
+            subsection("Added (Replacements)")
+            added_rows = []
+            for idx, row in enumerate(replacements, 1):
+                artist_record = self.repos.artists.get(row["artist_id"] or "")
+                artist_name = artist_record.get("name") if artist_record else row["artist_id"]
+                added_rows.append([
+                    idx,
+                    row.get("name") or "",
+                    artist_name or "",
+                    row.get("spotify_id") or "",
+                ])
+            if added_rows:
+                table(["#", "Song", "Artist", "Spotify ID"], added_rows)
         else:
             warning("Failed to update playlist.")
 
@@ -1740,6 +1830,8 @@ class PlaylistCLI:
             return None
         run = self.repos.runs.get(run_id)
         candidates = self.repos.candidates.list_by_run(run_id)
+        strict_ratios = []
+        missing_context = 0
         for candidate in candidates:
             track = self.repos.tracks.get(candidate["track_id"])
             if track:
@@ -1747,9 +1839,25 @@ class PlaylistCLI:
                 if artist_record and artist_record.get("name"):
                     track["artist_name"] = artist_record.get("name")
                 candidate["track"] = track
+            context = self.repos.context.get(candidate["track_id"])
+            if context:
+                ratio = context.get("strict_ratio")
+                if ratio is not None:
+                    strict_ratios.append(float(ratio))
+                if not context.get("context_text"):
+                    missing_context += 1
+            else:
+                missing_context += 1
+        avg_strict = sum(strict_ratios) / len(strict_ratios) if strict_ratios else 0.0
         return {
             "run": run,
             "candidates": candidates,
+            "summary": {
+                "count": len(candidates),
+                "avg_strict_ratio": avg_strict,
+                "missing_context": missing_context,
+                "cached": bool(self.last_search_cached),
+            },
         }
 
     def debug_track(self, track_id: str) -> Optional[Dict[str, object]]:
