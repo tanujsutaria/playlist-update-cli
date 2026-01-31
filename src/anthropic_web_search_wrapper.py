@@ -59,6 +59,17 @@ def main() -> int:
         return 1
 
     output_text = _extract_output_text(response)
+    if not output_text and _has_tool_use(response):
+        fallback = _run_without_tools(
+            client=client,
+            models=_resolve_model_candidates(model),
+            prompt=prompt,
+            max_tokens=max_tokens,
+        )
+        if fallback is None:
+            return 1
+        response = fallback
+        output_text = _extract_output_text(response)
     parsed = _parse_json_output(output_text or "")
     if parsed is None:
         summary = (output_text or "").strip()
@@ -118,6 +129,27 @@ def _run_with_fallbacks(
     return None
 
 
+def _run_without_tools(
+    client: anthropic.Anthropic,
+    models: List[str],
+    prompt: str,
+    max_tokens: int,
+) -> Optional[object]:
+    for model in models:
+        try:
+            return client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:
+            if _is_model_error(exc):
+                continue
+            print(f"Anthropic API error: {exc}", file=sys.stderr)
+            return None
+    return None
+
+
 def _resolve_model_candidates(primary: str) -> List[str]:
     candidates = [primary]
     extra = os.getenv("ANTHROPIC_WEB_SEARCH_MODEL_FALLBACKS", "").strip()
@@ -160,6 +192,20 @@ def _extract_output_text(message: Any) -> str:
         if text:
             texts.append(str(text))
     return "\n".join(texts)
+
+
+def _has_tool_use(message: Any) -> bool:
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") == "tool_use":
+                return True
+        else:
+            if getattr(block, "type", None) == "tool_use":
+                return True
+    return False
 
 
 def _parse_json_output(text: str) -> Optional[object]:
