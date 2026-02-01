@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from storage.cache import compute_query_hash
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
-from storage.vectors import encode_vector, vector_norm
+from storage.vectors import decode_vector, encode_vector, vector_norm
 
 from .canonicalize import canonicalize_results
 from .context import build_context_card
@@ -87,6 +88,60 @@ class SearchPipeline:
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
 
+    def _score_config_payload(self, score_config: ScoreConfig) -> Dict[str, object]:
+        return {
+            "strict_threshold": self.strict_threshold,
+            "lenient_threshold": self.lenient_threshold,
+            "base_weight": score_config.base_weight,
+            "strict_weight": score_config.strict_weight,
+            "source_weight": score_config.source_weight,
+            "year_weight": score_config.year_weight,
+            "year_tolerance": score_config.year_tolerance,
+            "source_cap": score_config.source_cap,
+            "year_target": score_config.year_target,
+        }
+
+    def _score_config_hash(self, score_config: ScoreConfig) -> str:
+        payload = self._score_config_payload(score_config)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _build_score_config(self, query: str) -> ScoreConfig:
+        base_config = self.score_config or ScoreConfig()
+        score_config = ScoreConfig(
+            strict_weight=base_config.strict_weight,
+            base_weight=base_config.base_weight,
+            source_weight=base_config.source_weight,
+            year_weight=base_config.year_weight,
+            year_tolerance=base_config.year_tolerance,
+            source_cap=base_config.source_cap,
+            year_target=_extract_year_target(query),
+        )
+        self.last_score_config = score_config
+        return score_config
+
+    def _ensure_model_consistency(self) -> None:
+        models: set[str] = set()
+        for row in self.repos.conn.execute(
+            "SELECT DISTINCT model_name FROM track_embeddings WHERE model_name IS NOT NULL;"
+        ).fetchall():
+            models.add(row["model_name"] if isinstance(row, dict) else row[0])
+        for row in self.repos.conn.execute(
+            "SELECT DISTINCT model_name FROM queries WHERE model_name IS NOT NULL;"
+        ).fetchall():
+            models.add(row["model_name"] if isinstance(row, dict) else row[0])
+
+        models.discard(None)
+        if not models:
+            return
+        if models != {self.model_name}:
+            logger.warning("Embedding model changed (%s -> %s); clearing cached embeddings and runs.", models, self.model_name)
+            self.repos.conn.execute("DELETE FROM track_embeddings;")
+            self.repos.conn.execute("DELETE FROM queries;")
+            self.repos.conn.execute("DELETE FROM search_candidates;")
+            self.repos.conn.execute("DELETE FROM search_runs;")
+            self.repos.conn.commit()
+
     def _latest_run_id(self, query_hash: str) -> Optional[str]:
         row = self.repos.conn.execute(
             """
@@ -136,6 +191,146 @@ class SearchPipeline:
             )
         return results
 
+    def _rescore_cached_run(
+        self,
+        run_id: str,
+        query_text: str,
+        query_hash: str,
+        score_config: ScoreConfig,
+        score_config_hash: str,
+    ) -> None:
+        rows = self.repos.conn.execute(
+            """
+            SELECT sc.track_id, sc.strict_ratio, sc.sources_count,
+                   t.release_date, tc.context_text
+            FROM search_candidates sc
+            JOIN tracks t ON t.track_id = sc.track_id
+            LEFT JOIN track_context tc ON tc.track_id = sc.track_id
+            WHERE sc.run_id = ?
+            ORDER BY sc.rank ASC;
+            """,
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            return
+
+        track_ids = [row["track_id"] if isinstance(row, dict) else row[0] for row in rows]
+        embedding_rows = {}
+        if track_ids:
+            placeholders = ",".join(["?"] * len(track_ids))
+            for row in self.repos.conn.execute(
+                f"SELECT track_id, embedding_blob, embedding_dim FROM track_embeddings WHERE track_id IN ({placeholders});",
+                track_ids,
+            ).fetchall():
+                track_id = row["track_id"] if isinstance(row, dict) else row[0]
+                embedding_rows[track_id] = row
+
+        missing_contexts: List[str] = []
+        missing_ids: List[str] = []
+        for row in rows:
+            track_id = row["track_id"] if isinstance(row, dict) else row[0]
+            if track_id not in embedding_rows:
+                context_text = row["context_text"] if isinstance(row, dict) else row[4]
+                if context_text:
+                    missing_ids.append(track_id)
+                    missing_contexts.append(context_text)
+
+        if missing_ids:
+            model = EmbeddingModel(self.model_name)
+            vectors = model.embed(missing_contexts)
+            now = self._now()
+            for track_id, vec in zip(missing_ids, vectors):
+                self.repos.embeddings.upsert(
+                    {
+                        "track_id": track_id,
+                        "model_name": self.model_name,
+                        "embedding_blob": encode_vector(vec),
+                        "embedding_dim": len(vec),
+                        "embedding_norm": vector_norm(vec),
+                        "strict_ratio": None,
+                        "created_at": now,
+                    }
+                )
+            self.repos.conn.commit()
+            for row in self.repos.conn.execute(
+                f"SELECT track_id, embedding_blob, embedding_dim FROM track_embeddings WHERE track_id IN ({placeholders});",
+                track_ids,
+            ).fetchall():
+                track_id = row["track_id"] if isinstance(row, dict) else row[0]
+                embedding_rows[track_id] = row
+
+        query_row = self.repos.queries.get(query_hash) or {}
+        query_blob = query_row.get("embedding_blob")
+        query_vec = decode_vector(query_blob) if query_blob else []
+        if not query_vec:
+            model = EmbeddingModel(self.model_name)
+            query_vec = model.embed([query_text])[0] if query_text else []
+            self.repos.queries.upsert(
+                {
+                    "query_hash": query_hash,
+                    "query_text": query_text,
+                    "constraints_json": query_row.get("constraints_json"),
+                    "embedding_blob": encode_vector(query_vec),
+                    "embedding_dim": len(query_vec),
+                    "model_name": self.model_name,
+                    "created_at": query_row.get("created_at") or self._now(),
+                    "last_used_at": self._now(),
+                }
+            )
+
+        track_vectors: List[List[float]] = []
+        strict_ratios: List[float] = []
+        metadata_items: List[Dict[str, object]] = []
+        for row in rows:
+            track_id = row["track_id"] if isinstance(row, dict) else row[0]
+            embedding_row = embedding_rows.get(track_id)
+            vec = decode_vector(embedding_row["embedding_blob"]) if embedding_row else []
+            track_vectors.append(vec)
+            ratio = row["strict_ratio"] if isinstance(row, dict) else row[1]
+            strict_ratios.append(float(ratio) if ratio is not None else 0.0)
+            release_date = row["release_date"] if isinstance(row, dict) else row[3]
+            sources_count = row["sources_count"] if isinstance(row, dict) else row[2]
+            metadata_items.append(
+                {
+                    "year": release_date,
+                    "sources_count": sources_count or 0,
+                }
+            )
+
+        scores = score_candidates(
+            query_vec,
+            track_vectors,
+            strict_ratios,
+            score_config,
+            metadata=metadata_items,
+        )
+        order = rank_scores(scores)
+
+        for rank, idx in enumerate(order, 1):
+            track_id = track_ids[idx]
+            score = scores[idx]
+            strict_ratio = strict_ratios[idx]
+            sources_count = metadata_items[idx].get("sources_count") or 0
+            self.repos.candidates.upsert(
+                {
+                    "run_id": run_id,
+                    "track_id": track_id,
+                    "rank": rank,
+                    "score_text": score,
+                    "score_audio": None,
+                    "score_final": score,
+                    "strict_ratio": strict_ratio,
+                    "lenient_ratio": 1.0 - float(strict_ratio),
+                    "sources_count": sources_count,
+                }
+            )
+
+        self.repos.conn.execute(
+            "UPDATE search_runs SET score_config_hash = ? WHERE run_id = ?;",
+            (score_config_hash, run_id),
+        )
+        self.repos.conn.commit()
+
     def run(
         self,
         query: str,
@@ -143,12 +338,26 @@ class SearchPipeline:
         progress: Optional[ProgressCallback] = None,
         on_result: Optional[ResultCallback] = None,
     ) -> Tuple[List[SearchResult], str]:
+        ensure_schema(self.repos.conn)
+        self._ensure_model_consistency()
+        score_config = self._build_score_config(query)
+        score_config_hash = self._score_config_hash(score_config)
         if progress:
             progress("cache")
 
         query_hash = compute_query_hash(query, {"expanded": expanded, "model": self.model_name})
         cached_run_id = self._latest_run_id(query_hash)
         if cached_run_id:
+            run_row = self.repos.runs.get(cached_run_id) or {}
+            cached_hash = run_row.get("score_config_hash")
+            if cached_hash != score_config_hash:
+                self._rescore_cached_run(
+                    run_id=cached_run_id,
+                    query_text=query,
+                    query_hash=query_hash,
+                    score_config=score_config,
+                    score_config_hash=score_config_hash,
+                )
             cached_results = self._load_cached_results(cached_run_id)
             if cached_results:
                 self.last_cached = True
@@ -161,7 +370,6 @@ class SearchPipeline:
         # Placeholder for eventual provider-specific progress updates.
         provider_run = run_providers(query=query, expanded=expanded)
 
-        ensure_schema(self.repos.conn)
         run_id = str(uuid.uuid4())
         now = self._now()
 
@@ -190,6 +398,7 @@ class SearchPipeline:
                 "error": None,
                 "started_at": now,
                 "finished_at": now,
+                "score_config_hash": score_config_hash,
                 "results_count": len(provider_run.results),
             }
         )
@@ -365,17 +574,6 @@ class SearchPipeline:
         if progress:
             progress("score")
 
-        base_config = self.score_config or ScoreConfig()
-        score_config = ScoreConfig(
-            strict_weight=base_config.strict_weight,
-            base_weight=base_config.base_weight,
-            source_weight=base_config.source_weight,
-            year_weight=base_config.year_weight,
-            year_tolerance=base_config.year_tolerance,
-            source_cap=base_config.source_cap,
-            year_target=_extract_year_target(query),
-        )
-        self.last_score_config = score_config
         scores = score_candidates(
             query_vector,
             track_vectors,
@@ -433,4 +631,5 @@ class SearchPipeline:
         if progress:
             progress("cache")
 
+        self.repos.conn.commit()
         return results_out, run_id
