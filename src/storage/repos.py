@@ -255,6 +255,7 @@ class SearchRunsRepo:
             "error",
             "started_at",
             "finished_at",
+            "score_config_hash",
             "results_count",
         ]
         values = [payload.get(col) for col in columns]

@@ -142,3 +142,9 @@ def schema_v2() -> list[str]:
         "CREATE INDEX IF NOT EXISTS idx_listen_events_track ON listen_events(track_id);",
         "CREATE INDEX IF NOT EXISTS idx_listen_events_played_at ON listen_events(played_at);",
     ]
+
+
+def schema_v3() -> list[str]:
+    return [
+        "ALTER TABLE search_runs ADD COLUMN score_config_hash TEXT;",
+    ]
