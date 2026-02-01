@@ -398,11 +398,13 @@ def _run_command(
         and allow_claude_cli_fallback
         and _is_anthropic_wrapper_command(command)
         and not results
-        and not summary
         and _command_exists("claude")
         and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=True)
     ):
-        logger.info("Claude wrapper returned empty output; retrying with claude CLI.")
+        if summary:
+            logger.info("Claude wrapper returned no results (summary only); retrying with claude CLI.")
+        else:
+            logger.info("Claude wrapper returned empty output; retrying with claude CLI.")
         return _run_command(
             label,
             "claude --json",

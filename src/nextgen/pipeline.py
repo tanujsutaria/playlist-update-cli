@@ -438,6 +438,14 @@ class SearchPipeline:
                 strict_threshold=self.strict_threshold,
             )
 
+            self.repos.artists.upsert(
+                artist_id=artist_key,
+                name=artist,
+                genres_json=json.dumps([]),
+                popularity=None,
+                updated_at=now,
+            )
+
             self.repos.tracks.upsert(
                 {
                     "track_id": track_id,
@@ -456,14 +464,6 @@ class SearchPipeline:
                     "created_at": now,
                     "updated_at": now,
                 }
-            )
-
-            self.repos.artists.upsert(
-                artist_id=artist_key,
-                name=artist,
-                genres_json=json.dumps([]),
-                popularity=None,
-                updated_at=now,
             )
 
             self.repos.context.upsert(
