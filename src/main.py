@@ -1004,7 +1004,7 @@ class PlaylistCLI:
             self.last_search_policy = None
             self.last_search_run_id = None
             self.last_search_track_ids = None
-            self.last_search_cached = None
+            self.last_search_cached = False
         query_text = " ".join(query) if isinstance(query, list) else str(query)
         section("Deep Search", query_text)
 
@@ -1799,6 +1799,9 @@ class PlaylistCLI:
 
                     track = search_results['tracks']['items'][0]
                     song.spotify_uri = track['uri']
+                    if not track.get('artists'):
+                        stats["not_found"] += 1
+                        continue
                     artist_id = track['artists'][0]['id']
 
                 artist_info = spotify.sp.artist(artist_id)

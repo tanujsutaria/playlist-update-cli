@@ -181,7 +181,7 @@ class SpotifyManager:
                     best_score = combined_score
                     best_match = track
             
-            if best_match:
+            if best_match and best_match.get('artists'):
                 logger.info(f"Found fuzzy match for '{song_name} by {artist_name}' => "
                            f"'{best_match['name'].lower()} by {best_match['artists'][0]['name'].lower()}' "
                            f"(Score: {best_score:.2f})")
