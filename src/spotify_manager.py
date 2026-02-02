@@ -128,9 +128,11 @@ class SpotifyManager:
             
             if results['tracks']['items']:
                 for track in results['tracks']['items']:
+                    if not track.get('artists'):
+                        continue
                     track_name = track['name'].lower()
                     artist_name_spotify = track['artists'][0]['name'].lower()
-                    
+
                     # Check for exact artist match first
                     if artist_name_spotify == artist_name:
                         # Then check for song name similarity
@@ -148,15 +150,17 @@ class SpotifyManager:
             best_score = 0
             
             for track in results['tracks']['items']:
+                if not track.get('artists'):
+                    continue
                 track_name = track['name'].lower()
                 artist_name_spotify = track['artists'][0]['name'].lower()
-                
+
                 # Calculate base similarity scores
                 name_score = SequenceMatcher(None, track_name, song_name).ratio()
                 artist_score = SequenceMatcher(None, artist_name_spotify, artist_name).ratio()
-                
+
                 # Check if the artist name is contained within the other
-                artist_contained = (artist_name in artist_name_spotify or 
+                artist_contained = (artist_name in artist_name_spotify or
                                   artist_name_spotify in artist_name)
                 
                 # Boost artist score if names are contained within each other
@@ -203,7 +207,8 @@ class SpotifyManager:
             tracks = self.sp.artist_top_tracks(artist_id, country=market).get("tracks", [])
             top_tracks = []
             for track in tracks[:limit]:
-                artist = track["artists"][0]["name"] if track.get("artists") else artist_name
+                artists = track.get("artists")
+                artist = artists[0]["name"] if artists else artist_name
                 top_tracks.append({
                     "name": track["name"],
                     "artist": artist,

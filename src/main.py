@@ -268,8 +268,12 @@ class PlaylistCLI:
                         
                         track = results['tracks']['items'][0]
                         track_uri = track['uri']
-                        
+
                         # Step 2: Check artist popularity
+                        if not track.get('artists'):
+                            logger.warning(f"Line {line_num}: No artist data for track: {name}")
+                            stats["not_found"] += 1
+                            continue
                         artist_id = track['artists'][0]['id']
                         artist_info = spotify.sp.artist(artist_id)
                         
@@ -536,7 +540,7 @@ class PlaylistCLI:
                     try:
                         # Convert from ISO format to YYYY-MM-DD
                         added_date = added_date.split('T')[0]
-                    except:
+                    except (AttributeError, IndexError):
                         added_date = 'Unknown'
                 
                 table_data.append([
@@ -898,21 +902,25 @@ class PlaylistCLI:
                         if track_info:
                             # Check artist popularity
                             track = spotify.sp.track(song.spotify_uri)
-                            artist_id = track['artists'][0]['id']
-                            artist_info = spotify.sp.artist(artist_id)
-                            follower_count = artist_info['followers']['total']
-                            
-                            if follower_count >= 1000000:
-                                logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
-                                songs_to_remove.append(song)
-                                stats["popular_artist"] += 1
+                            if not track.get('artists'):
+                                logger.warning(f"No artist data for track: {song.name}")
+                                # Continue to search fallback
+                            else:
+                                artist_id = track['artists'][0]['id']
+                                artist_info = spotify.sp.artist(artist_id)
+                                follower_count = artist_info['followers']['total']
+
+                                if follower_count >= 1000000:
+                                    logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                                    songs_to_remove.append(song)
+                                    stats["popular_artist"] += 1
+                                    continue
+
+                                stats["kept"] += 1
                                 continue
-                            
-                            stats["kept"] += 1
-                            continue
-                    except Exception:
+                    except Exception as e:
                         # URI no longer valid, continue with search
-                        pass
+                        logger.debug(f"URI validation failed for {song.name}: {e}")
                 
                 # Search for the song on Spotify
                 query = f"track:{song.name} artist:{song.artist}"
@@ -929,18 +937,22 @@ class PlaylistCLI:
                     if not song.spotify_uri:
                         song.spotify_uri = track['uri']
                         self.db._save_state()  # Save the updated URI
-                    
+
                     # Check artist popularity
-                    artist_id = track['artists'][0]['id']
-                    artist_info = spotify.sp.artist(artist_id)
-                    follower_count = artist_info['followers']['total']
-                    
-                    if follower_count >= 1000000:
-                        logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
-                        songs_to_remove.append(song)
-                        stats["popular_artist"] += 1
-                    else:
+                    if not track.get('artists'):
+                        logger.warning(f"No artist data for track: {song.name}")
                         stats["kept"] += 1
+                    else:
+                        artist_id = track['artists'][0]['id']
+                        artist_info = spotify.sp.artist(artist_id)
+                        follower_count = artist_info['followers']['total']
+
+                        if follower_count >= 1000000:
+                            logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                            songs_to_remove.append(song)
+                            stats["popular_artist"] += 1
+                        else:
+                            stats["kept"] += 1
             
             # Remove songs if not in dry run mode
             if songs_to_remove:
