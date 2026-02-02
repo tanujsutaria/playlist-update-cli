@@ -222,13 +222,13 @@ def _parse_json_output(text: str) -> Optional[object]:
     except json.JSONDecodeError:
         pass
 
-    fenced = re.search(r"```json\\s*([\\s\\S]*?)```", text, flags=re.IGNORECASE)
+    fenced = re.search(r"```json\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
     if fenced:
         parsed = _try_parse_json(fenced.group(1).strip())
         if parsed is not None:
             return parsed
 
-    fenced = re.search(r"```\\s*([\\s\\S]*?)```", text)
+    fenced = re.search(r"```\s*([\s\S]*?)```", text)
     if fenced:
         parsed = _try_parse_json(fenced.group(1).strip())
         if parsed is not None:

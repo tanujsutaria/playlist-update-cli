@@ -84,6 +84,7 @@ class PlaylistCLI:
         self.last_search_policy = None
         self.last_search_run_id = None
         self.last_search_track_ids = None
+        self.last_search_cached = False
 
     @property
     def db(self) -> DatabaseManager:
