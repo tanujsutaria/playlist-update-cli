@@ -262,11 +262,14 @@ class RotationManager:
             
             # Force delete and recreate the playlist
             success = self.spotify.refresh_playlist(self.playlist_name, songs)
-            
+
             if not success:
                 logger.error(f"Failed to update playlist '{self.playlist_name}'")
                 return False
-            
+
+            # Persist any URI changes discovered during Spotify search
+            self.db._save_state()
+
             # Update history even if we used fallback songs
             logger.info("Updating playlist history...")
             if record_generation:

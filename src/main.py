@@ -710,6 +710,8 @@ class PlaylistCLI:
             if songs_to_add:
                 add_success = self.spotify.append_to_playlist(playlist_name, songs_to_add)
                 if add_success:
+                    # Persist any URI changes discovered during Spotify search
+                    self.db._save_state()
                     logger.info(f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'")
                 else:
                     logger.error("Failed to add new songs to playlist")
@@ -1909,6 +1911,8 @@ class PlaylistCLI:
         section("Create Playlist", playlist_name)
         success = self.spotify.append_to_playlist(playlist_name, songs)
         if success:
+            # Persist any URI changes discovered during Spotify search
+            self.db._save_state()
             info(f"Playlist '{playlist_name}' updated with {len(songs)} tracks.")
         else:
             warning(f"Failed to update playlist '{playlist_name}'.")
