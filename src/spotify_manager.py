@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional, Dict, Callable, Any
+import time
+from typing import List, Optional, Dict, Callable, Any, TypeVar
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from models import Song
@@ -10,6 +11,48 @@ from tqdm import tqdm
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+
+def _retry_with_backoff(
+    func: Callable[[], T],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 16.0,
+) -> T:
+    """Execute a function with exponential backoff retry on failure.
+
+    Args:
+        func: The function to execute
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay in seconds
+
+    Returns:
+        The result of the function
+
+    Raises:
+        The last exception if all retries fail
+    """
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            error_str = str(e).lower()
+            # Check for rate limiting (429) or transient errors
+            is_rate_limited = "429" in error_str or "rate limit" in error_str
+            is_transient = "timeout" in error_str or "connection" in error_str
+
+            if attempt < max_retries and (is_rate_limited or is_transient):
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                logger.warning(f"Spotify API error (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+            else:
+                raise
+    raise last_exception  # Should never reach here, but for type safety
 
 SPOTIFY_SCOPES = [
     'playlist-modify-public',
@@ -128,9 +171,11 @@ class SpotifyManager:
             
             if results['tracks']['items']:
                 for track in results['tracks']['items']:
+                    if not track.get('artists'):
+                        continue
                     track_name = track['name'].lower()
                     artist_name_spotify = track['artists'][0]['name'].lower()
-                    
+
                     # Check for exact artist match first
                     if artist_name_spotify == artist_name:
                         # Then check for song name similarity
@@ -148,15 +193,17 @@ class SpotifyManager:
             best_score = 0
             
             for track in results['tracks']['items']:
+                if not track.get('artists'):
+                    continue
                 track_name = track['name'].lower()
                 artist_name_spotify = track['artists'][0]['name'].lower()
-                
+
                 # Calculate base similarity scores
                 name_score = SequenceMatcher(None, track_name, song_name).ratio()
                 artist_score = SequenceMatcher(None, artist_name_spotify, artist_name).ratio()
-                
+
                 # Check if the artist name is contained within the other
-                artist_contained = (artist_name in artist_name_spotify or 
+                artist_contained = (artist_name in artist_name_spotify or
                                   artist_name_spotify in artist_name)
                 
                 # Boost artist score if names are contained within each other
@@ -177,7 +224,7 @@ class SpotifyManager:
                     best_score = combined_score
                     best_match = track
             
-            if best_match:
+            if best_match and best_match.get('artists'):
                 logger.info(f"Found fuzzy match for '{song_name} by {artist_name}' => "
                            f"'{best_match['name'].lower()} by {best_match['artists'][0]['name'].lower()}' "
                            f"(Score: {best_score:.2f})")
@@ -203,7 +250,8 @@ class SpotifyManager:
             tracks = self.sp.artist_top_tracks(artist_id, country=market).get("tracks", [])
             top_tracks = []
             for track in tracks[:limit]:
-                artist = track["artists"][0]["name"] if track.get("artists") else artist_name
+                artists = track.get("artists")
+                artist = artists[0]["name"] if artists else artist_name
                 top_tracks.append({
                     "name": track["name"],
                     "artist": artist,
@@ -324,25 +372,32 @@ class SpotifyManager:
             if track_uris:
                 logger.info(f"Adding {len(track_uris)} new tracks...")
                 batch_size = 50
-                
+                batch_failures = 0
+
                 # Keep track of successfully added songs
                 added_songs = []
                 for i, song in enumerate(songs):
                     if song.spotify_uri in track_uris or any(uri == song.spotify_uri for uri in track_uris):
                         added_songs.append(song)
-                
+
                 for i in range(0, len(track_uris), batch_size):
                     batch = track_uris[i:i + batch_size]
                     try:
-                        self.sp.playlist_add_items(playlist_id, batch)
+                        _retry_with_backoff(lambda b=batch: self.sp.playlist_add_items(playlist_id, b))
                         logger.info(f"Added batch of {len(batch)} tracks")
                     except Exception as e:
                         logger.error(f"Error adding track batch: {str(e)}")
-            
+                        batch_failures += 1
+
             # Report results
             if failed_songs:
                 logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
-            
+
+            # Check for batch failures
+            if track_uris and batch_failures > 0:
+                logger.error(f"Failed to add {batch_failures} batch(es) to playlist")
+                return False
+
             # Log the songs that were successfully added
             if track_uris:
                 logger.info(f"Successfully updated playlist '{name}': added {len(track_uris)} new tracks")
@@ -394,19 +449,40 @@ class SpotifyManager:
                     else:
                         failed_songs.add(song.name)
 
+            batch_failures = 0
             if track_uris:
                 first_batch = track_uris[:100]
-                self.sp.playlist_replace_items(playlist_id, first_batch)
+                try:
+                    _retry_with_backoff(lambda: self.sp.playlist_replace_items(playlist_id, first_batch))
+                    logger.info(f"Replaced playlist with first {len(first_batch)} tracks")
+                except Exception as e:
+                    logger.error(f"Error replacing playlist items: {str(e)}")
+                    batch_failures += 1
+
                 remaining = track_uris[100:]
                 batch_size = 50
                 for i in range(0, len(remaining), batch_size):
                     batch = remaining[i:i + batch_size]
-                    self.sp.playlist_add_items(playlist_id, batch)
+                    try:
+                        _retry_with_backoff(lambda b=batch: self.sp.playlist_add_items(playlist_id, b))
+                        logger.info(f"Added batch of {len(batch)} tracks")
+                    except Exception as e:
+                        logger.error(f"Error adding track batch: {str(e)}")
+                        batch_failures += 1
             else:
-                self.sp.playlist_replace_items(playlist_id, [])
+                try:
+                    _retry_with_backoff(lambda: self.sp.playlist_replace_items(playlist_id, []))
+                except Exception as e:
+                    logger.error(f"Error clearing playlist: {str(e)}")
+                    batch_failures += 1
 
             if failed_songs:
                 logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
+
+            if batch_failures > 0:
+                logger.error(f"Failed {batch_failures} batch operation(s) during playlist replacement")
+                return False
+
             logger.info(f"Playlist '{name}' updated without deletion.")
             return True
         except Exception as e:
@@ -456,21 +532,28 @@ class SpotifyManager:
                         failed_songs.add(song.name)
             
             # Add tracks in batches
+            batch_failures = 0
             if track_uris:
                 logger.info(f"Appending {len(track_uris)} new tracks...")
                 batch_size = 50
                 for i in range(0, len(track_uris), batch_size):
                     batch = track_uris[i:i + batch_size]
                     try:
-                        self.sp.playlist_add_items(playlist_id, batch)
+                        _retry_with_backoff(lambda b=batch: self.sp.playlist_add_items(playlist_id, b))
                         logger.info(f"Added batch of {len(batch)} tracks")
                     except Exception as e:
                         logger.error(f"Error adding track batch: {str(e)}")
-            
+                        batch_failures += 1
+
             # Report results
             if failed_songs:
                 logger.warning(f"Failed to add {len(failed_songs)} songs: {', '.join(failed_songs)}")
-            
+
+            # Check for batch failures
+            if batch_failures > 0:
+                logger.error(f"Failed to add {batch_failures} batch(es) to playlist")
+                return False
+
             logger.info(f"Successfully appended tracks to playlist '{name}'")
             return True
             
@@ -493,20 +576,23 @@ class SpotifyManager:
                 return True
             
             logger.info(f"Removing {len(track_uris)} tracks from playlist '{name}'...")
-            
+
             # Remove tracks in batches
             batch_size = 50
+            batch_failures = 0
             for i in range(0, len(track_uris), batch_size):
                 batch = track_uris[i:i + batch_size]
                 try:
-                    # Format tracks for removal
-                    tracks_to_remove = [{"uri": uri} for uri in batch]
-                    self.sp.playlist_remove_all_occurrences_of_items(playlist_id, batch)
+                    _retry_with_backoff(lambda b=batch: self.sp.playlist_remove_all_occurrences_of_items(playlist_id, b))
                     logger.info(f"Removed batch of {len(batch)} tracks")
                 except Exception as e:
                     logger.error(f"Error removing track batch: {str(e)}")
-                    return False
-            
+                    batch_failures += 1
+
+            if batch_failures > 0:
+                logger.error(f"Failed to remove {batch_failures} batch(es) from playlist")
+                return False
+
             logger.info(f"Successfully removed tracks from playlist '{name}'")
             return True
             

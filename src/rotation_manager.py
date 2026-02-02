@@ -1,4 +1,5 @@
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Callable
 from pathlib import Path
@@ -172,12 +173,13 @@ class RotationManager:
             return selected + ranked_remaining[:remaining_count]
 
         # Fallback to legacy similarity search
+        if not selected and not all_songs:
+            return []
         seed_song = selected[-1] if selected else all_songs[0]
         similar_songs = self.db.find_similar_songs(seed_song, k=remaining_count, threshold=0.7)
-        
+
         # If we still don't have enough songs, add random ones from the remaining pool
         if len(selected) + len(similar_songs) < count and candidates:
-            import random
             remaining_needed = count - (len(selected) + len(similar_songs))
             logger.info(f"Still need {remaining_needed} more songs, adding random selections")
             
@@ -260,11 +262,14 @@ class RotationManager:
             
             # Force delete and recreate the playlist
             success = self.spotify.refresh_playlist(self.playlist_name, songs)
-            
+
             if not success:
                 logger.error(f"Failed to update playlist '{self.playlist_name}'")
                 return False
-            
+
+            # Persist any URI changes discovered during Spotify search
+            self.db._save_state()
+
             # Update history even if we used fallback songs
             logger.info("Updating playlist history...")
             if record_generation:
