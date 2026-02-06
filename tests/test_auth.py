@@ -18,13 +18,15 @@ def cli_no_init():
     return cli
 
 
-def test_auth_status_no_token(monkeypatch, caplog, cli_no_init):
+def test_auth_status_no_token(monkeypatch, cli_no_init):
+    """auth_status with no cached token should display a message via UI info()."""
     monkeypatch.setattr(main, "get_cached_token_info", lambda: None)
-    caplog.set_level("INFO", logger=main.__name__)
+    calls = []
+    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
 
     cli_no_init.auth_status()
 
-    assert "No cached Spotify token found." in caplog.text
+    assert any("No cached Spotify token found" in c for c in calls)
 
 
 def test_auth_status_with_token(monkeypatch, cli_no_init):
@@ -52,20 +54,35 @@ def test_auth_status_with_token(monkeypatch, cli_no_init):
     assert ["Scopes", "playlist-read-private"] in rows
 
 
-def test_auth_refresh_no_token(monkeypatch, caplog, cli_no_init):
+def test_auth_refresh_no_token(monkeypatch, cli_no_init):
+    """auth_refresh with no token should display a warning via UI warning()."""
     monkeypatch.setattr(main, "refresh_cached_token", lambda: None)
-    caplog.set_level("INFO", logger=main.__name__)
+    calls = []
+    monkeypatch.setattr(main, "warning", lambda msg: calls.append(msg))
 
     cli_no_init.auth_refresh()
 
-    assert "No token refreshed" in caplog.text
+    assert any("No token refreshed" in c for c in calls)
 
 
-def test_auth_refresh_with_expiry(monkeypatch, caplog, cli_no_init):
+def test_auth_refresh_with_expiry(monkeypatch, cli_no_init):
+    """auth_refresh with new expiry should display a message via UI info()."""
     ts = 1_700_000_000
     monkeypatch.setattr(main, "refresh_cached_token", lambda: {"expires_at": ts})
-    caplog.set_level("INFO", logger=main.__name__)
+    calls = []
+    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
 
     cli_no_init.auth_refresh()
 
-    assert "Token refreshed" in caplog.text
+    assert any("Token refreshed" in c for c in calls)
+
+
+def test_auth_refresh_without_expiry(monkeypatch, cli_no_init):
+    """auth_refresh with no expiry data should still display a message."""
+    monkeypatch.setattr(main, "refresh_cached_token", lambda: {"some_key": "val"})
+    calls = []
+    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+
+    cli_no_init.auth_refresh()
+
+    assert any("Token refreshed" in c for c in calls)
