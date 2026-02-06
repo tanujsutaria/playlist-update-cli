@@ -180,6 +180,19 @@ class PlaylistCLI:
             )
         return self._search_pipeline
 
+    def _reset_search_state(self) -> None:
+        """Reset all search-related state to defaults."""
+        self.last_search_results = None
+        self.last_search_query = None
+        self.last_search_summary = None
+        self.last_search_metrics = None
+        self.last_search_constraints = None
+        self.last_search_expanded = False
+        self.last_search_policy = None
+        self.last_search_run_id = None
+        self.last_search_track_ids = None
+        self.last_search_cached = False
+
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
         if playlist_name not in self._rotation_managers:
@@ -395,7 +408,7 @@ class PlaylistCLI:
             ["Songs Never Used", stats.songs_never_used],
             ["Total generations", stats.generations_count],
             ["Complete Rotation", "Yes" if stats.complete_rotation_achieved else "No"],
-            ["Rotation Progress", f"{(stats.unique_songs_used/stats.total_songs)*100:.1f}%"],
+            ["Rotation Progress", f"{(stats.unique_songs_used/stats.total_songs)*100:.1f}%" if stats.total_songs else "0.0%"],
             ["Current Strategy", stats.current_strategy],
         ]
         key_value_table(stats_table)
@@ -468,7 +481,7 @@ class PlaylistCLI:
         try:
             rm = self._get_rotation_manager(playlist_name)
             if not rm.history.generations:
-                logger.info(f"No rotations found for playlist '{playlist_name}'.")
+                info(f"No rotations found for playlist '{playlist_name}'.")
                 return
 
             # Determine how many generations to show
@@ -481,10 +494,10 @@ class PlaylistCLI:
                 try:
                     limit = int(gens_str)
                     if limit <= 0:
-                        logger.info("Number of generations must be positive.")
+                        warning("Number of generations must be positive.")
                         return
                 except ValueError:
-                    logger.info("Invalid --generations value. Must be an integer or 'all'.")
+                    warning("Invalid --generations value. Must be an integer or 'all'.")
                     return
                 
             # Handle out-of-bounds
@@ -513,7 +526,7 @@ class PlaylistCLI:
                         table_data.append([j, song.name, song.artist])
                     table(["#", "Song", "Artist"], table_data)
                 else:
-                    logger.info("   No songs found for this generation.")
+                    info("   No songs found for this generation.")
                     
             info(f"Current generation: {rm.history.current_generation + 1}")
         except Exception as e:
@@ -639,7 +652,7 @@ class PlaylistCLI:
         if export_format == "json":
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(export_payload, f, indent=2)
-            logger.info(f"Exported stats to {output_file}")
+            info(f"Exported stats to {output_file}")
             return
 
         # CSV export: flattened key/value pairs
@@ -655,7 +668,7 @@ class PlaylistCLI:
             writer = csv.writer(f)
             writer.writerow(["section", "key", "value"])
             writer.writerows(rows)
-        logger.info(f"Exported stats to {output_file}")
+        info(f"Exported stats to {output_file}")
 
     def sync_playlist(self, playlist_name: str):
         """Sync a playlist with all songs in the database by adding new songs and removing songs no longer in the database"""
@@ -821,14 +834,14 @@ class PlaylistCLI:
         backups_dir = project_root / "backups"
 
         if not backups_dir.exists():
-            logger.info("No backups directory found.")
+            info("No backups directory found.")
             return
 
         # Get all backup folders
         backup_folders = sorted(backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
 
         if not backup_folders:
-            logger.info("No backups found.")
+            info("No backups found.")
             return
 
         section("Available Backups")
@@ -852,7 +865,7 @@ class PlaylistCLI:
             info(f"Total backups: {len(table_data)}")
             info("Use 'restore <backup_name>' to restore a backup.")
         else:
-            logger.info("No backup folders found.")
+            info("No backup folders found.")
 
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
@@ -996,17 +1009,6 @@ class PlaylistCLI:
     ):
         """Deep web search for new songs based on criteria (next-gen pipeline)."""
         clear_preview()
-        if not hasattr(self, "last_search_results"):
-            self.last_search_results = None
-            self.last_search_query = None
-            self.last_search_summary = None
-            self.last_search_metrics = None
-            self.last_search_constraints = None
-            self.last_search_expanded = False
-            self.last_search_policy = None
-            self.last_search_run_id = None
-            self.last_search_track_ids = None
-            self.last_search_cached = False
         query_text = " ".join(query) if isinstance(query, list) else str(query)
         section("Deep Search", query_text)
 
@@ -1112,13 +1114,13 @@ class PlaylistCLI:
         except Exception as exc:
             warning(str(exc))
             clear_preview()
-            self.last_search_results = None
+            self._reset_search_state()
             return
 
         if not results:
             info("No results returned.")
             clear_preview()
-            self.last_search_results = None
+            self._reset_search_state()
             return
 
         self.last_search_cached = getattr(self.search_pipeline, "last_cached", False)
@@ -1930,6 +1932,7 @@ class PlaylistCLI:
         now = datetime.utcnow().isoformat() + "Z"
         for track_id in track_ids:
             self.repos.tracks.update_status(track_id, status, reason, now)
+        self.repos.conn.commit()
 
     def create_playlist_from_track_ids(self, playlist_name: str, track_ids: List[str]) -> bool:
         """Create or append to a playlist using cached track IDs."""
@@ -2146,7 +2149,7 @@ class PlaylistCLI:
         """Show Spotify auth token status without triggering auth flow."""
         token_info = get_cached_token_info()
         if not token_info:
-            logger.info("No cached Spotify token found.")
+            info("No cached Spotify token found.")
             return
 
         expires_at = token_info.get("expires_at")
@@ -2172,14 +2175,14 @@ class PlaylistCLI:
         """Refresh Spotify auth token if possible."""
         refreshed = refresh_cached_token()
         if not refreshed:
-            logger.info("No token refreshed. You may need to re-authenticate using any Spotify command.")
+            warning("No token refreshed. You may need to re-authenticate using any Spotify command.")
             return
         expires_at = refreshed.get("expires_at")
         if expires_at:
             expires_dt = datetime.fromtimestamp(expires_at)
-            logger.info(f"Token refreshed. New expiry: {expires_dt.isoformat()}")
+            info(f"Token refreshed. New expiry: {expires_dt.isoformat()}")
         else:
-            logger.info("Token refreshed.")
+            info("Token refreshed.")
 
 def main():
     if len(sys.argv) > 1:
@@ -2387,6 +2390,8 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
             cli.auth_status()
         elif command == 'auth-refresh':
             cli.auth_refresh()
+        elif command == 'interactive':
+            logger.info("Already running. Use the interactive UI directly.")
         else:
             logger.error(f"Unknown command: {command}")
             return 1
