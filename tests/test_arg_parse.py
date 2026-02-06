@@ -393,6 +393,111 @@ class TestSearchCommand:
             parser.parse_args(['search'])
 
 
+class TestIngestCommand:
+    """Tests for ingest command parsing"""
+
+    def test_parse_ingest_liked(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['ingest', 'liked'])
+        assert args.command == 'ingest'
+        assert args.source == 'liked'
+        assert args.name is None
+        assert args.time_range == 'medium_term'
+
+    def test_parse_ingest_playlist_with_name(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['ingest', 'playlist', 'My Playlist'])
+        assert args.source == 'playlist'
+        assert args.name == 'My Playlist'
+
+    def test_parse_ingest_top_with_time_range(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['ingest', 'top', '--time-range', 'long_term'])
+        assert args.source == 'top'
+        assert args.time_range == 'long_term'
+
+    def test_parse_ingest_recent(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['ingest', 'recent'])
+        assert args.source == 'recent'
+
+    def test_parse_ingest_invalid_source(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(['ingest', 'invalid'])
+
+    def test_parse_ingest_invalid_time_range(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(['ingest', 'top', '--time-range', 'invalid'])
+
+
+class TestListenSyncCommand:
+    """Tests for listen-sync command parsing"""
+
+    def test_parse_listen_sync_default(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['listen-sync'])
+        assert args.command == 'listen-sync'
+        assert args.limit == 50
+
+    def test_parse_listen_sync_custom_limit(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['listen-sync', '--limit', '100'])
+        assert args.limit == 100
+
+
+class TestRotateCommand:
+    """Tests for rotate command parsing"""
+
+    def test_parse_rotate_default_policy(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['rotate', 'My Playlist'])
+        assert args.command == 'rotate'
+        assert args.playlist == 'My Playlist'
+        assert args.policy == 'played'
+        assert args.max_replace is None
+
+    def test_parse_rotate_with_max_replace(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['rotate', 'My Playlist', '--max-replace', '5'])
+        assert args.max_replace == 5
+
+
+class TestRotatePlayedCommand:
+    """Tests for rotate-played (legacy) command parsing"""
+
+    def test_parse_rotate_played_default(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['rotate-played', 'My Playlist'])
+        assert args.command == 'rotate-played'
+        assert args.playlist == 'My Playlist'
+        assert args.max_replace is None
+
+
+class TestAuthCommands:
+    """Tests for auth-status and auth-refresh command parsing"""
+
+    def test_parse_auth_status(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['auth-status'])
+        assert args.command == 'auth-status'
+
+    def test_parse_auth_refresh(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['auth-refresh'])
+        assert args.command == 'auth-refresh'
+
+
+class TestInteractiveCommand:
+    """Tests for interactive command parsing"""
+
+    def test_parse_interactive(self):
+        parser = setup_parsers()
+        args = parser.parse_args(['interactive'])
+        assert args.command == 'interactive'
+
+
 class TestParseArgsFunction:
     """Tests for the parse_args function"""
 
@@ -432,6 +537,36 @@ class TestParseTokensFunction:
         command, args, error = parse_tokens([])
         assert command is None
         assert error is not None
+
+    def test_parse_tokens_valid_with_args(self):
+        command, args, error = parse_tokens(['update', 'My Playlist', '--count', '5'])
+        assert command == 'update'
+        assert args.playlist == 'My Playlist'
+        assert args.count == 5
+        assert error is None
+
+    def test_parse_tokens_invalid_command(self):
+        command, args, error = parse_tokens(['nonexistent'])
+        assert command is None
+        assert error is not None
+
+    def test_parse_tokens_all_commands(self):
+        """Verify parse_tokens handles every registered command."""
+        test_cases = [
+            (['stats'], 'stats'),
+            (['view', 'PL'], 'view'),
+            (['backup'], 'backup'),
+            (['list-backups'], 'list-backups'),
+            (['auth-status'], 'auth-status'),
+            (['auth-refresh'], 'auth-refresh'),
+            (['search', 'jazz'], 'search'),
+            (['clean'], 'clean'),
+            (['interactive'], 'interactive'),
+        ]
+        for tokens, expected_cmd in test_cases:
+            command, args, error = parse_tokens(tokens)
+            assert command == expected_cmd, f"Failed for tokens {tokens}: got {command}"
+            assert error is None, f"Unexpected error for {tokens}: {error}"
 
 
 if __name__ == "__main__":

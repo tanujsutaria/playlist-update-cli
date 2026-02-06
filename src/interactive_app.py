@@ -316,7 +316,11 @@ class PlaylistInteractiveApp(App):
             self.action_quit()
             return
 
-        tokens = shlex.split(text)
+        try:
+            tokens = shlex.split(text)
+        except ValueError as exc:
+            self.append_log(Panel(Text(f"Invalid command syntax: {exc}", style="red"), title="Error", border_style="red"))
+            return
         command, args, error = parse_tokens(tokens)
         if error:
             self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
@@ -349,8 +353,12 @@ class PlaylistInteractiveApp(App):
     def _execute_command(self, command: str, args: object) -> None:
         try:
             dispatch_command(self.cli, command, args)
-        except Exception:
+        except Exception as exc:
             logger.exception("Command failed: /%s", command)
+            self.call_from_thread(
+                self.append_log,
+                Panel(Text(f"Command /{command} failed: {exc}", style="red"), title="Error", border_style="red"),
+            )
         finally:
             self.call_from_thread(self._post_command, command)
 
@@ -373,13 +381,14 @@ class PlaylistInteractiveApp(App):
         table = Table(title="Commands", box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
         table.add_column("Command", style="cyan", overflow="fold", no_wrap=True, width=18)
         table.add_column("Description", overflow="fold", no_wrap=False)
-        table.add_row("/help", "Show this help screen")
+        table.add_row("/help, /?", "Show this help screen")
         table.add_row("/setup", "Show first-time setup instructions")
-        table.add_row("/env", "Show detected environment keys")
-        table.add_row("/debug", "Show debug info (errors, last, track <id>)")
-        table.add_row("/expand", "Expand the last search")
-        table.add_row("/clear", "Clear the output pane")
-        table.add_row("/quit", "Exit the app")
+        table.add_row("/env, /keys", "Show detected environment keys")
+        table.add_row("/debug", "Show debug info (errors, last, track <id|rank>)")
+        table.add_row("/errors", "Show error log (alias for /debug errors)")
+        table.add_row("/expand, /search-more", "Expand the last search")
+        table.add_row("/clear, /cls", "Clear the output pane")
+        table.add_row("/quit, /exit", "Exit the app")
         if not self._setup_mode:
             for name, help_text in self._command_summaries():
                 table.add_row(f"/{name}", help_text or "")
