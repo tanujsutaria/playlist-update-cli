@@ -72,15 +72,25 @@ class DatabaseManager:
         """Load song database from disk"""
         songs_path = self.embeddings_dir / "songs.pkl"
         if songs_path.exists():
-            with open(songs_path, 'rb') as f:
-                return pickle.load(f)
+            try:
+                with open(songs_path, 'rb') as f:
+                    return pickle.load(f)
+            except (pickle.UnpicklingError, EOFError, ValueError, KeyError) as e:
+                logger.error(f"Corrupt songs database file: {e}")
+            except Exception as e:
+                logger.error(f"Error loading songs: {e}")
         return {}
 
     def _load_embeddings(self) -> np.ndarray:
         """Load embeddings from disk"""
         embeddings_path = self.embeddings_dir / "embeddings.npy"
         if embeddings_path.exists():
-            return np.load(str(embeddings_path))
+            try:
+                return np.load(str(embeddings_path))
+            except (ValueError, OSError) as e:
+                logger.error(f"Corrupt embeddings file: {e}")
+            except Exception as e:
+                logger.error(f"Error loading embeddings: {e}")
         return np.array([])
 
     def _save_state(self):

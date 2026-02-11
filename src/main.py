@@ -219,7 +219,7 @@ class PlaylistCLI:
             logger.error(f"File not found: {file_path}")
             return
         
-        if not path.suffix.lower() in ['.txt', '.csv']:
+        if path.suffix.lower() not in ['.txt', '.csv']:
             logger.warning(f"File extension {path.suffix} not recognized. Expected .txt or .csv")
             logger.warning("Attempting to process file anyway...")
 
@@ -274,12 +274,12 @@ class PlaylistCLI:
                         query = f"track:{name} artist:{artist}"
                         results = spotify.sp.search(query, type='track', limit=1)
                         
-                        if not results['tracks']['items']:
+                        if not results.get('tracks', {}).get('items', []):
                             logger.warning(f"Line {line_num}: Song not found in Spotify: {name} by {artist}")
                             stats["not_found"] += 1
                             continue
-                        
-                        track = results['tracks']['items'][0]
+
+                        track = results.get('tracks', {}).get('items', [])[0]
                         track_uri = track['uri']
 
                         # Step 2: Check artist popularity
@@ -291,7 +291,7 @@ class PlaylistCLI:
                         artist_info = spotify.sp.artist(artist_id)
                         
                         # Get follower count
-                        follower_count = artist_info['followers']['total']
+                        follower_count = (artist_info.get('followers') or {}).get('total', 0)
                         
                         if follower_count >= 1000000:
                             logger.warning(f"Line {line_num}: Artist too popular ({follower_count:,} followers): {artist}")
@@ -801,8 +801,14 @@ class PlaylistCLI:
             return
 
         logger.info(f"Creating backup '{backup_folder.name}' from data folder...")
-        shutil.copytree(str(data_dir), str(backup_folder))
-        logger.info(f"Backup '{backup_folder.name}' created successfully.")
+        try:
+            shutil.copytree(str(data_dir), str(backup_folder))
+            logger.info(f"Backup '{backup_folder.name}' created successfully.")
+        except Exception as e:
+            logger.error(f"Backup failed: {e}")
+            if backup_folder.exists():
+                shutil.rmtree(str(backup_folder), ignore_errors=True)
+                logger.info("Cleaned up partial backup.")
 
     def restore_data(self, backup_name: str):
         """
@@ -818,6 +824,7 @@ class PlaylistCLI:
             return
 
         # Rename or remove current data/ before restoring
+        old_data_dir = None
         if data_dir.exists():
             logger.info("Renaming existing data folder...")
             old_data_dir = project_root / f"data_old_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -825,8 +832,16 @@ class PlaylistCLI:
             logger.info(f"Renamed existing data/ to {old_data_dir.name}")
 
         logger.info(f"Restoring backup '{backup_folder.name}' to data/ ...")
-        shutil.copytree(str(backup_folder), str(data_dir))
-        logger.info(f"Data successfully restored from '{backup_folder.name}'.")
+        try:
+            shutil.copytree(str(backup_folder), str(data_dir))
+            logger.info(f"Data successfully restored from '{backup_folder.name}'.")
+        except Exception as e:
+            logger.error(f"Restore failed: {e}")
+            if data_dir.exists():
+                shutil.rmtree(str(data_dir), ignore_errors=True)
+            if old_data_dir and old_data_dir.exists():
+                old_data_dir.rename(data_dir)
+                logger.info("Rolled back to previous data directory.")
 
     def list_backups(self):
         """List all available backups with their sizes and dates"""
@@ -923,7 +938,7 @@ class PlaylistCLI:
                             else:
                                 artist_id = track['artists'][0]['id']
                                 artist_info = spotify.sp.artist(artist_id)
-                                follower_count = artist_info['followers']['total']
+                                follower_count = (artist_info.get('followers') or {}).get('total', 0)
 
                                 if follower_count >= 1000000:
                                     logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
@@ -941,14 +956,14 @@ class PlaylistCLI:
                 query = f"track:{song.name} artist:{song.artist}"
                 results = spotify.sp.search(query, type='track', limit=1)
                 
-                if not results['tracks']['items']:
+                if not results.get('tracks', {}).get('items', []):
                     # Song not found in Spotify
                     logger.warning(f"Song not found in Spotify: {song.name} by {song.artist}")
                     songs_to_remove.append(song)
                     stats["not_found"] += 1
                 else:
                     # Song found, update URI if needed
-                    track = results['tracks']['items'][0]
+                    track = results.get('tracks', {}).get('items', [])[0]
                     if not song.spotify_uri:
                         song.spotify_uri = track['uri']
                         self.db._save_state()  # Save the updated URI
@@ -960,7 +975,7 @@ class PlaylistCLI:
                     else:
                         artist_id = track['artists'][0]['id']
                         artist_info = spotify.sp.artist(artist_id)
-                        follower_count = artist_info['followers']['total']
+                        follower_count = (artist_info.get('followers') or {}).get('total', 0)
 
                         if follower_count >= 1000000:
                             logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
@@ -1797,11 +1812,11 @@ class PlaylistCLI:
                         continue
                     query = f"track:{song.name} artist:{song.artist}"
                     search_results = spotify.sp.search(query, type='track', limit=1)
-                    if not search_results['tracks']['items']:
+                    if not search_results.get('tracks', {}).get('items', []):
                         stats["not_found"] += 1
                         continue
 
-                    track = search_results['tracks']['items'][0]
+                    track = search_results.get('tracks', {}).get('items', [])[0]
                     song.spotify_uri = track['uri']
                     if not track.get('artists'):
                         stats["not_found"] += 1
@@ -1809,7 +1824,7 @@ class PlaylistCLI:
                     artist_id = track['artists'][0]['id']
 
                 artist_info = spotify.sp.artist(artist_id)
-                follower_count = artist_info['followers']['total']
+                follower_count = (artist_info.get('followers') or {}).get('total', 0)
 
                 if pending_obscurity_proxy:
                     if max_listeners and follower_count > max_listeners:
@@ -2053,12 +2068,10 @@ class PlaylistCLI:
         artist = (item.get("artist") or "").strip()
         if not name or not artist:
             return None
-        name_clean = name.lower()
-        artist_clean = artist.lower()
         return Song(
-            id=f"{artist_clean}|||{name_clean}",
-            name=name_clean,
-            artist=artist_clean,
+            id=f"{artist.lower()}|||{name.lower()}",
+            name=name,
+            artist=artist,
             first_added=datetime.now()
         )
 
@@ -2213,6 +2226,8 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
                 args.query
             )
         elif command == 'stats':
+            if hasattr(args, 'output') and args.output and not args.export:
+                logger.warning("--output requires --export; ignoring --output")
             if args.export:
                 cli.export_stats(args.playlist, args.export, args.output)
             else:

@@ -307,6 +307,7 @@ def _run_command(
         return [], ""
     except Exception as exc:
         logger.warning("Search command failed for %s: %s", label, exc)
+        logger.debug("Full error:", exc_info=True)
         return [], ""
 
     if result.returncode != 0:
@@ -990,9 +991,10 @@ def run_deep_search(
         for future in as_completed(future_to_meta):
             label, idx, started = future_to_meta[future]
             try:
-                results, summary = future.result()
+                results, summary = future.result(timeout=timeout_sec + 30)
             except Exception as exc:
                 logger.warning("Search run %s-%s failed: %s", label, idx + 1, exc)
+                logger.debug("Full error:", exc_info=True)
                 continue
             elapsed = time.monotonic() - started
             logger.info(

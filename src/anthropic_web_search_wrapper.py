@@ -42,10 +42,21 @@ def main() -> int:
         or "claude-opus-4-5"
     )
     tool_type = os.getenv("ANTHROPIC_WEB_SEARCH_TOOL", "web_search_20250305")
-    max_uses = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_USES", "5"))
-    max_tokens = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_TOKENS", "1024"))
+    try:
+        max_uses = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_USES", "5"))
+    except ValueError:
+        max_uses = 5
+    try:
+        max_tokens = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_TOKENS", "1024"))
+    except ValueError:
+        max_tokens = 1024
 
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
+        return 1
+
+    client = anthropic.Anthropic(api_key=api_key)
     response = _run_with_fallbacks(
         client=client,
         models=_resolve_model_candidates(model),
@@ -291,4 +302,4 @@ def _is_model_error(exc: Exception) -> bool:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

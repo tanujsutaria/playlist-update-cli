@@ -53,7 +53,7 @@ def _cosine_similarity(vecs: np.ndarray, query: np.ndarray) -> np.ndarray:
     if vecs.size == 0:
         return np.array([])
     query_norm = np.linalg.norm(query)
-    if query_norm == 0:
+    if query_norm < 1e-10:
         return np.zeros(vecs.shape[0])
     vec_norms = np.linalg.norm(vecs, axis=1)
     vec_norms[vec_norms == 0] = 1e-10

@@ -42,9 +42,14 @@ def _retry_with_backoff(
         except Exception as e:
             last_exception = e
             error_str = str(e).lower()
-            # Check for rate limiting (429) or transient errors
             is_rate_limited = "429" in error_str or "rate limit" in error_str
             is_transient = "timeout" in error_str or "connection" in error_str
+            # Also check SpotifyException status code directly
+            if hasattr(e, 'http_status'):
+                if e.http_status == 429:
+                    is_rate_limited = True
+                elif e.http_status in (500, 502, 503, 504):
+                    is_transient = True
 
             if attempt < max_retries and (is_rate_limited or is_transient):
                 delay = min(base_delay * (2 ** attempt), max_delay)
@@ -71,11 +76,20 @@ def _get_cache_handler() -> spotipy.cache_handler.CacheFileHandler:
     )
 
 def _get_auth_manager(open_browser: bool = True) -> SpotifyOAuth:
+    client_id = os.getenv('SPOTIFY_CLIENT_ID')
+    client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+    redirect_uri = os.getenv('SPOTIFY_REDIRECT_URI')
+    if not client_id:
+        logger.warning("SPOTIFY_CLIENT_ID not set")
+    if not client_secret:
+        logger.warning("SPOTIFY_CLIENT_SECRET not set")
+    if not redirect_uri:
+        logger.warning("SPOTIFY_REDIRECT_URI not set")
     return SpotifyOAuth(
         scope=' '.join(SPOTIFY_SCOPES),
-        redirect_uri=os.getenv('SPOTIFY_REDIRECT_URI'),
-        client_id=os.getenv('SPOTIFY_CLIENT_ID'),
-        client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
+        redirect_uri=redirect_uri,
+        client_id=client_id,
+        client_secret=client_secret,
         cache_handler=_get_cache_handler(),
         open_browser=open_browser,
         show_dialog=False
@@ -251,7 +265,7 @@ class SpotifyManager:
             top_tracks = []
             for track in tracks[:limit]:
                 artists = track.get("artists")
-                artist = artists[0]["name"] if artists else artist_name
+                artist = (artists[0].get("name") or artist_name) if artists else artist_name
                 top_tracks.append({
                     "name": track["name"],
                     "artist": artist,
@@ -291,7 +305,11 @@ class SpotifyManager:
                 
                 # Get next batch if available
                 if results.get('next'):
-                    results = self.sp.next(results)
+                    try:
+                        results = self.sp.next(results)
+                    except Exception as e:
+                        logger.warning(f"Error fetching next page: {e}")
+                        break
                 else:
                     break
             
@@ -309,7 +327,7 @@ class SpotifyManager:
             track = self.sp.track(uri)
             return {
                 'name': track['name'].lower(),
-                'artist': track['artists'][0]['name'].lower(),
+                'artist': track['artists'][0]['name'].lower() if track.get('artists') else 'unknown',
                 'uri': track['uri']
             }
         except Exception as e:
@@ -329,7 +347,7 @@ class SpotifyManager:
                     del self.playlists[name]
                     logger.info(f"Successfully deleted playlist '{name}'")
                 except Exception as e:
-                    logger.warning(f"Error deleting playlist: {str(e)}")
+                    logger.warning(f"Error deleting playlist '{name}' (ID: {old_playlist_id}): {str(e)}. Proceeding to recreate playlist anyway.")
             
             # Create a new playlist
             logger.info(f"Creating new playlist '{name}'...")

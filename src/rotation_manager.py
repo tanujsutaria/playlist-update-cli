@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Callable
 from pathlib import Path
 import json
 import pickle
+import re as _re
 
 from models import Song, PlaylistHistory, RotationStats
 from db_manager import DatabaseManager
@@ -41,8 +42,8 @@ class RotationManager:
         """Load playlist history from disk"""
         history_dir = self.root_dir / "data/history"
         history_dir.mkdir(parents=True, exist_ok=True)
-        
-        history_file = history_dir / f"{self.playlist_name.lower().replace(' ', '_')}.pkl"
+
+        history_file = history_dir / f"{_re.sub(r'[^a-z0-9_-]', '_', self.playlist_name.lower())}.pkl"
         logger.debug(f"Loading history from: {history_file}")
         
         if history_file.exists():
@@ -58,8 +59,9 @@ class RotationManager:
     def _save_history(self):
         """Save playlist history to disk"""
         history_dir = self.root_dir / "data/history"
-        history_file = history_dir / f"{self.playlist_name.lower().replace(' ', '_')}.pkl"
-        
+        history_dir.mkdir(parents=True, exist_ok=True)
+        history_file = history_dir / f"{_re.sub(r'[^a-z0-9_-]', '_', self.playlist_name.lower())}.pkl"
+
         try:
             with open(history_file, 'wb') as f:
                 pickle.dump(self.history, f)
