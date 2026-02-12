@@ -662,13 +662,13 @@ class PlaylistInteractiveApp(App):
                 try:
                     if isinstance(fields_payload, str):
                         fields_payload = json.loads(fields_payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to parse debug JSON: %s", exc)
                 try:
                     if isinstance(sources_payload, str):
                         sources_payload = json.loads(sources_payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to parse debug JSON: %s", exc)
                 subsection("Context")
                 json_output({
                     "context_text": context.get("context_text"),
@@ -723,7 +723,8 @@ class PlaylistInteractiveApp(App):
 
         try:
             song = self.cli.db.get_song_by_id(target)
-        except Exception:
+        except Exception as exc:
+            logger.debug("DB lookup failed for %s: %s", target, exc)
             song = None
         if song:
             rows = [

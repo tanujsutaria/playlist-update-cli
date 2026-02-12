@@ -3,6 +3,20 @@ import inspect
 from typing import Tuple, Any, Optional, Type
 
 
+def _positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return ivalue
+
+
+def _non_negative_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"{value} must not be negative")
+    return ivalue
+
+
 class _NoExitArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that raises instead of exiting (for interactive UI)."""
 
@@ -32,8 +46,8 @@ def setup_parsers(
     # Update command
     update_parser = subparsers.add_parser('update', help='Update a playlist')
     update_parser.add_argument('playlist', help='Name of the playlist')
-    update_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
-    update_parser.add_argument('--fresh-days', type=int, default=30, 
+    update_parser.add_argument('--count', type=_positive_int, default=10, help='Number of songs to include')
+    update_parser.add_argument('--fresh-days', type=_non_negative_int, default=30,
                               help='Prioritize songs not listened to in this many days (default: 30)')
     update_parser.add_argument('--dry-run', action='store_true',
                               help='Preview selected songs without updating Spotify')
@@ -65,10 +79,10 @@ def setup_parsers(
     # Plan command
     plan_parser = subparsers.add_parser('plan', help='Preview future playlist rotations')
     plan_parser.add_argument('playlist', help='Name of the playlist')
-    plan_parser.add_argument('--count', type=int, default=10, help='Number of songs per generation')
-    plan_parser.add_argument('--fresh-days', type=int, default=30,
+    plan_parser.add_argument('--count', type=_positive_int, default=10, help='Number of songs per generation')
+    plan_parser.add_argument('--fresh-days', type=_non_negative_int, default=30,
                              help='Prioritize songs not listened to in this many days (default: 30)')
-    plan_parser.add_argument('--generations', type=int, default=3,
+    plan_parser.add_argument('--generations', type=_positive_int, default=3,
                              help='Number of future generations to preview (default: 3)')
     plan_parser.add_argument('--score-strategy', choices=['local', 'web', 'hybrid'], default='local',
                              help='Match scoring strategy to rank candidates (default: local)')
@@ -78,8 +92,8 @@ def setup_parsers(
     # Diff command
     diff_parser = subparsers.add_parser('diff', help='Show playlist changes before applying update')
     diff_parser.add_argument('playlist', help='Name of the playlist')
-    diff_parser.add_argument('--count', type=int, default=10, help='Number of songs to include')
-    diff_parser.add_argument('--fresh-days', type=int, default=30,
+    diff_parser.add_argument('--count', type=_positive_int, default=10, help='Number of songs to include')
+    diff_parser.add_argument('--fresh-days', type=_non_negative_int, default=30,
                              help='Prioritize songs not listened to in this many days (default: 30)')
     diff_parser.add_argument('--score-strategy', choices=['local', 'web', 'hybrid'], default='local',
                              help='Match scoring strategy to rank candidates (default: local)')
@@ -115,7 +129,7 @@ def setup_parsers(
 
     # Listen ledger sync
     listen_parser = subparsers.add_parser('listen-sync', help='Sync recently played tracks into the listen ledger')
-    listen_parser.add_argument('--limit', type=int, default=50,
+    listen_parser.add_argument('--limit', type=_positive_int, default=50,
                                help='Number of recent plays to pull (default: 50)')
 
     # Rotation based on listen ledger

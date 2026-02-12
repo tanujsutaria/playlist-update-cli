@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
@@ -35,11 +36,17 @@ def main() -> int:
         return 1
 
     prompt = _build_prompt(payload)
+    # Model is configurable via WEB_SEARCH_MODEL env var; gpt-5.2 is the default fallback
     model = os.getenv("WEB_SEARCH_MODEL", "gpt-5.2")
     tool_type = os.getenv("WEB_SEARCH_TOOL", "web_search")
     tool_choice = os.getenv("WEB_SEARCH_TOOL_CHOICE", "").strip().lower()
 
-    client = OpenAI()
+    timeout_val = 120
+    try:
+        timeout_val = float(os.getenv("WEB_SEARCH_TIMEOUT", "120"))
+    except ValueError:
+        print(f"Invalid WEB_SEARCH_TIMEOUT value, using default 120", file=sys.stderr)
+    client = OpenAI(timeout=timeout_val)
     request: Dict[str, Any] = {
         "model": model,
         "input": prompt,
@@ -53,6 +60,7 @@ def main() -> int:
     except Exception as exc:
         if _is_tool_type_error(exc, tool_type) and tool_type == "web_search":
             request["tools"] = [{"type": "web_search_preview"}]
+            time.sleep(2)
             try:
                 response = client.responses.create(**request)
             except Exception as retry_exc:
@@ -63,6 +71,8 @@ def main() -> int:
             return 1
 
     output_text = getattr(response, "output_text", None) or _extract_output_text(response)
+    if not output_text:
+        print("Warning: empty response from OpenAI API", file=sys.stderr)
     parsed = _parse_json_output(output_text or "")
     if parsed is None:
         summary = (output_text or "").strip()
@@ -186,4 +196,4 @@ def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

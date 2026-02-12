@@ -26,7 +26,11 @@ def main() -> int:
     tool_type = os.getenv("WEB_SCORE_TOOL", os.getenv("WEB_SEARCH_TOOL", "web_search"))
     tool_choice = os.getenv("WEB_SCORE_TOOL_CHOICE", "").strip().lower()
 
-    client = OpenAI()
+    try:
+        _timeout = float(os.getenv("WEB_SCORE_TIMEOUT", "120"))
+    except ValueError:
+        _timeout = 120.0
+    client = OpenAI(timeout=_timeout)
     request: Dict[str, Any] = {
         "model": model,
         "input": prompt,
@@ -50,6 +54,7 @@ def main() -> int:
             return 1
 
     output_text = getattr(response, "output_text", None) or _extract_output_text(response)
+    if not output_text: print("Warning: empty response from OpenAI API", file=sys.stderr)
     parsed = _parse_json_output(output_text or "")
     if parsed is None:
         parsed = {"scores": {}}
@@ -165,4 +170,4 @@ def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

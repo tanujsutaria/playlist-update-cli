@@ -23,7 +23,7 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA busy_timeout=10000;")
 
 
 @dataclass
@@ -38,7 +38,7 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self.path))
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             _apply_pragmas(self._conn)
         return self._conn

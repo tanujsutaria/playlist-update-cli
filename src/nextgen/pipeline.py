@@ -297,39 +297,43 @@ class SearchPipeline:
                 }
             )
 
-        scores = score_candidates(
-            query_vec,
-            track_vectors,
-            strict_ratios,
-            score_config,
-            metadata=metadata_items,
-        )
-        order = rank_scores(scores)
-
-        for rank, idx in enumerate(order, 1):
-            track_id = track_ids[idx]
-            score = scores[idx]
-            strict_ratio = strict_ratios[idx]
-            sources_count = metadata_items[idx].get("sources_count") or 0
-            self.repos.candidates.upsert(
-                {
-                    "run_id": run_id,
-                    "track_id": track_id,
-                    "rank": rank,
-                    "score_text": score,
-                    "score_audio": None,
-                    "score_final": score,
-                    "strict_ratio": strict_ratio,
-                    "lenient_ratio": 1.0 - float(strict_ratio),
-                    "sources_count": sources_count,
-                }
+        try:
+            scores = score_candidates(
+                query_vec,
+                track_vectors,
+                strict_ratios,
+                score_config,
+                metadata=metadata_items,
             )
+            order = rank_scores(scores)
 
-        self.repos.conn.execute(
-            "UPDATE search_runs SET score_config_hash = ? WHERE run_id = ?;",
-            (score_config_hash, run_id),
-        )
-        self.repos.conn.commit()
+            for rank, idx in enumerate(order, 1):
+                track_id = track_ids[idx]
+                score = scores[idx]
+                strict_ratio = strict_ratios[idx]
+                sources_count = metadata_items[idx].get("sources_count") or 0
+                self.repos.candidates.upsert(
+                    {
+                        "run_id": run_id,
+                        "track_id": track_id,
+                        "rank": rank,
+                        "score_text": score,
+                        "score_audio": None,
+                        "score_final": score,
+                        "strict_ratio": strict_ratio,
+                        "lenient_ratio": 1.0 - float(strict_ratio),
+                        "sources_count": sources_count,
+                    }
+                )
+
+            self.repos.conn.execute(
+                "UPDATE search_runs SET score_config_hash = ? WHERE run_id = ?;",
+                (score_config_hash, run_id),
+            )
+            self.repos.conn.commit()
+        except Exception as exc:
+            logger.error("Failed to rescore cached run %s: %s", run_id, exc)
+            self.repos.conn.rollback()
 
     def run(
         self,
@@ -387,6 +391,7 @@ class SearchPipeline:
                 "last_used_at": now,
             }
         )
+        self.repos.conn.commit()
 
         self.repos.runs.insert(
             {
@@ -402,6 +407,7 @@ class SearchPipeline:
                 "results_count": len(provider_run.results),
             }
         )
+        self.repos.conn.commit()
 
         track_ids: List[str] = []
         context_texts: List[str] = []
@@ -534,6 +540,8 @@ class SearchPipeline:
 
             if progress and idx % 25 == 0:
                 progress(f"extract {idx}/{len(canonical_results)}")
+
+        self.repos.conn.commit()
 
         if not track_ids:
             return [], run_id
