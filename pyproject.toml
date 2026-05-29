@@ -28,6 +28,7 @@ tunr = "src.main:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=7.3.1",
+    "pytest-cov>=4.0",
     "ruff>=0.6.0",
     "mypy>=1.8",
 ]
@@ -41,6 +42,22 @@ packages = ["src", "src.storage", "src.nextgen"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = [
+    "src/setup.py",
+    "src/*/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
 
 [tool.ruff]
 target-version = "py39"
