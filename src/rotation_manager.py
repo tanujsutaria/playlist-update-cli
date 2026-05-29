@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 from db_manager import DatabaseManager
 from models import PlaylistHistory, RotationStats, Song
-from scoring import MatchScorer, ScoreConfig
+from scoring import MatchScorer, PlaylistScoreConfig
 from spotify_manager import SpotifyManager
 
 logger = logging.getLogger(__name__)
@@ -96,7 +96,7 @@ class RotationManager:
         history: PlaylistHistory,
         count: int = 10,
         fresh_days: int = 30,
-        score_config: Optional[ScoreConfig] = None,
+        score_config: Optional[PlaylistScoreConfig] = None,
     ) -> List[Song]:
         """Select songs using a provided history snapshot."""
         today = datetime.now()
@@ -211,7 +211,10 @@ class RotationManager:
         return selected + similar_songs[:remaining_count]
 
     def select_songs_for_today(
-        self, count: int = 10, fresh_days: int = 30, score_config: Optional[ScoreConfig] = None
+        self,
+        count: int = 10,
+        fresh_days: int = 30,
+        score_config: Optional[PlaylistScoreConfig] = None,
     ) -> List[Song]:
         """Select songs for today's playlist, prioritizing songs not listened to recently
 
@@ -228,7 +231,7 @@ class RotationManager:
         count: int = 10,
         fresh_days: int = 30,
         generations: int = 3,
-        score_config: Optional[ScoreConfig] = None,
+        score_config: Optional[PlaylistScoreConfig] = None,
     ) -> List[List[Song]]:
         """Simulate future generations without writing history to disk."""
         import copy

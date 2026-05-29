@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ScoreConfig:
+class PlaylistScoreConfig:
     """Configuration for match scoring."""
 
     strategy: str = "local"  # local | web | hybrid
@@ -477,7 +477,7 @@ class ScorePipeline:
 
 
 class MatchScorer:
-    def __init__(self, playlist_name: str, db, spotify, history, config: ScoreConfig):
+    def __init__(self, playlist_name: str, db, spotify, history, config: PlaylistScoreConfig):
         self.playlist_name = playlist_name
         self.db = db
         self.spotify = spotify

@@ -7,7 +7,7 @@ import numpy as np
 
 
 @dataclass
-class ScoreConfig:
+class SearchScoreConfig:
     strict_weight: float = 0.4
     base_weight: float = 0.6
     source_weight: float = 0.05
@@ -52,7 +52,7 @@ def score_candidates(
     query_vec: List[float],
     track_vecs: Iterable[List[float]],
     strict_ratios: Iterable[float],
-    config: ScoreConfig,
+    config: SearchScoreConfig,
     metadata: Optional[List[Dict[str, Any]]] = None,
 ) -> List[float]:
     matrix = np.array(list(track_vecs), dtype=float)

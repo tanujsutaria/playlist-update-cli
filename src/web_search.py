@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from llm_json import parse_json_output as _parse_json_output
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_INSTRUCTIONS = (
@@ -407,7 +409,7 @@ def _run_command(
                 )
         if label == "claude" and not _module_available("anthropic"):
             logger.info(
-                "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m src.anthropic_web_search_wrapper' "
+                "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m anthropic_web_search_wrapper' "
                 "or install the anthropic package for structured JSON output."
             )
         return [], ""
@@ -532,74 +534,6 @@ def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
     if match:
         return match.group(1)
     return None
-
-
-def _parse_json_output(text: str) -> Optional[object]:
-    if text:
-        candidate = text.strip()
-        if candidate.startswith("```json"):
-            candidate = candidate[len("```json") :]
-        if candidate.startswith("```"):
-            candidate = candidate[len("```") :]
-        if candidate.endswith("```"):
-            candidate = candidate[:-3]
-        candidate = candidate.strip()
-        if candidate.startswith("{") and candidate.endswith("}"):
-            parsed = _try_parse_json(candidate)
-            if parsed is not None:
-                return parsed
-        if candidate.startswith("[") and candidate.endswith("]"):
-            parsed = _try_parse_json(candidate)
-            if parsed is not None:
-                return parsed
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    fenced = re.search(r"```json\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
-    if fenced:
-        candidate = fenced.group(1).strip()
-        parsed = _try_parse_json(candidate)
-        if parsed is not None:
-            return parsed
-
-    fenced = re.search(r"```\s*([\s\S]*?)```", text)
-    if fenced:
-        candidate = fenced.group(1).strip()
-        parsed = _try_parse_json(candidate)
-        if parsed is not None:
-            return parsed
-
-    brace_match = _extract_json_block(text, "{", "}")
-    if brace_match:
-        parsed = _try_parse_json(brace_match)
-        if parsed is not None:
-            return parsed
-
-    bracket_match = _extract_json_block(text, "[", "]")
-    if bracket_match:
-        parsed = _try_parse_json(bracket_match)
-        if parsed is not None:
-            return parsed
-
-    return None
-
-
-def _try_parse_json(candidate: str) -> Optional[object]:
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-
-def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[str]:
-    start = text.find(open_char)
-    end = text.rfind(close_char)
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1].strip()
 
 
 def _extract_text_from_response(output: object) -> Optional[str]:

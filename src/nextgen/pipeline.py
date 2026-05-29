@@ -19,7 +19,7 @@ from .context import build_context_card
 from .embeddings import EmbeddingModel
 from .extract import extract_context
 from .providers import run_providers
-from .scoring import ScoreConfig, rank_scores, score_candidates
+from .scoring import SearchScoreConfig, rank_scores, score_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -74,20 +74,20 @@ class SearchPipeline:
         model_name: str = "all-mpnet-base-v2",
         strict_threshold: float = 0.6,
         lenient_threshold: float = 0.75,
-        score_config: Optional[ScoreConfig] = None,
+        score_config: Optional[SearchScoreConfig] = None,
     ) -> None:
         self.repos = repos
         self.model_name = model_name
         self.strict_threshold = strict_threshold
         self.lenient_threshold = lenient_threshold
-        self.score_config = score_config or ScoreConfig()
+        self.score_config = score_config or SearchScoreConfig()
         self.last_cached = False
-        self.last_score_config: Optional[ScoreConfig] = None
+        self.last_score_config: Optional[SearchScoreConfig] = None
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
 
-    def _score_config_payload(self, score_config: ScoreConfig) -> Dict[str, object]:
+    def _score_config_payload(self, score_config: SearchScoreConfig) -> Dict[str, object]:
         return {
             "strict_threshold": self.strict_threshold,
             "lenient_threshold": self.lenient_threshold,
@@ -100,14 +100,14 @@ class SearchPipeline:
             "year_target": score_config.year_target,
         }
 
-    def _score_config_hash(self, score_config: ScoreConfig) -> str:
+    def _score_config_hash(self, score_config: SearchScoreConfig) -> str:
         payload = self._score_config_payload(score_config)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _build_score_config(self, query: str) -> ScoreConfig:
-        base_config = self.score_config or ScoreConfig()
-        score_config = ScoreConfig(
+    def _build_score_config(self, query: str) -> SearchScoreConfig:
+        base_config = self.score_config or SearchScoreConfig()
+        score_config = SearchScoreConfig(
             strict_weight=base_config.strict_weight,
             base_weight=base_config.base_weight,
             source_weight=base_config.source_weight,
@@ -199,7 +199,7 @@ class SearchPipeline:
         run_id: str,
         query_text: str,
         query_hash: str,
-        score_config: ScoreConfig,
+        score_config: SearchScoreConfig,
         score_config_hash: str,
     ) -> None:
         rows = self.repos.conn.execute(

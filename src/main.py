@@ -18,9 +18,9 @@ from db_manager import DatabaseManager
 from models import Song
 from nextgen.embeddings import EmbeddingModel
 from nextgen.pipeline import SearchPipeline, SearchResult
-from nextgen.scoring import ScoreConfig as SearchScoreConfig
+from nextgen.scoring import SearchScoreConfig
 from rotation_manager import RotationManager
-from scoring import ScoreConfig as PlaylistScoreConfig
+from scoring import PlaylistScoreConfig
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from storage.db import Database
 from storage.migrations import ensure_schema
@@ -123,7 +123,6 @@ class PlaylistCLI:
         if not hasattr(self, "_search_pipeline"):
             self._search_pipeline = None
         if self._search_pipeline is None:
-            import inspect
 
             def _env_float(name: str, default: float) -> float:
                 value = os.getenv(name)
@@ -147,19 +146,6 @@ class PlaylistCLI:
             strict_threshold = _env_float("SEARCH_STRICT_THRESHOLD", 0.6)
             lenient_threshold = _env_float("SEARCH_LENIENT_THRESHOLD", 0.75)
             score_config_cls = SearchScoreConfig
-            try:
-                if "strict_weight" not in inspect.signature(score_config_cls).parameters:
-                    from nextgen import scoring as nextgen_scoring
-
-                    score_config_cls = nextgen_scoring.ScoreConfig
-            except (TypeError, ValueError):
-                from nextgen import scoring as nextgen_scoring
-
-                score_config_cls = nextgen_scoring.ScoreConfig
-            if "strict_weight" not in inspect.signature(score_config_cls).parameters:
-                raise RuntimeError(
-                    "Next-gen ScoreConfig missing strict_weight; reinstall the project environment."
-                )
 
             score_config = score_config_cls(
                 strict_weight=_env_float("SEARCH_SCORE_STRICT_WEIGHT", 0.4),

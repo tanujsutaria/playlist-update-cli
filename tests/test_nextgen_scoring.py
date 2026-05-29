@@ -1,14 +1,14 @@
 import pytest
 
 from nextgen.pipeline import _extract_year_target
-from nextgen.scoring import ScoreConfig, score_candidates
+from nextgen.scoring import SearchScoreConfig, score_candidates
 
 
 def test_score_candidates_metadata_boosts():
     query_vec = [1.0, 0.0]
     track_vecs = [[1.0, 0.0]]
     strict_ratios = [0.0]
-    config = ScoreConfig(
+    config = SearchScoreConfig(
         base_weight=0.6,
         strict_weight=0.0,
         source_weight=0.1,
