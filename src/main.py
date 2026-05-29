@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from rich.logging import RichHandler
@@ -818,9 +818,14 @@ class PlaylistCLI:
                 shutil.rmtree(str(backup_folder), ignore_errors=True)
                 logger.info("Cleaned up partial backup.")
 
-    def restore_data(self, backup_name: str):
+    def restore_data(self, backup_name: str) -> bool:
         """
         Restore data/ from the chosen backup in backups/.
+
+        Atomic: the restored copy is built in a staging directory BEFORE the
+        live data/ is touched, then swapped in via rename. On any failure the
+        live data is left intact (or rolled back), and on success the
+        moved-aside old data dir is removed so it does not leak.
         """
         project_root = Path(__file__).parent.parent
         data_dir = project_root / "data"
@@ -829,27 +834,42 @@ class PlaylistCLI:
 
         if not backup_folder.exists():
             logger.error(f"No such backup folder: '{backup_folder.name}'")
-            return
+            return False
 
-        # Rename or remove current data/ before restoring
-        old_data_dir = None
-        if data_dir.exists():
-            logger.info("Renaming existing data folder...")
-            old_data_dir = project_root / f"data_old_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            data_dir.rename(old_data_dir)
-            logger.info(f"Renamed existing data/ to {old_data_dir.name}")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        staging = project_root / f".data_restore_{ts}"
 
+        # Build the new copy first; live data/ is untouched if this fails.
         logger.info(f"Restoring backup '{backup_folder.name}' to data/ ...")
         try:
-            shutil.copytree(str(backup_folder), str(data_dir))
-            logger.info(f"Data successfully restored from '{backup_folder.name}'.")
+            shutil.copytree(str(backup_folder), str(staging))
         except Exception as e:
             logger.error(f"Restore failed: {e}")
+            shutil.rmtree(str(staging), ignore_errors=True)
+            return False
+
+        old = None
+        try:
             if data_dir.exists():
-                shutil.rmtree(str(data_dir), ignore_errors=True)
-            if old_data_dir and old_data_dir.exists():
-                old_data_dir.rename(data_dir)
+                logger.info("Renaming existing data folder...")
+                old = project_root / f"data_old_{ts}"
+                data_dir.rename(old)  # move live aside
+                logger.info(f"Renamed existing data/ to {old.name}")
+            staging.rename(data_dir)  # atomic swap (same filesystem)
+        except Exception as e:
+            logger.error(f"Restore failed: {e}")
+            if old is not None and old.exists() and not data_dir.exists():
+                old.rename(data_dir)  # rollback
                 logger.info("Rolled back to previous data directory.")
+            shutil.rmtree(str(staging), ignore_errors=True)
+            return False
+
+        if old is not None:
+            # Success: remove the moved-aside copy (fixes the data_old_<ts> leak).
+            shutil.rmtree(str(old), ignore_errors=True)
+
+        logger.info(f"Data successfully restored from '{backup_folder.name}'.")
+        return True
 
     def list_backups(self):
         """List all available backups with their sizes and dates"""
@@ -2235,204 +2255,331 @@ def main():
     return run_interactive()
 
 
+# ---------------------------------------------------------------------------
+# Command registry
+#
+# Each command is handled by a small module-level function that pulls the
+# relevant fields off the parsed argparse Namespace and delegates to a
+# PlaylistCLI method, returning an exit code (0 success, 1 error). The
+# `_COMMAND_HANDLERS` mapping (defined below the handlers) replaces what used
+# to be a ~200-line if/elif ladder. The public contract
+# (`dispatch_command(cli, command, args) -> int`, the cli method signatures,
+# and the return codes) is unchanged and locked by tests/test_dispatch_command.py.
+#
+# NOTE (future step): per-domain service-object extraction (search / rotation /
+# ingest / maintenance / auth) is deliberately deferred — the cli methods are
+# locked by the test suite, so wrapping them is high-risk churn. Tracked in
+# docs/REMEDIATION_PLAN.md.
+# ---------------------------------------------------------------------------
+
+
+def _handle_import(cli: "PlaylistCLI", args: Any) -> int:
+    cli.import_songs(args.file)
+    return 0
+
+
+def _handle_update(cli: "PlaylistCLI", args: Any) -> int:
+    cli.update_playlist(
+        args.playlist,
+        args.count,
+        args.fresh_days,
+        args.dry_run,
+        args.score_strategy,
+        args.query,
+    )
+    return 0
+
+
+def _handle_stats(cli: "PlaylistCLI", args: Any) -> int:
+    if hasattr(args, "output") and args.output and not args.export:
+        logger.warning("--output requires --export; ignoring --output")
+    if args.export:
+        cli.export_stats(args.playlist, args.export, args.output)
+    else:
+        cli.show_stats(args.playlist)
+    return 0
+
+
+def _handle_view(cli: "PlaylistCLI", args: Any) -> int:
+    cli.view_playlist(args.playlist)
+    return 0
+
+
+def _handle_sync(cli: "PlaylistCLI", args: Any) -> int:
+    cli.sync_playlist(args.playlist)
+    return 0
+
+
+def _handle_extract(cli: "PlaylistCLI", args: Any) -> int:
+    cli.extract_playlist(args.playlist, args.output)
+    return 0
+
+
+def _handle_plan(cli: "PlaylistCLI", args: Any) -> int:
+    cli.plan_playlist(
+        args.playlist,
+        args.count,
+        args.fresh_days,
+        args.generations,
+        args.score_strategy,
+        args.query,
+    )
+    return 0
+
+
+def _handle_diff(cli: "PlaylistCLI", args: Any) -> int:
+    cli.diff_playlist(args.playlist, args.count, args.fresh_days, args.score_strategy, args.query)
+    return 0
+
+
+def _handle_clean(cli: "PlaylistCLI", args: Any) -> int:
+    cli.clean_database(args.dry_run)
+    return 0
+
+
+def _handle_search(cli: "PlaylistCLI", args: Any) -> int:
+    cli.search_songs(args.query)
+    return 0
+
+
+def _present_debug_track(payload: dict) -> None:
+    """Render the `debug track` payload as tables (output unchanged)."""
+    track = payload.get("track") or {}
+    context = payload.get("context") or {}
+    sources = payload.get("sources") or []
+    embedding = payload.get("embedding") or {}
+    listens = payload.get("listens") or []
+    section("Debug", "Track")
+    rows = [
+        ["Track ID", track.get("track_id") or ""],
+        ["Name", track.get("name") or ""],
+        ["Artist ID", track.get("artist_id") or ""],
+        ["Spotify ID", track.get("spotify_id") or ""],
+        ["Spotify URL", track.get("spotify_url") or ""],
+        ["Release", track.get("release_date") or ""],
+        ["Status", track.get("status") or ""],
+    ]
+    if payload.get("resolved_rank"):
+        rows.append(["Resolved Rank", payload.get("resolved_rank")])
+    key_value_table(rows)
+    if context:
+        subsection("Context")
+        key_value_table(
+            [
+                ["Strict Ratio", context.get("strict_ratio")],
+                ["Context Text", (context.get("context_text") or "")[:200]],
+            ]
+        )
+    if sources:
+        subsection("Sources")
+        table(
+            ["#", "URL", "Title", "Snippet", "Provider", "Strict"],
+            [
+                [
+                    idx,
+                    s.get("url") or "",
+                    s.get("title") or "",
+                    s.get("snippet") or "",
+                    s.get("provider") or "",
+                    "yes" if s.get("is_strict") else "no",
+                ]
+                for idx, s in enumerate(sources, 1)
+            ],
+        )
+    if embedding:
+        subsection("Embedding")
+        key_value_table(
+            [
+                ["Model", embedding.get("model_name") or ""],
+                ["Dimensions", embedding.get("embedding_dim") or ""],
+                ["Norm", embedding.get("embedding_norm")],
+            ]
+        )
+    if listens:
+        subsection("Listen Events")
+        table(
+            ["#", "Played At", "Source"],
+            [
+                [idx, event.get("played_at") or "", event.get("source") or ""]
+                for idx, event in enumerate(listens[:10], 1)
+            ],
+        )
+
+
+def _present_debug_last_search(payload: dict) -> None:
+    """Render the `debug last-search` payload as tables (output unchanged)."""
+    run = payload.get("run") or {}
+    candidates = payload.get("candidates") or []
+    summary = payload.get("summary") or {}
+    section("Debug", "Last Search")
+    key_value_table(
+        [
+            ["Run ID", run.get("run_id")],
+            ["Started", run.get("started_at")],
+            ["Finished", run.get("finished_at")],
+            ["Status", run.get("status")],
+            ["Results", len(candidates)],
+            ["Cached", summary.get("cached")],
+            ["Avg strict ratio", f"{summary.get('avg_strict_ratio', 0):.2f}"],
+            ["Missing context", summary.get("missing_context", 0)],
+            ["Model", summary.get("model_name") or ""],
+        ]
+    )
+    score_config = summary.get("score_config") or {}
+    if score_config:
+        subsection("Score Config")
+        key_value_table(
+            [
+                ["Base", score_config.get("base_weight")],
+                ["Strict", score_config.get("strict_weight")],
+                ["Source", score_config.get("source_weight")],
+                ["Year", score_config.get("year_weight")],
+                ["Year tol", score_config.get("year_tolerance")],
+                ["Source cap", score_config.get("source_cap")],
+                ["Year target", score_config.get("year_target")],
+            ]
+        )
+    if candidates:
+        preview_rows = []
+        for idx, candidate in enumerate(candidates[:10], 1):
+            track = candidate.get("track") or {}
+            artist_label = track.get("artist_name") or track.get("artist_id") or ""
+            label = f"{track.get('name', '')} — {artist_label}".strip(" —")
+            preview_rows.append([idx, label, candidate.get("track_id") or ""])
+        subsection("Top Results (IDs)")
+        table(["#", "Track", "Track ID"], preview_rows)
+
+
+def _present_debug(payload: dict, topic: str) -> None:
+    """Render a debug payload as tables, dispatching on topic."""
+    if topic == "track":
+        _present_debug_track(payload)
+    else:
+        _present_debug_last_search(payload)
+
+
+def _handle_debug(cli: "PlaylistCLI", args: Any) -> int:
+    topic = getattr(args, "topic", "last")
+    fmt = getattr(args, "format", "json")
+    if topic == "track":
+        if not getattr(args, "value", None):
+            warning("Track ID required for debug track.")
+            return 1
+        payload = cli.debug_track(args.value)
+    else:
+        payload = cli.debug_last_search()
+    if not payload:
+        warning("No debug data available.")
+        return 1
+    if fmt == "table":
+        _present_debug(payload, topic)
+        return 0
+    json_output(payload)
+    return 0
+
+
+def _handle_ingest(cli: "PlaylistCLI", args: Any) -> int:
+    cli.ingest_tracks(args.source, args.name, args.time_range)
+    return 0
+
+
+def _handle_listen_sync(cli: "PlaylistCLI", args: Any) -> int:
+    cli.sync_listen_history(args.limit)
+    return 0
+
+
+def _handle_rotate_played(cli: "PlaylistCLI", args: Any) -> int:
+    cli.rotate_playlist_played(args.playlist, args.max_replace)
+    return 0
+
+
+def _handle_rotate(cli: "PlaylistCLI", args: Any) -> int:
+    if args.policy == "played":
+        cli.rotate_playlist_played(args.playlist, args.max_replace)
+        return 0
+    logger.error(f"Unknown rotate policy: {args.policy}")
+    return 1
+
+
+def _handle_backup(cli: "PlaylistCLI", args: Any) -> int:
+    cli.backup_data(args.backup_name)
+    return 0
+
+
+def _handle_restore(cli: "PlaylistCLI", args: Any) -> int:
+    cli.restore_data(args.backup_name)
+    return 0
+
+
+def _handle_restore_previous_rotation(cli: "PlaylistCLI", args: Any) -> int:
+    cli.restore_previous_rotation(args.playlist, args.offset)
+    return 0
+
+
+def _handle_list_rotations(cli: "PlaylistCLI", args: Any) -> int:
+    cli.list_rotations(args.playlist, args.generations)
+    return 0
+
+
+def _handle_list_backups(cli: "PlaylistCLI", args: Any) -> int:
+    cli.list_backups()
+    return 0
+
+
+def _handle_auth_status(cli: "PlaylistCLI", args: Any) -> int:
+    cli.auth_status()
+    return 0
+
+
+def _handle_auth_refresh(cli: "PlaylistCLI", args: Any) -> int:
+    cli.auth_refresh()
+    return 0
+
+
+def _handle_interactive(cli: "PlaylistCLI", args: Any) -> int:
+    logger.info("Already running. Use the interactive UI directly.")
+    return 0
+
+
+# Built after the handler functions so each name is already defined.
+_COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
+    "import": _handle_import,
+    "update": _handle_update,
+    "stats": _handle_stats,
+    "view": _handle_view,
+    "sync": _handle_sync,
+    "extract": _handle_extract,
+    "plan": _handle_plan,
+    "diff": _handle_diff,
+    "clean": _handle_clean,
+    "search": _handle_search,
+    "debug": _handle_debug,
+    "ingest": _handle_ingest,
+    "listen-sync": _handle_listen_sync,
+    "rotate-played": _handle_rotate_played,
+    "rotate": _handle_rotate,
+    "backup": _handle_backup,
+    "restore": _handle_restore,
+    "restore-previous-rotation": _handle_restore_previous_rotation,
+    "list-rotations": _handle_list_rotations,
+    "list-backups": _handle_list_backups,
+    "auth-status": _handle_auth_status,
+    "auth-refresh": _handle_auth_refresh,
+    "interactive": _handle_interactive,
+}
+
+
 def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
-    """Execute a parsed command against the CLI."""
+    """Execute a parsed command against the CLI via the command registry."""
     try:
-        if command == "import":
-            cli.import_songs(args.file)
-        elif command == "update":
-            cli.update_playlist(
-                args.playlist,
-                args.count,
-                args.fresh_days,
-                args.dry_run,
-                args.score_strategy,
-                args.query,
-            )
-        elif command == "stats":
-            if hasattr(args, "output") and args.output and not args.export:
-                logger.warning("--output requires --export; ignoring --output")
-            if args.export:
-                cli.export_stats(args.playlist, args.export, args.output)
-            else:
-                cli.show_stats(args.playlist)
-        elif command == "view":
-            cli.view_playlist(args.playlist)
-        elif command == "sync":
-            cli.sync_playlist(args.playlist)
-        elif command == "extract":
-            cli.extract_playlist(args.playlist, args.output)
-        elif command == "plan":
-            cli.plan_playlist(
-                args.playlist,
-                args.count,
-                args.fresh_days,
-                args.generations,
-                args.score_strategy,
-                args.query,
-            )
-        elif command == "diff":
-            cli.diff_playlist(
-                args.playlist, args.count, args.fresh_days, args.score_strategy, args.query
-            )
-        elif command == "clean":
-            cli.clean_database(args.dry_run)
-        elif command == "search":
-            cli.search_songs(args.query)
-        elif command == "debug":
-            topic = getattr(args, "topic", "last")
-            fmt = getattr(args, "format", "json")
-            if topic == "track":
-                if not getattr(args, "value", None):
-                    warning("Track ID required for debug track.")
-                    return 1
-                payload = cli.debug_track(args.value)
-            else:
-                payload = cli.debug_last_search()
-            if not payload:
-                warning("No debug data available.")
-                return 1
-            if fmt == "table":
-                if topic == "track":
-                    track = payload.get("track") or {}
-                    context = payload.get("context") or {}
-                    sources = payload.get("sources") or []
-                    embedding = payload.get("embedding") or {}
-                    listens = payload.get("listens") or []
-                    section("Debug", "Track")
-                    rows = [
-                        ["Track ID", track.get("track_id") or ""],
-                        ["Name", track.get("name") or ""],
-                        ["Artist ID", track.get("artist_id") or ""],
-                        ["Spotify ID", track.get("spotify_id") or ""],
-                        ["Spotify URL", track.get("spotify_url") or ""],
-                        ["Release", track.get("release_date") or ""],
-                        ["Status", track.get("status") or ""],
-                    ]
-                    if payload.get("resolved_rank"):
-                        rows.append(["Resolved Rank", payload.get("resolved_rank")])
-                    key_value_table(rows)
-                    if context:
-                        subsection("Context")
-                        key_value_table(
-                            [
-                                ["Strict Ratio", context.get("strict_ratio")],
-                                ["Context Text", (context.get("context_text") or "")[:200]],
-                            ]
-                        )
-                    if sources:
-                        subsection("Sources")
-                        table(
-                            ["#", "URL", "Title", "Snippet", "Provider", "Strict"],
-                            [
-                                [
-                                    idx,
-                                    s.get("url") or "",
-                                    s.get("title") or "",
-                                    s.get("snippet") or "",
-                                    s.get("provider") or "",
-                                    "yes" if s.get("is_strict") else "no",
-                                ]
-                                for idx, s in enumerate(sources, 1)
-                            ],
-                        )
-                    if embedding:
-                        subsection("Embedding")
-                        key_value_table(
-                            [
-                                ["Model", embedding.get("model_name") or ""],
-                                ["Dimensions", embedding.get("embedding_dim") or ""],
-                                ["Norm", embedding.get("embedding_norm")],
-                            ]
-                        )
-                    if listens:
-                        subsection("Listen Events")
-                        table(
-                            ["#", "Played At", "Source"],
-                            [
-                                [idx, event.get("played_at") or "", event.get("source") or ""]
-                                for idx, event in enumerate(listens[:10], 1)
-                            ],
-                        )
-                else:
-                    run = payload.get("run") or {}
-                    candidates = payload.get("candidates") or []
-                    summary = payload.get("summary") or {}
-                    section("Debug", "Last Search")
-                    key_value_table(
-                        [
-                            ["Run ID", run.get("run_id")],
-                            ["Started", run.get("started_at")],
-                            ["Finished", run.get("finished_at")],
-                            ["Status", run.get("status")],
-                            ["Results", len(candidates)],
-                            ["Cached", summary.get("cached")],
-                            ["Avg strict ratio", f"{summary.get('avg_strict_ratio', 0):.2f}"],
-                            ["Missing context", summary.get("missing_context", 0)],
-                            ["Model", summary.get("model_name") or ""],
-                        ]
-                    )
-                    score_config = summary.get("score_config") or {}
-                    if score_config:
-                        subsection("Score Config")
-                        key_value_table(
-                            [
-                                ["Base", score_config.get("base_weight")],
-                                ["Strict", score_config.get("strict_weight")],
-                                ["Source", score_config.get("source_weight")],
-                                ["Year", score_config.get("year_weight")],
-                                ["Year tol", score_config.get("year_tolerance")],
-                                ["Source cap", score_config.get("source_cap")],
-                                ["Year target", score_config.get("year_target")],
-                            ]
-                        )
-                    if candidates:
-                        preview_rows = []
-                        for idx, candidate in enumerate(candidates[:10], 1):
-                            track = candidate.get("track") or {}
-                            artist_label = track.get("artist_name") or track.get("artist_id") or ""
-                            label = f"{track.get('name', '')} — {artist_label}".strip(" —")
-                            preview_rows.append([idx, label, candidate.get("track_id") or ""])
-                        subsection("Top Results (IDs)")
-                        table(["#", "Track", "Track ID"], preview_rows)
-                return 0
-            json_output(payload)
-        elif command == "ingest":
-            cli.ingest_tracks(args.source, args.name, args.time_range)
-        elif command == "listen-sync":
-            cli.sync_listen_history(args.limit)
-        elif command == "rotate-played":
-            cli.rotate_playlist_played(args.playlist, args.max_replace)
-        elif command == "rotate":
-            if args.policy == "played":
-                cli.rotate_playlist_played(args.playlist, args.max_replace)
-            else:
-                logger.error(f"Unknown rotate policy: {args.policy}")
-                return 1
-        elif command == "backup":
-            cli.backup_data(args.backup_name)
-        elif command == "restore":
-            cli.restore_data(args.backup_name)
-        elif command == "restore-previous-rotation":
-            cli.restore_previous_rotation(args.playlist, args.offset)
-        elif command == "list-rotations":
-            cli.list_rotations(args.playlist, args.generations)
-        elif command == "list-backups":
-            cli.list_backups()
-        elif command == "auth-status":
-            cli.auth_status()
-        elif command == "auth-refresh":
-            cli.auth_refresh()
-        elif command == "interactive":
-            logger.info("Already running. Use the interactive UI directly.")
-        else:
+        handler = _COMMAND_HANDLERS.get(command)
+        if handler is None:
             logger.error(f"Unknown command: {command}")
             return 1
+        return handler(cli, args)
     except Exception as e:
         logger.error(f"Command failed: {str(e)}")
         return 1
-
-    return 0
 
 
 if __name__ == "__main__":
