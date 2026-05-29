@@ -66,11 +66,37 @@ SPOTIFY_SCOPES = [
     'user-library-read'
 ]
 
+class _SecureCacheFileHandler(spotipy.cache_handler.CacheFileHandler):
+    """CacheFileHandler that keeps the token file private (0600) after writes.
+
+    spotipy writes the token file using the process umask (commonly leaving it
+    world-readable), so we re-tighten permissions on every save.
+    """
+
+    def save_token_to_cache(self, token_info):
+        super().save_token_to_cache(token_info)
+        try:
+            os.chmod(self.cache_path, 0o600)
+        except OSError:
+            logger.debug("Could not chmod token cache file to 0600", exc_info=True)
+
+
 def _get_cache_handler() -> spotipy.cache_handler.CacheFileHandler:
     cache_dir = Path(__file__).parent.parent / ".spotify_cache"
     cache_dir.mkdir(exist_ok=True, mode=0o700)
+    # mkdir(mode=...) is a no-op when the directory already exists, so enforce
+    # private permissions explicitly — a pre-existing cache dir may be 0755.
+    try:
+        cache_dir.chmod(0o700)
+    except OSError:
+        logger.debug("Could not chmod .spotify_cache dir to 0700", exc_info=True)
     cache_path = cache_dir / ".spotify_token"
-    return spotipy.cache_handler.CacheFileHandler(
+    if cache_path.exists():
+        try:
+            cache_path.chmod(0o600)
+        except OSError:
+            logger.debug("Could not chmod existing token cache file to 0600", exc_info=True)
+    return _SecureCacheFileHandler(
         cache_path=str(cache_path),
         username='default'
     )
