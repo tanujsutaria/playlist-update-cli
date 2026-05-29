@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import inspect
 from typing import Tuple, Any, Optional, Type
