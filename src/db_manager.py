@@ -1,18 +1,21 @@
+import logging
 import os
 import pickle
-import logging
-import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional
+
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
+
 from models import Song
 
 logger = logging.getLogger(__name__)
 
+
 class DatabaseManager:
     """Manages the song database and embeddings using numpy for similarity search"""
-    
+
     def __init__(self, data_dir: str = "data"):
         # Convert relative path to absolute path relative to the project root
         if not os.path.isabs(data_dir):
@@ -21,33 +24,33 @@ class DatabaseManager:
             self.data_dir = script_dir / data_dir
         else:
             self.data_dir = Path(data_dir)
-        
+
         self.embeddings_dir = self.data_dir / "embeddings"
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
-        
+
         logger.debug("Checking data directories:")
         logger.debug("- Data dir: %s", self.data_dir.absolute())
         logger.debug("- Embeddings dir: %s", self.embeddings_dir.absolute())
-        
+
         # Check if files exist
         songs_path = self.embeddings_dir / "songs.pkl"
         embeddings_path = self.embeddings_dir / "embeddings.npy"
         logger.debug("Checking files:")
         logger.debug("- songs.pkl exists: %s", songs_path.exists())
         logger.debug("- embeddings.npy exists: %s", embeddings_path.exists())
-        
+
         if not songs_path.exists() or not embeddings_path.exists():
             logger.warning("Expected database files in: %s", self.embeddings_dir)
             logger.debug("Current directory: %s", os.getcwd())
-        
+
         logger.debug("Initializing embedding model...")
-        self.model = TfidfVectorizer(stop_words='english')
+        self.model = TfidfVectorizer(stop_words="english")
         # Initialize the model with sample text to ensure non-empty vocabulary
         self.model.fit(["song artist music playlist track album"])
-        
+
         self.songs = self._load_songs()
         logger.debug("Loaded %s songs from database", len(self.songs))
-        
+
         self.embeddings = self._load_embeddings()
         logger.debug(
             "Loaded embeddings shape: %s",
@@ -73,7 +76,7 @@ class DatabaseManager:
         songs_path = self.embeddings_dir / "songs.pkl"
         if songs_path.exists():
             try:
-                with open(songs_path, 'rb') as f:
+                with open(songs_path, "rb") as f:
                     return pickle.load(f)
             except (pickle.UnpicklingError, EOFError, ValueError, KeyError) as e:
                 logger.error(f"Corrupt songs database file: {e}")
@@ -96,9 +99,9 @@ class DatabaseManager:
     def _save_state(self):
         """Save current state to disk"""
         # Save songs database
-        with open(self.embeddings_dir / "songs.pkl", 'wb') as f:
+        with open(self.embeddings_dir / "songs.pkl", "wb") as f:
             pickle.dump(self.songs, f)
-        
+
         # Save embeddings array
         if len(self.embeddings) > 0:
             np.save(str(self.embeddings_dir / "embeddings.npy"), self.embeddings)
@@ -106,29 +109,29 @@ class DatabaseManager:
     def generate_embedding(self, song: Song) -> np.ndarray:
         """Generate embedding for a song"""
         text = f"{song.name} {song.artist}"
-        
+
         # Check if we have existing embeddings to match dimensions
         if len(self.embeddings) > 0:
             expected_dim = self.embeddings.shape[1]
-            
+
             # Load all existing songs to rebuild vocabulary consistently
             all_texts = []
             # Use at least 100 songs to build a stable vocabulary
             for i, song_id in enumerate(list(self.songs.keys())[:100]):
                 s = self.songs[song_id]
                 all_texts.append(f"{s.name} {s.artist}")
-            
+
             # Add current text
             all_texts.append(text)
-            
+
             # Always rebuild the model with all texts to ensure consistency
-            self.model = TfidfVectorizer(stop_words='english')
+            self.model = TfidfVectorizer(stop_words="english")
             self.model.fit(all_texts)
-            
+
             # Transform the text
             sparse_vector = self.model.transform([text])
             vector = sparse_vector.toarray()[0]
-            
+
             # If dimensions still don't match, pad or truncate
             if len(vector) != expected_dim:
                 if len(vector) < expected_dim:
@@ -137,7 +140,7 @@ class DatabaseManager:
                 else:
                     # Truncate
                     vector = vector[:expected_dim]
-            
+
             return vector
         else:
             # No existing embeddings, create a new model
@@ -145,30 +148,30 @@ class DatabaseManager:
                 # For new databases, use a fixed dimension size of 384
                 # This matches what seems to be your existing embedding size
                 fixed_dim = 384
-                
+
                 # Create a basic vocabulary
                 base_texts = [
                     text,
                     "song artist music playlist track album",
                     "rock pop jazz electronic indie alternative",
                     "vocals guitar drums bass piano keyboard",
-                    "melody rhythm harmony tempo beat"
+                    "melody rhythm harmony tempo beat",
                 ]
-                
+
                 # Create a new vectorizer with a fixed random state for consistency
-                self.model = TfidfVectorizer(stop_words='english')
+                self.model = TfidfVectorizer(stop_words="english")
                 self.model.fit(base_texts)
-                
+
                 # Transform the text
                 sparse_vector = self.model.transform([text])
                 vector = sparse_vector.toarray()[0]
-                
+
                 # Ensure the vector has the fixed dimension
                 if len(vector) < fixed_dim:
                     vector = np.pad(vector, (0, fixed_dim - len(vector)))
                 elif len(vector) > fixed_dim:
                     vector = vector[:fixed_dim]
-                
+
                 return vector
             except Exception as e:
                 # Fallback to a zero vector of the right size if all else fails
@@ -216,7 +219,7 @@ class DatabaseManager:
                     song.embedding = embedding_vec.tolist()
                     embedding = embedding_vec.reshape(1, -1)
                     self.embeddings = np.vstack([self.embeddings, embedding])
-        
+
         # Add to songs database
         self.songs[song.id] = song
         self._save_state()
@@ -243,56 +246,58 @@ class DatabaseManager:
         # Handle zero vectors to avoid division by zero
         norms1 = np.linalg.norm(self.embeddings, axis=1)
         norms2 = np.linalg.norm(query_embedding)
-        
+
         # Replace zero norms with a small value to avoid division by zero
         norms1[norms1 == 0] = 1e-10
         if norms2 == 0:
             norms2 = 1e-10
-            
+
         similarities = np.dot(self.embeddings, query_embedding.T).flatten()
         similarities = similarities / (norms1 * norms2)
-        
+
         # Get top k similar songs above threshold
         similar_indices = np.where(similarities > threshold)[0]
         similar_indices = similar_indices[np.argsort(-similarities[similar_indices])][:k]
-        
+
         # Convert to song objects
         similar_songs = []
         song_ids = list(self.songs.keys())
         for idx in similar_indices:
             if idx < len(song_ids) and song_ids[idx] != song.id:
                 similar_songs.append(self.songs[song_ids[idx]])
-        
+
         return similar_songs
 
     def remove_song(self, song_id: str) -> bool:
         """Remove a song from the database"""
         if song_id not in self.songs:
             return False
-            
+
         # Get the index of the song in the embeddings array
         song_ids = list(self.songs.keys())
         if song_id in song_ids:
             idx = song_ids.index(song_id)
-            
+
             # Remove from embeddings array
             if len(self.embeddings) > 0 and idx < len(self.embeddings):
                 # Create a new array without the song's embedding
                 self.embeddings = np.delete(self.embeddings, idx, axis=0)
-            
+
             # Remove from songs dictionary
             del self.songs[song_id]
-            
+
             # Save changes
             self._save_state()
             return True
-        
+
         return False
-        
+
     def get_stats(self):
         """Get database statistics"""
         return {
             "total_songs": len(self.songs),
             "embedding_dimensions": self.embeddings.shape[1] if len(self.embeddings) > 0 else 0,
-            "storage_size_mb": (self.embeddings.nbytes / 1024 / 1024) if len(self.embeddings) > 0 else 0
-        } 
+            "storage_size_mb": (self.embeddings.nbytes / 1024 / 1024)
+            if len(self.embeddings) > 0
+            else 0,
+        }

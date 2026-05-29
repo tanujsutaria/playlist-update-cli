@@ -2,20 +2,19 @@
 Mock response factories and helper classes for testing.
 Provides functions to create realistic Spotify API responses and mock objects.
 """
-from typing import List, Dict, Optional
-from unittest.mock import MagicMock
-from datetime import datetime
 
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from models import PlaylistHistory
 
 # =============================================================================
 # Spotify API Response Factories
 # =============================================================================
 
+
 def create_spotify_track_response(
-    name: str,
-    artist: str,
-    uri: str = None,
-    artist_id: str = None
+    name: str, artist: str, uri: str = None, artist_id: str = None
 ) -> Dict:
     """Create a mock Spotify track object"""
     if uri is None:
@@ -24,21 +23,13 @@ def create_spotify_track_response(
         artist_id = f"artist_{artist.lower().replace(' ', '')}"
 
     return {
-        'name': name,
-        'uri': uri,
-        'id': uri.split(':')[-1],
-        'artists': [
-            {
-                'id': artist_id,
-                'name': artist
-            }
-        ],
-        'album': {
-            'name': f"{name} Album",
-            'id': f"album_{name.lower().replace(' ', '')}"
-        },
-        'duration_ms': 180000,
-        'popularity': 50
+        "name": name,
+        "uri": uri,
+        "id": uri.split(":")[-1],
+        "artists": [{"id": artist_id, "name": artist}],
+        "album": {"name": f"{name} Album", "id": f"album_{name.lower().replace(' ', '')}"},
+        "duration_ms": 180000,
+        "popularity": 50,
     }
 
 
@@ -47,53 +38,41 @@ def create_spotify_search_response(tracks: List[Dict] = None) -> Dict:
     if tracks is None:
         tracks = [create_spotify_track_response("Default Track", "Default Artist")]
 
-    return {
-        'tracks': {
-            'items': tracks,
-            'total': len(tracks),
-            'limit': 10,
-            'offset': 0
-        }
-    }
+    return {"tracks": {"items": tracks, "total": len(tracks), "limit": 10, "offset": 0}}
 
 
 def create_spotify_playlist_response(
-    name: str,
-    playlist_id: str,
-    owner_id: str = "test_user_id"
+    name: str, playlist_id: str, owner_id: str = "test_user_id"
 ) -> Dict:
     """Create a mock playlist object"""
     return {
-        'id': playlist_id,
-        'name': name,
-        'owner': {'id': owner_id},
-        'public': False,
-        'tracks': {'total': 0},
-        'description': f"Test playlist: {name}"
+        "id": playlist_id,
+        "name": name,
+        "owner": {"id": owner_id},
+        "public": False,
+        "tracks": {"total": 0},
+        "description": f"Test playlist: {name}",
     }
 
 
 def create_spotify_artist_response(
-    name: str,
-    followers: int = 500000,
-    artist_id: str = None
+    name: str, followers: int = 500000, artist_id: str = None
 ) -> Dict:
     """Create a mock artist object with configurable follower count"""
     if artist_id is None:
         artist_id = f"artist_{name.lower().replace(' ', '')}"
 
     return {
-        'id': artist_id,
-        'name': name,
-        'followers': {'total': followers},
-        'popularity': 50,
-        'genres': ['rock', 'pop']
+        "id": artist_id,
+        "name": name,
+        "followers": {"total": followers},
+        "popularity": 50,
+        "genres": ["rock", "pop"],
     }
 
 
 def create_spotify_playlist_tracks_response(
-    tracks: List[Dict] = None,
-    has_next: bool = False
+    tracks: List[Dict] = None, has_next: bool = False
 ) -> Dict:
     """Create a mock playlist_tracks API response"""
     if tracks is None:
@@ -101,16 +80,9 @@ def create_spotify_playlist_tracks_response(
 
     items = []
     for i, track in enumerate(tracks):
-        items.append({
-            'added_at': f"2024-01-{(i+1):02d}T00:00:00Z",
-            'track': track
-        })
+        items.append({"added_at": f"2024-01-{(i + 1):02d}T00:00:00Z", "track": track})
 
-    return {
-        'items': items,
-        'total': len(items),
-        'next': 'http://next_page' if has_next else None
-    }
+    return {"items": items, "total": len(items), "next": "http://next_page" if has_next else None}
 
 
 def create_spotify_user_playlists_response(playlists: List[Dict] = None) -> Dict:
@@ -118,15 +90,13 @@ def create_spotify_user_playlists_response(playlists: List[Dict] = None) -> Dict
     if playlists is None:
         playlists = []
 
-    return {
-        'items': playlists,
-        'total': len(playlists)
-    }
+    return {"items": playlists, "total": len(playlists)}
 
 
 # =============================================================================
 # Mock Spotipy Client Class
 # =============================================================================
+
 
 class MockSpotipyClient:
     """
@@ -142,7 +112,7 @@ class MockSpotipyClient:
         self._search_results = {}
 
     def current_user(self) -> Dict:
-        return {'id': self.user_id}
+        return {"id": self.user_id}
 
     def current_user_playlists(self) -> Dict:
         items = [
@@ -151,12 +121,14 @@ class MockSpotipyClient:
         ]
         return create_spotify_user_playlists_response(items)
 
-    def user_playlist_create(self, user_id: str, name: str, public: bool = False, description: str = "") -> Dict:
+    def user_playlist_create(
+        self, user_id: str, name: str, public: bool = False, description: str = ""
+    ) -> Dict:
         playlist_id = f"new_playlist_{len(self._playlists)}"
         self._playlists[name] = playlist_id
         return create_spotify_playlist_response(name, playlist_id, user_id)
 
-    def search(self, query: str, type: str = 'track', limit: int = 10) -> Dict:
+    def search(self, query: str, type: str = "track", limit: int = 10) -> Dict:
         # Check for configured search results first
         if query in self._search_results:
             return self._search_results[query]
@@ -174,14 +146,15 @@ class MockSpotipyClient:
         # Add track URIs as track objects
         for uri in items:
             self._tracks[playlist_id].append(
-                create_spotify_track_response(f"Track {len(self._tracks[playlist_id])}", "Artist", uri)
+                create_spotify_track_response(
+                    f"Track {len(self._tracks[playlist_id])}", "Artist", uri
+                )
             )
 
     def playlist_remove_all_occurrences_of_items(self, playlist_id: str, items: List[str]) -> None:
         if playlist_id in self._tracks:
             self._tracks[playlist_id] = [
-                t for t in self._tracks[playlist_id]
-                if t['uri'] not in items
+                t for t in self._tracks[playlist_id] if t["uri"] not in items
             ]
 
     def current_user_unfollow_playlist(self, playlist_id: str) -> None:
@@ -230,32 +203,32 @@ class MockSpotipyClient:
 # Test Data Generators
 # =============================================================================
 
+
 def generate_song_batch(count: int = 10, start_index: int = 0) -> List[Dict]:
     """Generate a batch of test songs"""
-    from models import Song
     import numpy as np
+
+    from models import Song
 
     songs = []
     for i in range(start_index, start_index + count):
-        songs.append(Song(
-            id=f"artist{i}|||song{i}",
-            name=f"song{i}",
-            artist=f"artist{i}",
-            embedding=np.random.rand(384).tolist(),
-            spotify_uri=f"spotify:track:track{i}",
-            first_added=datetime(2024, 1, (i % 28) + 1)
-        ))
+        songs.append(
+            Song(
+                id=f"artist{i}|||song{i}",
+                name=f"song{i}",
+                artist=f"artist{i}",
+                embedding=np.random.rand(384).tolist(),
+                spotify_uri=f"spotify:track:track{i}",
+                first_added=datetime(2024, 1, (i % 28) + 1),
+            )
+        )
     return songs
 
 
 def generate_playlist_history(
-    playlist_name: str,
-    generations_count: int = 5,
-    songs_per_generation: int = 10
-) -> 'PlaylistHistory':
+    playlist_name: str, generations_count: int = 5, songs_per_generation: int = 10
+) -> "PlaylistHistory":
     """Generate a test PlaylistHistory with multiple generations"""
-    from models import PlaylistHistory
-
     generations = []
     for gen in range(generations_count):
         song_ids = [
@@ -268,5 +241,5 @@ def generate_playlist_history(
         playlist_id=f"playlist_{playlist_name.lower().replace(' ', '_')}",
         name=playlist_name,
         generations=generations,
-        current_generation=generations_count - 1
+        current_generation=generations_count - 1,
     )

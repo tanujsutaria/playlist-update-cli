@@ -99,7 +99,16 @@ def extract_context(
             sources.extend(summary_field.sources)
 
     if isinstance(context, dict):
-        for key in ("moods", "genres", "instrumentation", "comparisons", "era", "themes", "lyrics", "scene"):
+        for key in (
+            "moods",
+            "genres",
+            "instrumentation",
+            "comparisons",
+            "era",
+            "themes",
+            "lyrics",
+            "scene",
+        ):
             if key not in context:
                 continue
             field = _field_from_value(

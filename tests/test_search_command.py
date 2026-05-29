@@ -1,5 +1,4 @@
 """Unit tests for the search command workflow."""
-from unittest.mock import MagicMock
 
 from nextgen.pipeline import SearchResult
 
@@ -22,7 +21,11 @@ def test_search_sets_last_results(monkeypatch, mock_cli):
         return results, "run-1"
 
     monkeypatch.setattr(mock_cli, "_search_pipeline", None, raising=False)
-    monkeypatch.setattr(mock_cli.__class__, "search_pipeline", property(lambda self: type("P", (), {"run": fake_run})()))
+    monkeypatch.setattr(
+        mock_cli.__class__,
+        "search_pipeline",
+        property(lambda self: type("P", (), {"run": fake_run})()),
+    )
 
     mock_cli.search_songs("late night jazz")
 
@@ -50,7 +53,9 @@ def test_search_resets_state_on_error(monkeypatch, mock_cli):
             raise RuntimeError("search failed")
 
     monkeypatch.setattr(mock_cli, "_search_pipeline", None, raising=False)
-    monkeypatch.setattr(mock_cli.__class__, "search_pipeline", property(lambda self: FailPipeline()))
+    monkeypatch.setattr(
+        mock_cli.__class__, "search_pipeline", property(lambda self: FailPipeline())
+    )
 
     mock_cli.search_songs("new query")
 
@@ -76,7 +81,11 @@ def test_search_resets_state_on_empty_results(monkeypatch, mock_cli):
         return [], "run-empty"
 
     monkeypatch.setattr(mock_cli, "_search_pipeline", None, raising=False)
-    monkeypatch.setattr(mock_cli.__class__, "search_pipeline", property(lambda self: type("P", (), {"run": fake_run})()))
+    monkeypatch.setattr(
+        mock_cli.__class__,
+        "search_pipeline",
+        property(lambda self: type("P", (), {"run": fake_run})()),
+    )
 
     mock_cli.search_songs("empty results query")
 
@@ -103,7 +112,11 @@ def test_search_with_list_query(monkeypatch, mock_cli):
         return results, "run-list"
 
     monkeypatch.setattr(mock_cli, "_search_pipeline", None, raising=False)
-    monkeypatch.setattr(mock_cli.__class__, "search_pipeline", property(lambda self: type("P", (), {"run": fake_run})()))
+    monkeypatch.setattr(
+        mock_cli.__class__,
+        "search_pipeline",
+        property(lambda self: type("P", (), {"run": fake_run})()),
+    )
 
     mock_cli.search_songs(["indie", "rock", "2023"])
 

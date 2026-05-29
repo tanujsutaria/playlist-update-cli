@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
-import importlib.util
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,17 @@ KNOWN_METRICS = {
     "liveness": ["live", "liveness"],
     "popularity": ["popularity", "mainstream", "underground", "obscure"],
     "monthly_listeners": ["monthly listeners", "monthly listener", "listeners"],
-    "release_year": ["year", "release year", "released", "era", "decade", "90s", "80s", "00s", "2010s"],
+    "release_year": [
+        "year",
+        "release year",
+        "released",
+        "era",
+        "decade",
+        "90s",
+        "80s",
+        "00s",
+        "2010s",
+    ],
     "language": ["language", "spanish", "french", "german", "italian", "portuguese"],
     "region": ["region", "scene", "uk", "us", "japan", "korea", "brazil"],
     "mood": ["mood", "vibe", "atmospheric", "chill", "dark", "bright"],
@@ -128,7 +138,12 @@ def extract_constraints(query: str) -> dict:
         if value:
             constraints["min_monthly_listeners"] = value
 
-    if "similar" in lowered or "like " in lowered or "in the style" in lowered or "in the vein" in lowered:
+    if (
+        "similar" in lowered
+        or "like " in lowered
+        or "in the style" in lowered
+        or "in the vein" in lowered
+    ):
         constraints["similarity_requested"] = True
 
     return constraints
@@ -242,7 +257,7 @@ def build_search_payload(
                                 "value": "string or list",
                                 "sources": ["url"],
                                 "confidence": "float 0-1",
-                                "strict": "bool (true if sourced)"
+                                "strict": "bool (true if sourced)",
                             }
                         ],
                         "moods": ["string"],
@@ -252,7 +267,7 @@ def build_search_payload(
                         "era": ["string"],
                         "themes": ["string"],
                         "sources": ["url"],
-                        "confidence": "float 0-1"
+                        "confidence": "float 0-1",
                     },
                 }
             ]
@@ -356,7 +371,9 @@ def _run_command(
                             )
                     args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
                     if flag == "--search":
-                        logger.warning("Codex CLI does not support --search; running without web search.")
+                        logger.warning(
+                            "Codex CLI does not support --search; running without web search."
+                        )
                     return _run_command(
                         label,
                         " ".join(args),
@@ -385,7 +402,9 @@ def _run_command(
             wrapper_cmd = _default_anthropic_web_search_command()
             if wrapper_cmd != command:
                 logger.info("Retrying %s via Anthropic web search wrapper.", label)
-                return _run_command(label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides)
+                return _run_command(
+                    label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides
+                )
         if label == "claude" and not _module_available("anthropic"):
             logger.info(
                 "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m src.anthropic_web_search_wrapper' "
@@ -403,7 +422,9 @@ def _run_command(
         and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=True)
     ):
         if summary:
-            logger.info("Claude wrapper returned no results (summary only); retrying with claude CLI.")
+            logger.info(
+                "Claude wrapper returned no results (summary only); retrying with claude CLI."
+            )
         else:
             logger.info("Claude wrapper returned empty output; retrying with claude CLI.")
         return _run_command(
@@ -453,7 +474,7 @@ def _should_retry_claude_with_wrapper(command: str) -> bool:
 
 def _default_codex_command() -> str:
     schema = _codex_schema()
-    return f'codex exec --search --output-schema {schema} -'
+    return f"codex exec --search --output-schema {schema} -"
 
 
 def _default_openai_web_search_command() -> str:
@@ -467,9 +488,7 @@ def _default_anthropic_web_search_command() -> str:
 
 
 def _codex_schema() -> str:
-    return (
-        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]},"spotify_url":{"type":["string","null"]},"spotify_uri":{"type":["string","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
-    )
+    return '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]},"spotify_url":{"type":["string","null"]},"spotify_uri":{"type":["string","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
 
 
 def _module_available(name: str) -> bool:
@@ -487,17 +506,10 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-
-
 def _build_prompt_from_payload(payload: dict) -> str:
     instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
     filtered = {key: value for key, value in payload.items() if key != "instructions"}
-    return (
-        f"{instructions}\n\n"
-        "Input JSON:\n"
-        f"{json.dumps(filtered, indent=2)}\n\n"
-        "Return JSON only."
-    )
+    return f"{instructions}\n\nInput JSON:\n{json.dumps(filtered, indent=2)}\n\nReturn JSON only."
 
 
 def _stderr_has_unknown_json(stderr: str) -> bool:
@@ -530,7 +542,7 @@ def _parse_json_output(text: str) -> Optional[object]:
         if candidate.startswith("```"):
             candidate = candidate[len("```") :]
         if candidate.endswith("```"):
-            candidate = candidate[: -3]
+            candidate = candidate[:-3]
         candidate = candidate.strip()
         if candidate.startswith("{") and candidate.endswith("}"):
             parsed = _try_parse_json(candidate)
@@ -655,7 +667,9 @@ def _extract_output(output: object) -> Tuple[List[dict], str]:
     results: Iterable = []
     summary = ""
     if isinstance(output, dict):
-        summary = str(output.get("summary") or output.get("overview") or output.get("rationale") or "")
+        summary = str(
+            output.get("summary") or output.get("overview") or output.get("rationale") or ""
+        )
         results = (
             output.get("results")
             or output.get("songs")
@@ -742,12 +756,19 @@ def _normalize_item(item: object) -> Optional[dict]:
     normalized_sources: List[str] = []
     for source in sources:
         if isinstance(source, dict):
-            url = source.get("url") or source.get("link") or source.get("source") or source.get("href")
+            url = (
+                source.get("url")
+                or source.get("link")
+                or source.get("source")
+                or source.get("href")
+            )
             if url:
                 normalized_sources.append(str(url))
                 detail = {"url": str(url)}
                 title = source.get("title") or source.get("name")
-                snippet = source.get("snippet") or source.get("summary") or source.get("description")
+                snippet = (
+                    source.get("snippet") or source.get("summary") or source.get("description")
+                )
                 if title:
                     detail["title"] = str(title)
                 if snippet:
@@ -786,7 +807,11 @@ def _normalize_item(item: object) -> Optional[dict]:
         "song": str(song),
         "artist": str(artist),
         "year": item.get("year") or item.get("release_year") or item.get("released") or "",
-        "why": item.get("why") or item.get("reason") or item.get("rationale") or item.get("notes") or "",
+        "why": item.get("why")
+        or item.get("reason")
+        or item.get("rationale")
+        or item.get("notes")
+        or "",
         "sources": normalized_sources,
         "source_details": source_details,
         "metrics": metrics,
@@ -878,17 +903,29 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                 if not existing:
                     combined[key]["context"] = context
                 else:
-                    if isinstance(existing.get("fields"), list) and isinstance(context.get("fields"), list):
+                    if isinstance(existing.get("fields"), list) and isinstance(
+                        context.get("fields"), list
+                    ):
                         existing_fields = existing.get("fields") or []
                         existing_fields.extend(context.get("fields") or [])
                         existing["fields"] = existing_fields
-                    for key_name in ("moods", "genres", "instrumentation", "comparisons", "era", "themes", "sources"):
+                    for key_name in (
+                        "moods",
+                        "genres",
+                        "instrumentation",
+                        "comparisons",
+                        "era",
+                        "themes",
+                        "sources",
+                    ):
                         if context.get(key_name):
                             existing.setdefault(key_name, [])
-                            existing[key_name] = list({
-                                *existing.get(key_name, []),
-                                *context.get(key_name, []),
-                            })
+                            existing[key_name] = list(
+                                {
+                                    *existing.get(key_name, []),
+                                    *context.get(key_name, []),
+                                }
+                            )
                     if context.get("confidence") and not existing.get("confidence"):
                         existing["confidence"] = context.get("confidence")
                     combined[key]["context"] = existing
@@ -916,7 +953,9 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
             }
         )
 
-    results.sort(key=lambda item: (item["_rank"][0], item["_rank"][1], item["_rank"][2]), reverse=True)
+    results.sort(
+        key=lambda item: (item["_rank"][0], item["_rank"][1], item["_rank"][2]), reverse=True
+    )
     trimmed = results[:limit] if limit else results
     for item in trimmed:
         item.pop("_rank", None)
@@ -933,7 +972,16 @@ def run_deep_search(
     commands = detect_search_commands()
     selected = select_commands(commands, provider)
     if not selected:
-        return [], {}, [], "No search providers configured.", [], "", {}, build_source_policy(expanded)
+        return (
+            [],
+            {},
+            [],
+            "No search providers configured.",
+            [],
+            "",
+            {},
+            build_source_policy(expanded),
+        )
 
     env_timeout = os.getenv("WEB_SEARCH_TIMEOUT_SEC")
     if env_timeout:
@@ -1015,16 +1063,36 @@ def run_deep_search(
 
     filtered_results = {label: results for label, results in provider_results.items() if results}
     if not filtered_results:
-        return [], {}, [], "No results returned by providers.", requested_metrics, "", constraints, build_source_policy(expanded)
+        return (
+            [],
+            {},
+            [],
+            "No results returned by providers.",
+            requested_metrics,
+            "",
+            constraints,
+            build_source_policy(expanded),
+        )
 
     logger.info("Synthesizing results across providers...")
     combined = synthesize_results(filtered_results, resolved_limit)
     total_elapsed = time.monotonic() - started_at
     logger.info("Deep search complete (%s results, %.1fs).", len(combined), total_elapsed)
     providers = list(filtered_results.keys())
-    filtered_summaries = {label: summary for label, summary in provider_summaries.items() if label in filtered_results}
+    filtered_summaries = {
+        label: summary for label, summary in provider_summaries.items() if label in filtered_results
+    }
     summary = synthesize_summary(filtered_summaries, query)
-    return combined, filtered_results, providers, None, requested_metrics, summary, constraints, build_source_policy(expanded)
+    return (
+        combined,
+        filtered_results,
+        providers,
+        None,
+        requested_metrics,
+        summary,
+        constraints,
+        build_source_policy(expanded),
+    )
 
 
 def synthesize_summary(provider_summaries: Dict[str, str], query: str) -> str:

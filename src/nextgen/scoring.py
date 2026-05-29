@@ -37,7 +37,9 @@ def _parse_year(value: object) -> Optional[int]:
     return None
 
 
-def _year_similarity(track_year: Optional[int], target_year: Optional[int], tolerance: int) -> float:
+def _year_similarity(
+    track_year: Optional[int], target_year: Optional[int], tolerance: int
+) -> float:
     if not track_year or not target_year or tolerance <= 0:
         return 0.0
     diff = abs(track_year - target_year)

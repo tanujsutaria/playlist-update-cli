@@ -2,12 +2,12 @@
 Unit tests for RotationManager.
 Tests the song rotation algorithm and history management with mocked dependencies.
 """
-import pytest
-from unittest.mock import MagicMock, patch
-from datetime import datetime, timedelta
-from pathlib import Path
 
-from models import Song, PlaylistHistory, RotationStats
+from datetime import datetime
+
+import pytest
+
+from models import PlaylistHistory
 
 
 class TestRotationStats:
@@ -89,9 +89,7 @@ class TestSelectSongsForToday:
     def test_select_with_partial_history(self, mock_rotation_manager, sample_songs):
         """Test selection when some songs are in history"""
         # Mark first two songs as used
-        mock_rotation_manager.history.generations = [
-            [sample_songs[0].id, sample_songs[1].id]
-        ]
+        mock_rotation_manager.history.generations = [[sample_songs[0].id, sample_songs[1].id]]
 
         songs = mock_rotation_manager.select_songs_for_today(count=3)
 
@@ -203,10 +201,10 @@ class TestHistoryPersistence:
         """Test that history has all required fields"""
         history = mock_rotation_manager.history
 
-        assert hasattr(history, 'playlist_id')
-        assert hasattr(history, 'name')
-        assert hasattr(history, 'generations')
-        assert hasattr(history, 'current_generation')
+        assert hasattr(history, "playlist_id")
+        assert hasattr(history, "name")
+        assert hasattr(history, "generations")
+        assert hasattr(history, "current_generation")
 
 
 class TestPlaylistHistoryModel:
@@ -218,18 +216,13 @@ class TestPlaylistHistoryModel:
 
         assert isinstance(used, set)
         # Should contain all unique song IDs from all generations
-        expected_count = len(set(
-            sid for gen in sample_playlist_history.generations for sid in gen
-        ))
+        expected_count = len(set(sid for gen in sample_playlist_history.generations for sid in gen))
         assert len(used) == expected_count
 
     def test_all_used_songs_empty(self):
         """Test all_used_songs with empty generations"""
         history = PlaylistHistory(
-            playlist_id="test",
-            name="Test",
-            generations=[],
-            current_generation=0
+            playlist_id="test", name="Test", generations=[], current_generation=0
         )
 
         assert history.all_used_songs == set()

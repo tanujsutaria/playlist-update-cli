@@ -45,7 +45,7 @@ def main() -> int:
     try:
         timeout_val = float(os.getenv("WEB_SEARCH_TIMEOUT", "120"))
     except ValueError:
-        print(f"Invalid WEB_SEARCH_TIMEOUT value, using default 120", file=sys.stderr)
+        print("Invalid WEB_SEARCH_TIMEOUT value, using default 120", file=sys.stderr)
     client = OpenAI(timeout=timeout_val)
     request: Dict[str, Any] = {
         "model": model,
@@ -87,12 +87,7 @@ def main() -> int:
 def _build_prompt(payload: dict) -> str:
     instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
     trimmed = {key: value for key, value in payload.items() if key != "instructions"}
-    return (
-        f"{instructions}\n\n"
-        "Input JSON:\n"
-        f"{json.dumps(trimmed, indent=2)}\n\n"
-        "Return JSON only."
-    )
+    return f"{instructions}\n\nInput JSON:\n{json.dumps(trimmed, indent=2)}\n\nReturn JSON only."
 
 
 def _extract_output_text(response: Any) -> str:
@@ -101,7 +96,11 @@ def _extract_output_text(response: Any) -> str:
         return ""
     texts: List[str] = []
     for item in output:
-        content = getattr(item, "content", None) or item.get("content") if isinstance(item, dict) else None
+        content = (
+            getattr(item, "content", None) or item.get("content")
+            if isinstance(item, dict)
+            else None
+        )
         if not isinstance(content, list):
             continue
         for chunk in content:
@@ -166,7 +165,7 @@ def _strip_fence(text: str) -> Optional[str]:
     if candidate.startswith("```"):
         candidate = candidate[len("```") :]
     if candidate.endswith("```"):
-        candidate = candidate[: -3]
+        candidate = candidate[:-3]
     candidate = candidate.strip()
     if (candidate.startswith("{") and candidate.endswith("}")) or (
         candidate.startswith("[") and candidate.endswith("]")
@@ -192,7 +191,11 @@ def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[
 
 def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
     message = str(exc).lower()
-    return "tool" in message and tool_type in message and ("invalid" in message or "unsupported" in message)
+    return (
+        "tool" in message
+        and tool_type in message
+        and ("invalid" in message or "unsupported" in message)
+    )
 
 
 if __name__ == "__main__":

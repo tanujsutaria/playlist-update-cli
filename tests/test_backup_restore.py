@@ -2,10 +2,12 @@
 Unit tests for backup and restore commands.
 Tests the data directory backup and restore functionality.
 """
-import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
+
 from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 
 class TestBackupCommand:
@@ -13,7 +15,7 @@ class TestBackupCommand:
 
     def test_backup_creates_folder(self, cli_no_init, tmp_path):
         """Test that backup creates a folder in backups directory"""
-        with patch('main.Path') as mock_path:
+        with patch("main.Path") as mock_path:
             # Set up the path mocking
             mock_path.return_value.parent.parent = tmp_path
 
@@ -26,13 +28,14 @@ class TestBackupCommand:
 
             # Manually call the backup logic
             from main import PlaylistCLI
+
             cli = PlaylistCLI.__new__(PlaylistCLI)
             cli._db = None
             cli._spotify = None
             cli._rotation_managers = {}
 
             # Patch __file__ to return our tmp_path
-            with patch.object(Path, '__new__', return_value=tmp_path / "src" / "main.py"):
+            with patch.object(Path, "__new__", return_value=tmp_path / "src" / "main.py"):
                 # The backup should create the backups directory
                 backups_dir.mkdir(exist_ok=True)
                 assert backups_dir.exists()
@@ -47,7 +50,7 @@ class TestBackupCommand:
 
         # Timestamp should match YYYYMMDD_HHMMSS format
         assert len(timestamp) == 15
-        assert timestamp[8] == '_'
+        assert timestamp[8] == "_"
 
     def test_backup_uses_custom_name(self, tmp_path):
         """Test that backup uses provided name"""
@@ -76,6 +79,7 @@ class TestBackupCommand:
         backup_dir = backups_dir / "test_backup"
 
         import shutil
+
         shutil.copytree(str(data_dir), str(backup_dir))
 
         # Verify contents copied
@@ -112,6 +116,7 @@ class TestRestoreCommand:
 
         # Restore
         import shutil
+
         if data_dir.exists():
             shutil.rmtree(str(data_dir))
         shutil.copytree(str(backup_dir), str(data_dir))
@@ -156,6 +161,7 @@ class TestRestoreCommand:
         # Restore (copy)
         data_dir = tmp_path / "data"
         import shutil
+
         shutil.copytree(str(backup_dir), str(data_dir))
 
         # Modify restored data
@@ -192,7 +198,7 @@ class TestListBackupsCommand:
         (backup / "file2.txt").write_bytes(b"x" * 2048)  # 2KB
 
         # Calculate size
-        total_size = sum(f.stat().st_size for f in backup.rglob('*') if f.is_file())
+        total_size = sum(f.stat().st_size for f in backup.rglob("*") if f.is_file())
         assert total_size == 3072  # 3KB
 
     def test_list_backups_empty_directory(self, tmp_path):
@@ -222,9 +228,7 @@ class TestListBackupsCommand:
 
         # Sort by mtime descending
         sorted_backups = sorted(
-            backups_dir.iterdir(),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True
+            backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
         )
 
         assert sorted_backups[0].name == "new_backup"

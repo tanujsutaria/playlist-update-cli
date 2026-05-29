@@ -2,12 +2,12 @@ import os
 import shutil
 
 from web_search import (
-    detect_search_commands,
-    synthesize_results,
-    extract_constraints,
-    extract_requested_metrics,
     _extract_output,
     _run_command,
+    detect_search_commands,
+    extract_constraints,
+    extract_requested_metrics,
+    synthesize_results,
 )
 
 
@@ -26,12 +26,27 @@ def test_detect_search_commands_prefers_explicit(monkeypatch):
 def test_synthesize_results_merges_providers():
     provider_results = {
         "claude": [
-            {"song": "Track A", "artist": "Artist 1", "why": "fits mood", "sources": ["https://example.com/a"]},
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "why": "fits mood",
+                "sources": ["https://example.com/a"],
+            },
             {"song": "Track B", "artist": "Artist 2", "why": "similar tempo", "sources": []},
         ],
         "codex": [
-            {"song": "Track A", "artist": "Artist 1", "why": "matches theme", "sources": ["https://example.com/b"]},
-            {"song": "Track C", "artist": "Artist 3", "why": "recommended by critics", "sources": []},
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "why": "matches theme",
+                "sources": ["https://example.com/b"],
+            },
+            {
+                "song": "Track C",
+                "artist": "Artist 3",
+                "why": "recommended by critics",
+                "sources": [],
+            },
         ],
     }
 
@@ -133,7 +148,11 @@ def test_normalize_item_with_source_details():
                     "song": "Track A",
                     "artist": "Artist 1",
                     "sources": [
-                        {"url": "https://example.com/a", "title": "Source A", "snippet": "Snippet A"}
+                        {
+                            "url": "https://example.com/a",
+                            "title": "Source A",
+                            "snippet": "Snippet A",
+                        }
                     ],
                     "metrics": {},
                 }

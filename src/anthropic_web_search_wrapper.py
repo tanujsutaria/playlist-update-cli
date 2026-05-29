@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import anthropic
 
@@ -178,12 +178,7 @@ def _resolve_model_candidates(primary: str) -> List[str]:
 def _build_prompt(payload: dict) -> str:
     instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
     trimmed = {key: value for key, value in payload.items() if key != "instructions"}
-    return (
-        f"{instructions}\n\n"
-        "Input JSON:\n"
-        f"{json.dumps(trimmed, indent=2)}\n\n"
-        "Return JSON only."
-    )
+    return f"{instructions}\n\nInput JSON:\n{json.dumps(trimmed, indent=2)}\n\nReturn JSON only."
 
 
 def _extract_output_text(message: Any) -> str:
@@ -267,7 +262,7 @@ def _strip_fence(text: str) -> Optional[str]:
     if candidate.startswith("```"):
         candidate = candidate[len("```") :]
     if candidate.endswith("```"):
-        candidate = candidate[: -3]
+        candidate = candidate[:-3]
     candidate = candidate.strip()
     if (candidate.startswith("{") and candidate.endswith("}")) or (
         candidate.startswith("[") and candidate.endswith("]")
@@ -298,7 +293,9 @@ def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
 
 def _is_model_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "model" in message and ("not found" in message or "invalid" in message or "unknown" in message)
+    return "model" in message and (
+        "not found" in message or "invalid" in message or "unknown" in message
+    )
 
 
 if __name__ == "__main__":

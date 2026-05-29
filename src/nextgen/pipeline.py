@@ -16,11 +16,10 @@ from storage.vectors import decode_vector, encode_vector, vector_norm
 
 from .canonicalize import canonicalize_results
 from .context import build_context_card
-from .extract import extract_context
 from .embeddings import EmbeddingModel
+from .extract import extract_context
 from .providers import run_providers
 from .scoring import ScoreConfig, rank_scores, score_candidates
-
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,11 @@ class SearchPipeline:
         if not models:
             return
         if models != {self.model_name}:
-            logger.warning("Embedding model changed (%s -> %s); clearing cached embeddings and runs.", models, self.model_name)
+            logger.warning(
+                "Embedding model changed (%s -> %s); clearing cached embeddings and runs.",
+                models,
+                self.model_name,
+            )
             self.repos.conn.execute("DELETE FROM track_embeddings;")
             self.repos.conn.execute("DELETE FROM queries;")
             self.repos.conn.execute("DELETE FROM search_candidates;")

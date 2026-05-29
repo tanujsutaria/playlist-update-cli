@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Optional, Any, Union
+from typing import Any, Callable, Optional, Union
 
 from rich import box
 from rich.console import Console, RenderableType
@@ -10,7 +10,6 @@ from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-
 
 console = Console()
 _output_sink: Optional[Callable[[RenderableType], None]] = None

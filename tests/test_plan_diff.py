@@ -1,7 +1,8 @@
 """
 Unit tests for plan and diff command workflows.
 """
-from unittest.mock import MagicMock, patch, ANY
+
+from unittest.mock import ANY, MagicMock, patch
 
 
 def test_plan_playlist_calls_simulate(mock_cli, sample_songs):

@@ -1,8 +1,8 @@
 """
 Unit tests for auth-status and auth-refresh commands.
 """
+
 from datetime import datetime
-from unittest.mock import MagicMock
 
 import pytest
 

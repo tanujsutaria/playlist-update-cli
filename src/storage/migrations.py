@@ -5,7 +5,6 @@ from typing import Iterable
 
 from .schema import initial_schema, schema_v2, schema_v3
 
-
 LATEST_VERSION = 3
 
 

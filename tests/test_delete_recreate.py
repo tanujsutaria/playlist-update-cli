@@ -2,21 +2,26 @@
 Unit tests for playlist delete and recreate functionality.
 Tests the refresh_playlist workflow that deletes existing playlists and creates new ones.
 """
+
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import MagicMock, patch, call
+
 from models import Song
 
 
 class TestRefreshPlaylistDeleteExisting:
     """Tests for deleting existing playlists during refresh"""
 
-    def test_refresh_deletes_existing_playlist(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_deletes_existing_playlist(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that existing playlist is deleted before creating new one"""
         manager = real_spotify_manager_with_mock_client
         result = manager.refresh_playlist("Test Playlist", sample_songs)
 
         assert result is True
-        manager.sp.current_user_unfollow_playlist.assert_called_once_with('playlist_123')
+        manager.sp.current_user_unfollow_playlist.assert_called_once_with("playlist_123")
 
     def test_refresh_removes_from_cache(self, real_spotify_manager_with_mock_client, sample_songs):
         """Test that deleted playlist is removed from local cache"""
@@ -30,7 +35,9 @@ class TestRefreshPlaylistDeleteExisting:
         # The playlist should still exist (recreated)
         assert "Test Playlist" in manager.playlists
 
-    def test_refresh_handles_delete_error(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_handles_delete_error(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that refresh continues even if delete fails"""
         manager = real_spotify_manager_with_mock_client
         manager.sp.current_user_unfollow_playlist.side_effect = Exception("Delete failed")
@@ -45,7 +52,9 @@ class TestRefreshPlaylistDeleteExisting:
 class TestRefreshPlaylistCreateNew:
     """Tests for creating new playlists during refresh"""
 
-    def test_refresh_creates_new_playlist(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_creates_new_playlist(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that new playlist is created after deletion"""
         manager = real_spotify_manager_with_mock_client
         manager.playlists = {}  # No existing playlist
@@ -55,7 +64,9 @@ class TestRefreshPlaylistCreateNew:
         assert result is True
         manager.sp.user_playlist_create.assert_called()
 
-    def test_refresh_creates_playlist_with_correct_name(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_creates_playlist_with_correct_name(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that playlist is created with the correct name"""
         manager = real_spotify_manager_with_mock_client
         manager.playlists = {}
@@ -69,7 +80,9 @@ class TestRefreshPlaylistCreateNew:
 class TestRefreshPlaylistAddTracks:
     """Tests for adding tracks during refresh"""
 
-    def test_refresh_adds_tracks_with_uris(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_adds_tracks_with_uris(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that tracks with URIs are added to playlist"""
         manager = real_spotify_manager_with_mock_client
         result = manager.refresh_playlist("Test Playlist", sample_songs)
@@ -86,7 +99,7 @@ class TestRefreshPlaylistAddTracks:
                 id=f"artist{i}|||song{i}",
                 name=f"song{i}",
                 artist=f"artist{i}",
-                spotify_uri=f"spotify:track:uri{i}"
+                spotify_uri=f"spotify:track:uri{i}",
             )
             for i in range(75)
         ]
@@ -111,11 +124,9 @@ class TestRefreshPlaylistAddTracks:
     def test_refresh_handles_failed_searches(self, real_spotify_manager_with_mock_client):
         """Test that refresh continues when song search fails"""
         manager = real_spotify_manager_with_mock_client
-        manager.sp.search.return_value = {'tracks': {'items': []}}
+        manager.sp.search.return_value = {"tracks": {"items": []}}
 
-        songs = [
-            Song(id="unknown|||song", name="unknown song", artist="unknown", spotify_uri=None)
-        ]
+        songs = [Song(id="unknown|||song", name="unknown song", artist="unknown", spotify_uri=None)]
 
         result = manager.refresh_playlist("Test Playlist", songs)
 
@@ -126,19 +137,23 @@ class TestRefreshPlaylistAddTracks:
 class TestRefreshPlaylistErrorHandling:
     """Tests for error handling during refresh"""
 
-    def test_refresh_returns_false_on_create_failure(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_returns_false_on_create_failure(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that refresh returns False when playlist creation fails"""
         manager = real_spotify_manager_with_mock_client
         manager.playlists = {}
         manager.sp.user_playlist_create.return_value = None
 
         # The create_playlist method will return None
-        with patch.object(manager, 'create_playlist', return_value=None):
+        with patch.object(manager, "create_playlist", return_value=None):
             result = manager.refresh_playlist("Test Playlist", sample_songs)
 
         assert result is False
 
-    def test_refresh_handles_api_exception(self, real_spotify_manager_with_mock_client, sample_songs):
+    def test_refresh_handles_api_exception(
+        self, real_spotify_manager_with_mock_client, sample_songs
+    ):
         """Test that API exceptions are handled gracefully"""
         manager = real_spotify_manager_with_mock_client
         manager.sp.playlist_add_items.side_effect = Exception("API Error")

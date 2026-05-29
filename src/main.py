@@ -1,49 +1,50 @@
 import logging
-import sys
 import os
 import re
+import sys
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
-import json
 import csv
+import json
 import shutil
 import uuid
 from dataclasses import asdict
 from datetime import datetime
-from dotenv import load_dotenv
-from typing import Optional, Dict, List, Union, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
+from dotenv import load_dotenv
 from rich.logging import RichHandler
 
-from models import Song
 from db_manager import DatabaseManager
-from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
+from models import Song
+from nextgen.embeddings import EmbeddingModel
+from nextgen.pipeline import SearchPipeline, SearchResult
+from nextgen.scoring import ScoreConfig as SearchScoreConfig
 from rotation_manager import RotationManager
 from scoring import ScoreConfig as PlaylistScoreConfig
-from ui import (
-    console,
-    section,
-    subsection,
-    table,
-    key_value_table,
-    info,
-    warning,
-    json_output,
-    preview_table,
-    clear_preview,
-)
+from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.vectors import decode_vector, vector_norm
-from nextgen.pipeline import SearchPipeline, SearchResult
-from nextgen.scoring import ScoreConfig as SearchScoreConfig
-from nextgen.embeddings import EmbeddingModel
+from ui import (
+    clear_preview,
+    console,
+    info,
+    json_output,
+    key_value_table,
+    preview_table,
+    section,
+    subsection,
+    table,
+    warning,
+)
 
 logger = logging.getLogger(__name__)
+
 
 def configure_logging(handler: Optional[logging.Handler] = None) -> None:
     """Configure logging for CLI or interactive UI."""
@@ -62,12 +63,13 @@ def configure_logging(handler: Optional[logging.Handler] = None) -> None:
         )
     root_logger.addHandler(handler)
 
+
 class PlaylistCLI:
     def __init__(self):
         # Get the project root directory
         project_root = Path(__file__).parent.parent
-        load_dotenv(project_root / 'config' / '.env')
-        
+        load_dotenv(project_root / "config" / ".env")
+
         # Initialize managers as needed
         self._db = None
         self._spotify = None
@@ -197,18 +199,16 @@ class PlaylistCLI:
         """Get or create a rotation manager for a playlist"""
         if playlist_name not in self._rotation_managers:
             self._rotation_managers[playlist_name] = RotationManager(
-                playlist_name=playlist_name,
-                db=self.db,
-                spotify=self.spotify
+                playlist_name=playlist_name, db=self.db, spotify=self.spotify
             )
         return self._rotation_managers[playlist_name]
 
     def import_songs(self, file_path: str):
         """Import songs from a file into the database
-        
+
         Supports both .txt and .csv files with format: song_name,artist_name
         Lines starting with # are treated as comments
-        
+
         Validates that:
         1. The song exists in Spotify
         2. The artist has less than 1 million monthly listeners
@@ -218,8 +218,8 @@ class PlaylistCLI:
         if not path.exists():
             logger.error(f"File not found: {file_path}")
             return
-        
-        if path.suffix.lower() not in ['.txt', '.csv']:
+
+        if path.suffix.lower() not in [".txt", ".csv"]:
             logger.warning(f"File extension {path.suffix} not recognized. Expected .txt or .csv")
             logger.warning("Attempting to process file anyway...")
 
@@ -239,86 +239,94 @@ class PlaylistCLI:
             "already_exists": 0,
             "not_found": 0,
             "popular_artist": 0,
-            "error": 0
+            "error": 0,
         }
 
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     try:
                         stats["total"] += 1
-                        
+
                         # Skip empty lines and comments
-                        if not line.strip() or line.startswith('#'):
+                        if not line.strip() or line.startswith("#"):
                             stats["total"] -= 1  # Don't count comments/empty lines
                             continue
-                            
+
                         # Split and take only first two columns (name, artist)
-                        parts = [x.strip().lower() for x in line.split(',')]
+                        parts = [x.strip().lower() for x in line.split(",")]
                         if len(parts) < 2:
-                            logger.warning(f"Line {line_num}: Skipping invalid line (not enough columns): {line.strip()}")
+                            logger.warning(
+                                f"Line {line_num}: Skipping invalid line (not enough columns): {line.strip()}"
+                            )
                             stats["error"] += 1
                             continue
-                            
+
                         name, artist = parts[0], parts[1]
-                        
+
                         # Basic validation
                         if not name or not artist:
-                            logger.warning(f"Line {line_num}: Skipping invalid line (empty name or artist): {line.strip()}")
+                            logger.warning(
+                                f"Line {line_num}: Skipping invalid line (empty name or artist): {line.strip()}"
+                            )
                             stats["error"] += 1
                             continue
-                        
+
                         logger.info(f"Validating: {name} by {artist}")
-                        
+
                         # Step 1: Check if song exists in Spotify
                         query = f"track:{name} artist:{artist}"
-                        results = spotify.sp.search(query, type='track', limit=1)
-                        
-                        if not results.get('tracks', {}).get('items', []):
-                            logger.warning(f"Line {line_num}: Song not found in Spotify: {name} by {artist}")
+                        results = spotify.sp.search(query, type="track", limit=1)
+
+                        if not results.get("tracks", {}).get("items", []):
+                            logger.warning(
+                                f"Line {line_num}: Song not found in Spotify: {name} by {artist}"
+                            )
                             stats["not_found"] += 1
                             continue
 
-                        track = results.get('tracks', {}).get('items', [])[0]
-                        track_uri = track['uri']
+                        track = results.get("tracks", {}).get("items", [])[0]
+                        track_uri = track["uri"]
 
                         # Step 2: Check artist popularity
-                        if not track.get('artists'):
+                        if not track.get("artists"):
                             logger.warning(f"Line {line_num}: No artist data for track: {name}")
                             stats["not_found"] += 1
                             continue
-                        artist_id = track['artists'][0]['id']
+                        artist_id = track["artists"][0]["id"]
                         artist_info = spotify.sp.artist(artist_id)
-                        
+
                         # Get follower count
-                        follower_count = (artist_info.get('followers') or {}).get('total', 0)
-                        
+                        follower_count = (artist_info.get("followers") or {}).get("total", 0)
+
                         if follower_count >= 1000000:
-                            logger.warning(f"Line {line_num}: Artist too popular ({follower_count:,} followers): {artist}")
+                            logger.warning(
+                                f"Line {line_num}: Artist too popular ({follower_count:,} followers): {artist}"
+                            )
                             stats["popular_artist"] += 1
                             continue
-                        
+
                         # Song passed validation, add to database
                         song = Song(
                             id=f"{artist}|||{name}",
                             name=name,
                             artist=artist,
                             spotify_uri=track_uri,
-                            first_added=datetime.now()
+                            first_added=datetime.now(),
                         )
-                        
+
                         if self.db.add_song(song):
                             logger.info(f"Added: {song.name} by {song.artist}")
                             stats["added"] += 1
                         else:
                             logger.info(f"Skipped (already exists): {song.name} by {song.artist}")
                             stats["already_exists"] += 1
-                            
+
                     except Exception as e:
                         logger.warning(f"Line {line_num}: Error processing line: {str(e)}")
                         stats["error"] += 1
                         continue
-            
+
             # Display import statistics
             section("Import Summary")
             key_value_table(
@@ -331,7 +339,7 @@ class PlaylistCLI:
                     ["Errors", stats["error"]],
                 ]
             )
-                    
+
         except Exception as e:
             logger.error(f"Error importing songs: {str(e)}")
 
@@ -342,10 +350,10 @@ class PlaylistCLI:
         fresh_days: int = 30,
         dry_run: bool = False,
         score_strategy: str = "local",
-        query: Optional[str] = None
+        query: Optional[str] = None,
     ):
         """Update a playlist with new songs by deleting and recreating it
-        
+
         Args:
             playlist_name: Name of the playlist to update
             song_count: Number of songs to include in the playlist
@@ -357,13 +365,13 @@ class PlaylistCLI:
         try:
             rm = self._get_rotation_manager(playlist_name)
             score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
-            
+
             # Select songs
-            logger.info(f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)...")
+            logger.info(
+                f"Selecting {song_count} songs (prioritizing songs not used in {fresh_days} days)..."
+            )
             songs = rm.select_songs_for_today(
-                count=song_count,
-                fresh_days=fresh_days,
-                score_config=score_config
+                count=song_count, fresh_days=fresh_days, score_config=score_config
             )
 
             if dry_run:
@@ -372,7 +380,7 @@ class PlaylistCLI:
                 table(["#", "Song", "Artist"], table_data)
                 info(f"Total selected: {len(songs)}")
                 return
-            
+
             # Update playlist
             logger.info("Updating playlist...")
             if rm.update_playlist(songs):
@@ -390,7 +398,7 @@ class PlaylistCLI:
                 )
             else:
                 logger.error("Failed to update playlist")
-            
+
         except Exception as e:
             logger.error(f"Error updating playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
@@ -399,7 +407,7 @@ class PlaylistCLI:
         """Show detailed statistics about the playlist"""
         stats = rm.get_rotation_stats()
         recent_songs = rm.get_recent_songs(days=7)
-        
+
         # Basic stats
         section("Playlist Statistics")
         stats_table = [
@@ -408,21 +416,28 @@ class PlaylistCLI:
             ["Songs Never Used", stats.songs_never_used],
             ["Total generations", stats.generations_count],
             ["Complete Rotation", "Yes" if stats.complete_rotation_achieved else "No"],
-            ["Rotation Progress", f"{(stats.unique_songs_used/stats.total_songs)*100:.1f}%" if stats.total_songs else "0.0%"],
+            [
+                "Rotation Progress",
+                f"{(stats.unique_songs_used / stats.total_songs) * 100:.1f}%"
+                if stats.total_songs
+                else "0.0%",
+            ],
             ["Current Strategy", stats.current_strategy],
         ]
         key_value_table(stats_table)
-        
+
         # Recent activity
         section("Recent Activity", "Last 7 Days")
         recent_table = []
         for date, songs in recent_songs.items():
-            recent_table.append([
-                date,
-                len(songs),
-                ", ".join(f"{s.name} by {s.artist}"[:40] for s in songs[:3]) + 
-                ("..." if len(songs) > 3 else "")
-            ])
+            recent_table.append(
+                [
+                    date,
+                    len(songs),
+                    ", ".join(f"{s.name} by {s.artist}"[:40] for s in songs[:3])
+                    + ("..." if len(songs) > 3 else ""),
+                ]
+            )
         table(
             ["Date", "Songs Added", "Sample Songs"],
             recent_table,
@@ -458,7 +473,9 @@ class PlaylistCLI:
                 return
 
             # Update playlist with these songs
-            logger.info(f"Restoring playlist '{playlist_name}' to generation index {new_gen_index}...")
+            logger.info(
+                f"Restoring playlist '{playlist_name}' to generation index {new_gen_index}..."
+            )
             # Don't record a new generation when reverting
             success = rm.update_playlist(songs_to_restore, record_generation=False)
             if success:
@@ -470,10 +487,10 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error restoring previous rotation: {str(e)}")
             logger.debug("Full error:", exc_info=True)
-            
+
     def list_rotations(self, playlist_name: str, generations: str = "3"):
         """List rotations for a given playlist
-        
+
         Args:
             playlist_name: Name of the playlist
             generations: Number of generations to list, or 'all' for all generations
@@ -499,15 +516,15 @@ class PlaylistCLI:
                 except ValueError:
                     warning("Invalid --generations value. Must be an integer or 'all'.")
                     return
-                
+
             # Handle out-of-bounds
             if limit > len(all_gens):
                 logger.info(f"Requested {limit} generations, but only {len(all_gens)} available.")
                 limit = len(all_gens)
-                
+
             # Get the most recent N generations
             selected_gens = all_gens[-limit:]
-            
+
             section("Rotations", f"Playlist: {playlist_name}")
             # Calculate the starting index for proper numbering
             start_idx = len(all_gens) - limit + 1
@@ -518,7 +535,7 @@ class PlaylistCLI:
                     song = self.db.get_song_by_id(song_id)
                     if song:
                         songs.append(song)
-                
+
                 # Display songs in a tabular format
                 if songs:
                     table_data = []
@@ -527,50 +544,45 @@ class PlaylistCLI:
                     table(["#", "Song", "Artist"], table_data)
                 else:
                     info("   No songs found for this generation.")
-                    
+
             info(f"Current generation: {rm.history.current_generation + 1}")
         except Exception as e:
             logger.error(f"Error listing rotations: {str(e)}")
             logger.debug("Full error:", exc_info=True)
-            
+
     def view_playlist(self, playlist_name: str):
         """View current playlist contents - only needs Spotify"""
         try:
             # Only initialize Spotify manager
             tracks = self.spotify.get_playlist_tracks(playlist_name)
-            
+
             section("Current Playlist", playlist_name)
-            
+
             if not tracks:
                 warning("Playlist is empty.")
                 return
-            
+
             # Prepare table data
             table_data = []
             for i, track in enumerate(tracks, 1):
-                added_date = track.get('added_at', '')
+                added_date = track.get("added_at", "")
                 if added_date:
                     try:
                         # Convert from ISO format to YYYY-MM-DD
-                        added_date = added_date.split('T')[0]
+                        added_date = added_date.split("T")[0]
                     except (AttributeError, IndexError):
-                        added_date = 'Unknown'
-                
-                table_data.append([
-                    i,
-                    track['name'],
-                    track['artist'],
-                    added_date or 'Unknown'
-                ])
-            
+                        added_date = "Unknown"
+
+                table_data.append([i, track["name"], track["artist"], added_date or "Unknown"])
+
             table(
                 ["#", "Song", "Artist", "Added Date"],
                 table_data,
             )
-            
+
             # Show summary
             info(f"Total tracks: {len(tracks)}")
-            
+
         except Exception as e:
             logger.error(f"Error viewing playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
@@ -593,7 +605,7 @@ class PlaylistCLI:
             if playlist_name:
                 rm = self._get_rotation_manager(playlist_name)
                 stats = rm.get_rotation_stats()
-                
+
                 section("Playlist Stats", playlist_name)
                 key_value_table(
                     [
@@ -604,7 +616,7 @@ class PlaylistCLI:
                         ["Complete rotation achieved", stats.complete_rotation_achieved],
                     ]
                 )
-                
+
                 # Show recent generations
                 recent_gens = rm.get_recent_generations(count=5)
                 if recent_gens:
@@ -618,17 +630,19 @@ class PlaylistCLI:
                         table(["#", "Song", "Artist"], table_data)
                 else:
                     info("No generation history found.")
-                
+
         except Exception as e:
             logger.error(f"Error showing stats: {str(e)}")
 
-    def export_stats(self, playlist_name: Optional[str], export_format: str, output_file: Optional[str]):
+    def export_stats(
+        self, playlist_name: Optional[str], export_format: str, output_file: Optional[str]
+    ):
         """Export database and playlist stats to a file."""
         db_stats = self.db.get_stats()
         export_payload = {
             "database": db_stats,
             "playlist": None,
-            "generated_at": datetime.now().isoformat()
+            "generated_at": datetime.now().isoformat(),
         }
 
         if playlist_name:
@@ -641,7 +655,7 @@ class PlaylistCLI:
                 "songs_never_used": stats.songs_never_used,
                 "generations_count": stats.generations_count,
                 "complete_rotation_achieved": stats.complete_rotation_achieved,
-                "current_strategy": stats.current_strategy
+                "current_strategy": stats.current_strategy,
             }
 
         if output_file is None:
@@ -674,76 +688,82 @@ class PlaylistCLI:
         """Sync a playlist with all songs in the database by adding new songs and removing songs no longer in the database"""
         try:
             logger.info(f"Starting database sync with playlist '{playlist_name}'...")
-            
+
             # Get all songs from database
             all_songs = self.db.get_all_songs()
             if not all_songs:
                 logger.error("No songs found in database")
                 return
-            
+
             logger.info(f"Found {len(all_songs)} songs in database")
-            
+
             # Get existing tracks in the playlist
             existing_tracks = self.spotify.get_playlist_tracks(playlist_name)
             if existing_tracks is None:
                 logger.error(f"Failed to retrieve tracks from playlist '{playlist_name}'")
                 return
-                
+
             # Create a set of existing URIs for quick lookup
             existing_uris = set()
             for track in existing_tracks:
-                if 'uri' in track:
-                    existing_uris.add(track['uri'])
-            
+                if "uri" in track:
+                    existing_uris.add(track["uri"])
+
             logger.info(f"Found {len(existing_uris)} existing tracks in playlist")
-            
+
             # Create a set of database URIs for quick lookup
             database_uris = set()
             songs_to_add = []
-            
+
             for song in all_songs:
                 # If song doesn't have a URI yet, try to find it
                 if not song.spotify_uri:
                     song.spotify_uri = self.spotify.search_song(song)
-                    
+
                 if song.spotify_uri:
                     database_uris.add(song.spotify_uri)
-                    
+
                     # Only add songs with URIs that aren't already in the playlist
                     if song.spotify_uri not in existing_uris:
                         songs_to_add.append(song)
-            
+
             # Find tracks to remove (in playlist but not in database)
             uris_to_remove = existing_uris - database_uris
-            
+
             logger.info(f"Found {len(songs_to_add)} new songs to add to playlist")
             logger.info(f"Found {len(uris_to_remove)} songs to remove from playlist")
-            
+
             # Add new songs if needed
             if songs_to_add:
                 add_success = self.spotify.append_to_playlist(playlist_name, songs_to_add)
                 if add_success:
                     # Persist any URI changes discovered during Spotify search
                     self.db._save_state()
-                    logger.info(f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'")
+                    logger.info(
+                        f"Successfully added {len(songs_to_add)} new songs to playlist '{playlist_name}'"
+                    )
                 else:
                     logger.error("Failed to add new songs to playlist")
             else:
                 logger.info("No new songs to add")
-            
+
             # Remove songs if needed
             if uris_to_remove:
-                remove_success = self.spotify.remove_from_playlist(playlist_name, list(uris_to_remove))
+                remove_success = self.spotify.remove_from_playlist(
+                    playlist_name, list(uris_to_remove)
+                )
                 if remove_success:
-                    logger.info(f"Successfully removed {len(uris_to_remove)} songs from playlist '{playlist_name}'")
+                    logger.info(
+                        f"Successfully removed {len(uris_to_remove)} songs from playlist '{playlist_name}'"
+                    )
                 else:
                     logger.error("Failed to remove songs from playlist")
             else:
                 logger.info("No songs to remove")
-                
+
             if not songs_to_add and not uris_to_remove:
                 logger.info("Playlist is already in sync with the database")
-            
+
         except Exception as e:
             logger.error(f"Error syncing playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
@@ -753,32 +773,32 @@ class PlaylistCLI:
         try:
             # Get tracks from playlist
             tracks = self.spotify.get_playlist_tracks(playlist_name)
-            
+
             if not tracks:
                 logger.error(f"No tracks found in playlist '{playlist_name}'")
                 return False
-            
+
             # Generate output filename if not provided
             if output_file is None:
                 output_file = f"{playlist_name}_songs.csv"
-            
+
             # Ensure file extension is .csv
-            if not output_file.endswith('.csv'):
-                output_file += '.csv'
-            
+            if not output_file.endswith(".csv"):
+                output_file += ".csv"
+
             # Write to file
             logger.info(f"Writing {len(tracks)} tracks to {output_file}")
-            with open(output_file, 'w', encoding='utf-8') as f:
+            with open(output_file, "w", encoding="utf-8") as f:
                 for track in tracks:
                     f.write(f"{track['name']},{track['artist']}\n")
-            
+
             logger.info(f"Successfully exported playlist to {output_file}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error extracting playlist: {str(e)}")
             return False
-            
+
     def backup_data(self, backup_name: Optional[str] = None):
         """
         Create a backup of the entire data/ folder in a new backups/ directory
@@ -853,7 +873,9 @@ class PlaylistCLI:
             return
 
         # Get all backup folders
-        backup_folders = sorted(backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        backup_folders = sorted(
+            backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
+        )
 
         if not backup_folders:
             info("No backups found.")
@@ -866,7 +888,7 @@ class PlaylistCLI:
         for backup in backup_folders:
             if backup.is_dir():
                 # Calculate folder size
-                total_size = sum(f.stat().st_size for f in backup.rglob('*') if f.is_file())
+                total_size = sum(f.stat().st_size for f in backup.rglob("*") if f.is_file())
                 size_mb = total_size / (1024 * 1024)
 
                 # Get modification time
@@ -885,45 +907,46 @@ class PlaylistCLI:
     def clean_database(self, dry_run: bool = False):
         """Clean database by removing songs that no longer exist in Spotify
         or whose artists have 1 million or more monthly listeners
-        
+
         Args:
             dry_run: If True, only show what would be removed without actually removing
         """
         try:
             logger.info("Starting database cleaning process...")
-            
+
             # Get all songs from database
             all_songs = self.db.get_all_songs()
             if not all_songs:
                 logger.info("No songs found in database")
                 return
-            
+
             logger.info(f"Checking {len(all_songs)} songs in database")
-            
+
             # Initialize Spotify for validation
             spotify = self.spotify
-            
+
             # Track statistics
             stats = {
                 "total": len(all_songs),
                 "checked": 0,
                 "not_found": 0,
                 "popular_artist": 0,
-                "kept": 0
+                "kept": 0,
             }
-            
+
             # Songs to remove
             songs_to_remove = []
-            
+
             # Check each song
             from tqdm import tqdm
+
             for song in tqdm(
                 all_songs,
                 desc="Checking songs",
                 disable=os.getenv("TUNR_INTERACTIVE") == "1",
             ):
                 stats["checked"] += 1
-                
+
                 # Skip songs that already have a Spotify URI (optimization)
                 if song.spotify_uri:
                     # Verify the URI still works
@@ -932,16 +955,20 @@ class PlaylistCLI:
                         if track_info:
                             # Check artist popularity
                             track = spotify.sp.track(song.spotify_uri)
-                            if not track.get('artists'):
+                            if not track.get("artists"):
                                 logger.warning(f"No artist data for track: {song.name}")
                                 # Continue to search fallback
                             else:
-                                artist_id = track['artists'][0]['id']
+                                artist_id = track["artists"][0]["id"]
                                 artist_info = spotify.sp.artist(artist_id)
-                                follower_count = (artist_info.get('followers') or {}).get('total', 0)
+                                follower_count = (artist_info.get("followers") or {}).get(
+                                    "total", 0
+                                )
 
                                 if follower_count >= 1000000:
-                                    logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                                    logger.warning(
+                                        f"Artist too popular ({follower_count:,} followers): {song.artist}"
+                                    )
                                     songs_to_remove.append(song)
                                     stats["popular_artist"] += 1
                                     continue
@@ -951,39 +978,41 @@ class PlaylistCLI:
                     except Exception as e:
                         # URI no longer valid, continue with search
                         logger.debug(f"URI validation failed for {song.name}: {e}")
-                
+
                 # Search for the song on Spotify
                 query = f"track:{song.name} artist:{song.artist}"
-                results = spotify.sp.search(query, type='track', limit=1)
-                
-                if not results.get('tracks', {}).get('items', []):
+                results = spotify.sp.search(query, type="track", limit=1)
+
+                if not results.get("tracks", {}).get("items", []):
                     # Song not found in Spotify
                     logger.warning(f"Song not found in Spotify: {song.name} by {song.artist}")
                     songs_to_remove.append(song)
                     stats["not_found"] += 1
                 else:
                     # Song found, update URI if needed
-                    track = results.get('tracks', {}).get('items', [])[0]
+                    track = results.get("tracks", {}).get("items", [])[0]
                     if not song.spotify_uri:
-                        song.spotify_uri = track['uri']
+                        song.spotify_uri = track["uri"]
                         self.db._save_state()  # Save the updated URI
 
                     # Check artist popularity
-                    if not track.get('artists'):
+                    if not track.get("artists"):
                         logger.warning(f"No artist data for track: {song.name}")
                         stats["kept"] += 1
                     else:
-                        artist_id = track['artists'][0]['id']
+                        artist_id = track["artists"][0]["id"]
                         artist_info = spotify.sp.artist(artist_id)
-                        follower_count = (artist_info.get('followers') or {}).get('total', 0)
+                        follower_count = (artist_info.get("followers") or {}).get("total", 0)
 
                         if follower_count >= 1000000:
-                            logger.warning(f"Artist too popular ({follower_count:,} followers): {song.artist}")
+                            logger.warning(
+                                f"Artist too popular ({follower_count:,} followers): {song.artist}"
+                            )
                             songs_to_remove.append(song)
                             stats["popular_artist"] += 1
                         else:
                             stats["kept"] += 1
-            
+
             # Remove songs if not in dry run mode
             if songs_to_remove:
                 if dry_run:
@@ -995,7 +1024,7 @@ class PlaylistCLI:
                     for song in songs_to_remove:
                         logger.info(f"Removing: {song.name} by {song.artist}")
                         self.db.remove_song(song.id)
-            
+
             # Display cleaning statistics
             section("Database Cleaning Results")
             key_value_table(
@@ -1012,7 +1041,7 @@ class PlaylistCLI:
                 info(f"Songs removed: {len(songs_to_remove)}")
             else:
                 info("No songs needed to be removed.")
-            
+
         except Exception as e:
             logger.error(f"Error cleaning database: {str(e)}")
             logger.debug("Full error:", exc_info=True)
@@ -1076,7 +1105,17 @@ class PlaylistCLI:
                 ]
 
         else:
-            live_headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Status", "Providers", "Sources"]
+            live_headers = [
+                "#",
+                "Song",
+                "Artist",
+                "Year",
+                "Score",
+                "Strict",
+                "Status",
+                "Providers",
+                "Sources",
+            ]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
                 return [
@@ -1142,27 +1181,36 @@ class PlaylistCLI:
         status_label = "cached" if self.last_search_cached else "fresh"
         rows = []
         for idx, item in enumerate(results, 1):
-            rows.append([
-                idx,
-                item.song,
-                item.artist,
-                item.year or "-",
-                f"{item.score:.3f}",
-                f"{item.strict_ratio:.2f}",
-                status_label,
-                len(item.providers or []),
-                len(item.sources or []),
-            ])
+            rows.append(
+                [
+                    idx,
+                    item.song,
+                    item.artist,
+                    item.year or "-",
+                    f"{item.score:.3f}",
+                    f"{item.strict_ratio:.2f}",
+                    status_label,
+                    len(item.providers or []),
+                    len(item.sources or []),
+                ]
+            )
 
-        headers = ["#", "Song", "Artist", "Year", "Score", "Strict", "Status", "Providers", "Sources"]
+        headers = [
+            "#",
+            "Song",
+            "Artist",
+            "Year",
+            "Score",
+            "Strict",
+            "Status",
+            "Providers",
+            "Sources",
+        ]
         if not (interactive and stream_full):
             if final_table_mode == "compact":
                 table(
                     ["#", "Song", "Artist", "Score", "Strict", "Status"],
-                    [
-                        [row[0], row[1], row[2], row[4], row[5], row[6]]
-                        for row in rows
-                    ],
+                    [[row[0], row[1], row[2], row[4], row[5], row[6]] for row in rows],
                 )
             elif final_table_mode != "none":
                 table(headers, rows)
@@ -1181,10 +1229,7 @@ class PlaylistCLI:
             if final_table_mode == "compact":
                 table(
                     ["#", "Song", "Artist", "Score", "Strict", "Status"],
-                    [
-                        [row[0], row[1], row[2], row[4], row[5], row[6]]
-                        for row in rows
-                    ],
+                    [[row[0], row[1], row[2], row[4], row[5], row[6]] for row in rows],
                 )
             elif final_table_mode == "full":
                 table(headers, rows)
@@ -1212,7 +1257,9 @@ class PlaylistCLI:
         self.last_search_run_id = run_id
         self.last_search_track_ids = [item.track_id for item in results]
 
-    def ingest_tracks(self, source: str, name: Optional[str] = None, time_range: str = "medium_term"):
+    def ingest_tracks(
+        self, source: str, name: Optional[str] = None, time_range: str = "medium_term"
+    ):
         """Ingest tracks from Spotify into the SQLite cache."""
         now = datetime.utcnow().isoformat() + "Z"
         ingested = 0
@@ -1260,7 +1307,9 @@ class PlaylistCLI:
                 section("Ingest", f"Top Tracks ({time_range})")
                 offset = 0
                 while True:
-                    batch = sp.current_user_top_tracks(limit=50, offset=offset, time_range=time_range)
+                    batch = sp.current_user_top_tracks(
+                        limit=50, offset=offset, time_range=time_range
+                    )
                     items = batch.get("items") or []
                     if not items:
                         break
@@ -1449,12 +1498,16 @@ class PlaylistCLI:
             model = EmbeddingModel(model_name)
             query_vec = model.embed([playlist_name])[0]
             query_norm = vector_norm(query_vec) or 1.0
-            rows = self.repos.conn.execute(
-                "SELECT track_id, embedding_blob FROM track_embeddings WHERE track_id IN ({})".format(
-                    ",".join(["?"] * len(candidate_rows))
-                ),
-                [row["track_id"] for row in candidate_rows],
-            ).fetchall() if candidate_rows else []
+            rows = (
+                self.repos.conn.execute(
+                    "SELECT track_id, embedding_blob FROM track_embeddings WHERE track_id IN ({})".format(
+                        ",".join(["?"] * len(candidate_rows))
+                    ),
+                    [row["track_id"] for row in candidate_rows],
+                ).fetchall()
+                if candidate_rows
+                else []
+            )
             for row in rows:
                 vec = decode_vector(row["embedding_blob"])
                 denom = vector_norm(vec) * query_norm
@@ -1524,13 +1577,15 @@ class PlaylistCLI:
                 track = self.repos.tracks.get(track_id) or {}
                 artist_record = self.repos.artists.get(track.get("artist_id") or "")
                 artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
-                removed_rows.append([
-                    idx,
-                    track.get("name") or track_id,
-                    artist_name or "",
-                    added_at.isoformat() if added_at else "",
-                    played_at.isoformat() if played_at else "",
-                ])
+                removed_rows.append(
+                    [
+                        idx,
+                        track.get("name") or track_id,
+                        artist_name or "",
+                        added_at.isoformat() if added_at else "",
+                        played_at.isoformat() if played_at else "",
+                    ]
+                )
             if removed_rows:
                 table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
 
@@ -1539,12 +1594,14 @@ class PlaylistCLI:
             for idx, row in enumerate(replacements, 1):
                 artist_record = self.repos.artists.get(row["artist_id"] or "")
                 artist_name = artist_record.get("name") if artist_record else row["artist_id"]
-                added_rows.append([
-                    idx,
-                    row.get("name") or "",
-                    artist_name or "",
-                    row.get("spotify_id") or "",
-                ])
+                added_rows.append(
+                    [
+                        idx,
+                        row.get("name") or "",
+                        artist_name or "",
+                        row.get("spotify_id") or "",
+                    ]
+                )
             if added_rows:
                 table(["#", "Song", "Artist", "Spotify ID"], added_rows)
         else:
@@ -1612,7 +1669,9 @@ class PlaylistCLI:
                 if artists:
                     item["spotify_artist_id"] = artists[0].get("id")
             except Exception as exc:
-                logger.warning("Spotify lookup failed for %s by %s: %s", song.name, song.artist, exc)
+                logger.warning(
+                    "Spotify lookup failed for %s by %s: %s", song.name, song.artist, exc
+                )
 
     def _spotify_url_from_uri(self, uri: Optional[str]) -> str:
         if not uri:
@@ -1708,11 +1767,13 @@ class PlaylistCLI:
                 seeds.append(song)
         return seeds
 
-    def _audio_similarity_scores(self, candidates: List[Song], seeds: List[Song]) -> Dict[str, float]:
+    def _audio_similarity_scores(
+        self, candidates: List[Song], seeds: List[Song]
+    ) -> Dict[str, float]:
         if not candidates or not seeds:
             return {}
         try:
-            from scoring import SpotifyAudioFeaturesProvider, PlaylistProfile
+            from scoring import PlaylistProfile, SpotifyAudioFeaturesProvider
         except Exception as exc:
             logger.warning("Audio similarity unavailable: %s", exc)
             return {}
@@ -1735,7 +1796,12 @@ class PlaylistCLI:
             return [], {"error": len(results) if results else 0}
 
         constraints = self.last_search_constraints or {}
-        require_spotify = (os.getenv("SEARCH_SPOTIFY_REQUIRED") or "").strip().lower() in {"1", "true", "yes", "on"}
+        require_spotify = (os.getenv("SEARCH_SPOTIFY_REQUIRED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         max_listeners = constraints.get("max_monthly_listeners")
         min_listeners = constraints.get("min_monthly_listeners")
         similarity_required = bool(constraints.get("similarity_requested"))
@@ -1811,20 +1877,20 @@ class PlaylistCLI:
                         stats["spotify_required_failed"] += 1
                         continue
                     query = f"track:{song.name} artist:{song.artist}"
-                    search_results = spotify.sp.search(query, type='track', limit=1)
-                    if not search_results.get('tracks', {}).get('items', []):
+                    search_results = spotify.sp.search(query, type="track", limit=1)
+                    if not search_results.get("tracks", {}).get("items", []):
                         stats["not_found"] += 1
                         continue
 
-                    track = search_results.get('tracks', {}).get('items', [])[0]
-                    song.spotify_uri = track['uri']
-                    if not track.get('artists'):
+                    track = search_results.get("tracks", {}).get("items", [])[0]
+                    song.spotify_uri = track["uri"]
+                    if not track.get("artists"):
                         stats["not_found"] += 1
                         continue
-                    artist_id = track['artists'][0]['id']
+                    artist_id = track["artists"][0]["id"]
 
                 artist_info = spotify.sp.artist(artist_id)
-                follower_count = (artist_info.get('followers') or {}).get('total', 0)
+                follower_count = (artist_info.get("followers") or {}).get("total", 0)
 
                 if pending_obscurity_proxy:
                     if max_listeners and follower_count > max_listeners:
@@ -1848,7 +1914,9 @@ class PlaylistCLI:
             seed_songs = self._seed_songs_from_query(self.last_search_query or "")
             if not seed_songs:
                 logger.warning("No seed artists found for audio similarity validation.")
-            audio_scores = self._audio_similarity_scores(validated, seed_songs) if seed_songs else {}
+            audio_scores = (
+                self._audio_similarity_scores(validated, seed_songs) if seed_songs else {}
+            )
 
             filtered: List[Song] = []
             for song in validated:
@@ -2052,15 +2120,17 @@ class PlaylistCLI:
             rows.append(["Songs added", stats.get("added", 0)])
         if "already_exists" in stats:
             rows.append(["Songs already in database", stats.get("already_exists", 0)])
-        rows.extend([
-            ["Songs not found in Spotify", stats.get("not_found", 0)],
-            ["Artists with >=1M followers", stats.get("popular_artist", 0)],
-            ["Obscurity failed", stats.get("obscurity_failed", 0)],
-            ["Obscurity unverified", stats.get("obscurity_unverified", 0)],
-            ["Similarity failed", stats.get("similarity_failed", 0)],
-            ["Similarity unverified", stats.get("similarity_unverified", 0)],
-            ["Errors", stats.get("error", 0)],
-        ])
+        rows.extend(
+            [
+                ["Songs not found in Spotify", stats.get("not_found", 0)],
+                ["Artists with >=1M followers", stats.get("popular_artist", 0)],
+                ["Obscurity failed", stats.get("obscurity_failed", 0)],
+                ["Obscurity unverified", stats.get("obscurity_unverified", 0)],
+                ["Similarity failed", stats.get("similarity_failed", 0)],
+                ["Similarity unverified", stats.get("similarity_unverified", 0)],
+                ["Errors", stats.get("error", 0)],
+            ]
+        )
         key_value_table(rows)
 
     def _song_from_result(self, item: Dict) -> Optional[Song]:
@@ -2072,7 +2142,7 @@ class PlaylistCLI:
             id=f"{artist.lower()}|||{name.lower()}",
             name=name,
             artist=artist,
-            first_added=datetime.now()
+            first_added=datetime.now(),
         )
 
     def plan_playlist(
@@ -2082,7 +2152,7 @@ class PlaylistCLI:
         fresh_days: int,
         generations: int,
         score_strategy: str = "local",
-        query: Optional[str] = None
+        query: Optional[str] = None,
     ):
         """Preview future generations without updating Spotify."""
         try:
@@ -2092,7 +2162,7 @@ class PlaylistCLI:
                 count=song_count,
                 fresh_days=fresh_days,
                 generations=generations,
-                score_config=score_config
+                score_config=score_config,
             )
             section("Plan", f"{generations} future generations for '{playlist_name}'")
             for idx, songs in enumerate(plans, 1):
@@ -2108,7 +2178,7 @@ class PlaylistCLI:
         song_count: int,
         fresh_days: int,
         score_strategy: str = "local",
-        query: Optional[str] = None
+        query: Optional[str] = None,
     ):
         """Show playlist changes before applying update."""
         try:
@@ -2116,9 +2186,7 @@ class PlaylistCLI:
             logger.info(f"Selecting {song_count} songs for diff (fresh_days={fresh_days})...")
             score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
             selected = rm.select_songs_for_today(
-                count=song_count,
-                fresh_days=fresh_days,
-                score_config=score_config
+                count=song_count, fresh_days=fresh_days, score_config=score_config
             )
 
             current_tracks = self.spotify.get_playlist_tracks(playlist_name)
@@ -2188,7 +2256,9 @@ class PlaylistCLI:
         """Refresh Spotify auth token if possible."""
         refreshed = refresh_cached_token()
         if not refreshed:
-            warning("No token refreshed. You may need to re-authenticate using any Spotify command.")
+            warning(
+                "No token refreshed. You may need to re-authenticate using any Spotify command."
+            )
             return
         expires_at = refreshed.get("expires_at")
         if expires_at:
@@ -2196,6 +2266,7 @@ class PlaylistCLI:
             info(f"Token refreshed. New expiry: {expires_dt.isoformat()}")
         else:
             info("Token refreshed.")
+
 
 def main():
     if len(sys.argv) > 1:
@@ -2214,54 +2285,48 @@ def main():
 def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
     """Execute a parsed command against the CLI."""
     try:
-        if command == 'import':
+        if command == "import":
             cli.import_songs(args.file)
-        elif command == 'update':
+        elif command == "update":
             cli.update_playlist(
                 args.playlist,
                 args.count,
                 args.fresh_days,
                 args.dry_run,
                 args.score_strategy,
-                args.query
+                args.query,
             )
-        elif command == 'stats':
-            if hasattr(args, 'output') and args.output and not args.export:
+        elif command == "stats":
+            if hasattr(args, "output") and args.output and not args.export:
                 logger.warning("--output requires --export; ignoring --output")
             if args.export:
                 cli.export_stats(args.playlist, args.export, args.output)
             else:
                 cli.show_stats(args.playlist)
-        elif command == 'view':
+        elif command == "view":
             cli.view_playlist(args.playlist)
-        elif command == 'sync':
+        elif command == "sync":
             cli.sync_playlist(args.playlist)
-        elif command == 'extract':
+        elif command == "extract":
             cli.extract_playlist(args.playlist, args.output)
-        elif command == 'plan':
+        elif command == "plan":
             cli.plan_playlist(
                 args.playlist,
                 args.count,
                 args.fresh_days,
                 args.generations,
                 args.score_strategy,
-                args.query
+                args.query,
             )
-        elif command == 'diff':
+        elif command == "diff":
             cli.diff_playlist(
-                args.playlist,
-                args.count,
-                args.fresh_days,
-                args.score_strategy,
-                args.query
+                args.playlist, args.count, args.fresh_days, args.score_strategy, args.query
             )
-        elif command == 'clean':
+        elif command == "clean":
             cli.clean_database(args.dry_run)
-        elif command == 'search':
-            cli.search_songs(
-                args.query
-            )
-        elif command == 'debug':
+        elif command == "search":
+            cli.search_songs(args.query)
+        elif command == "debug":
             topic = getattr(args, "topic", "last")
             fmt = getattr(args, "format", "json")
             if topic == "track":
@@ -2379,33 +2444,33 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
                         table(["#", "Track", "Track ID"], preview_rows)
                 return 0
             json_output(payload)
-        elif command == 'ingest':
+        elif command == "ingest":
             cli.ingest_tracks(args.source, args.name, args.time_range)
-        elif command == 'listen-sync':
+        elif command == "listen-sync":
             cli.sync_listen_history(args.limit)
-        elif command == 'rotate-played':
+        elif command == "rotate-played":
             cli.rotate_playlist_played(args.playlist, args.max_replace)
-        elif command == 'rotate':
-            if args.policy == 'played':
+        elif command == "rotate":
+            if args.policy == "played":
                 cli.rotate_playlist_played(args.playlist, args.max_replace)
             else:
                 logger.error(f"Unknown rotate policy: {args.policy}")
                 return 1
-        elif command == 'backup':
+        elif command == "backup":
             cli.backup_data(args.backup_name)
-        elif command == 'restore':
+        elif command == "restore":
             cli.restore_data(args.backup_name)
-        elif command == 'restore-previous-rotation':
+        elif command == "restore-previous-rotation":
             cli.restore_previous_rotation(args.playlist, args.offset)
-        elif command == 'list-rotations':
+        elif command == "list-rotations":
             cli.list_rotations(args.playlist, args.generations)
-        elif command == 'list-backups':
+        elif command == "list-backups":
             cli.list_backups()
-        elif command == 'auth-status':
+        elif command == "auth-status":
             cli.auth_status()
-        elif command == 'auth-refresh':
+        elif command == "auth-refresh":
             cli.auth_refresh()
-        elif command == 'interactive':
+        elif command == "interactive":
             logger.info("Already running. Use the interactive UI directly.")
         else:
             logger.error(f"Unknown command: {command}")
@@ -2415,6 +2480,7 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
         return 1
 
     return 0
+
 
 if __name__ == "__main__":
     exit(main())

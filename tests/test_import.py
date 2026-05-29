@@ -2,12 +2,12 @@
 Unit tests for the import command.
 Tests importing songs from CSV/TXT files with Spotify validation.
 """
-import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 
-from models import Song
-from test_mocks import create_spotify_track_response, create_spotify_artist_response
+from unittest.mock import MagicMock
+
+import pytest
+
+from test_mocks import create_spotify_artist_response, create_spotify_track_response
 
 
 class TestImportValidFile:
@@ -20,7 +20,7 @@ class TestImportValidFile:
 
         # Mock successful Spotify search
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -35,7 +35,7 @@ class TestImportValidFile:
         txt_file.write_text("song1,artist1\nsong2,artist2\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -54,7 +54,7 @@ class TestImportSkipsInvalidLines:
         csv_file.write_text("# This is a comment\nsong1,artist1\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -67,7 +67,7 @@ class TestImportSkipsInvalidLines:
         csv_file.write_text("song1,artist1\n\n\nsong2,artist2\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -79,7 +79,7 @@ class TestImportSkipsInvalidLines:
         csv_file.write_text("only_one_column\nsong1,artist1\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -96,10 +96,12 @@ class TestImportArtistValidation:
         csv_file.write_text("hit song,popular artist\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("hit song", "popular artist")]}
+            "tracks": {"items": [create_spotify_track_response("hit song", "popular artist")]}
         }
         # Artist has 2,000,000 followers - should be rejected
-        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("popular artist", 2000000)
+        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response(
+            "popular artist", 2000000
+        )
 
         mock_cli.import_songs(str(csv_file))
 
@@ -112,10 +114,12 @@ class TestImportArtistValidation:
         csv_file.write_text("indie song,indie artist\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("indie song", "indie artist")]}
+            "tracks": {"items": [create_spotify_track_response("indie song", "indie artist")]}
         }
         # Artist has 500k followers - should be accepted
-        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("indie artist", 500000)
+        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response(
+            "indie artist", 500000
+        )
 
         mock_cli.import_songs(str(csv_file))
 
@@ -129,7 +133,7 @@ class TestImportSpotifyValidation:
         csv_file.write_text("nonexistent song,unknown artist\n")
 
         # Spotify returns no results
-        mock_cli._spotify.sp.search.return_value = {'tracks': {'items': []}}
+        mock_cli._spotify.sp.search.return_value = {"tracks": {"items": []}}
 
         mock_cli.import_songs(str(csv_file))
 
@@ -141,8 +145,10 @@ class TestImportSpotifyValidation:
         csv_file.write_text("found song,known artist\n")
 
         track = create_spotify_track_response("found song", "known artist")
-        mock_cli._spotify.sp.search.return_value = {'tracks': {'items': [track]}}
-        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("known artist", 500000)
+        mock_cli._spotify.sp.search.return_value = {"tracks": {"items": [track]}}
+        mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response(
+            "known artist", 500000
+        )
 
         mock_cli.import_songs(str(csv_file))
 
@@ -157,7 +163,7 @@ class TestImportDuplicates:
         csv_file.write_text("song1,artist1\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
@@ -196,7 +202,7 @@ class TestImportStatistics:
         csv_file.write_text("song1,artist1\nsong2,artist2\n")
 
         mock_cli._spotify.sp.search.return_value = {
-            'tracks': {'items': [create_spotify_track_response("song1", "artist1")]}
+            "tracks": {"items": [create_spotify_track_response("song1", "artist1")]}
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 

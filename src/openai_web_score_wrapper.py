@@ -54,7 +54,8 @@ def main() -> int:
             return 1
 
     output_text = getattr(response, "output_text", None) or _extract_output_text(response)
-    if not output_text: print("Warning: empty response from OpenAI API", file=sys.stderr)
+    if not output_text:
+        print("Warning: empty response from OpenAI API", file=sys.stderr)
     parsed = _parse_json_output(output_text or "")
     if parsed is None:
         parsed = {"scores": {}}
@@ -83,7 +84,11 @@ def _extract_output_text(response: Any) -> str:
         return ""
     texts: List[str] = []
     for item in output:
-        content = getattr(item, "content", None) or item.get("content") if isinstance(item, dict) else None
+        content = (
+            getattr(item, "content", None) or item.get("content")
+            if isinstance(item, dict)
+            else None
+        )
         if not isinstance(content, list):
             continue
         for chunk in content:
@@ -142,7 +147,7 @@ def _strip_fence(text: str) -> Optional[str]:
     if candidate.startswith("```"):
         candidate = candidate[len("```") :]
     if candidate.endswith("```"):
-        candidate = candidate[: -3]
+        candidate = candidate[:-3]
     candidate = candidate.strip()
     if candidate.startswith("{") and candidate.endswith("}"):
         return candidate
@@ -166,7 +171,11 @@ def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[
 
 def _is_tool_type_error(exc: Exception, tool_type: str) -> bool:
     message = str(exc).lower()
-    return "tool" in message and tool_type in message and ("invalid" in message or "unsupported" in message)
+    return (
+        "tool" in message
+        and tool_type in message
+        and ("invalid" in message or "unsupported" in message)
+    )
 
 
 if __name__ == "__main__":
