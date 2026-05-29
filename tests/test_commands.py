@@ -492,14 +492,14 @@ class TestListBackupsDisplay:
         calls = []
         import main
         monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
-        monkeypatch.setattr(main.Path, "__new__", lambda cls, *a, **k: tmp_path / "nonexistent")
 
-        # Use a fresh CLI so Path(__file__).parent.parent resolves to tmp_path
+        # Point Path(__file__).parent.parent at an empty tmp dir so the
+        # computed backups/ directory does not exist.
         with patch("main.Path") as MockPath:
             MockPath.return_value.parent.parent = tmp_path
             mock_cli.list_backups()
 
-        # The method should either show "No backups directory found" or handle gracefully
+        assert any("No backups directory found" in c for c in calls)
 
 
 if __name__ == "__main__":

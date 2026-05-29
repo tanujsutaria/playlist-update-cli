@@ -3,6 +3,8 @@ Shared pytest fixtures for all tests.
 Provides mocked managers and sample data to enable testing without Spotify credentials.
 """
 import sys
+import types
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -11,7 +13,35 @@ from typing import List, Dict
 import numpy as np
 import pytest
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+# Put src/ at the FRONT of sys.path (defense-in-depth alongside the
+# pythonpath setting in pyproject.toml) so bare imports resolve to this
+# repo's modules and never a stray site-packages install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# Importing the real `sentence_transformers` takes ~17s and would download a
+# model on first use. No test needs the real encoder, so inject a deterministic,
+# dependency-free stub before any module lazily imports it.
+if "sentence_transformers" not in sys.modules:
+    _st_stub = types.ModuleType("sentence_transformers")
+
+    class _StubSentenceTransformer:
+        def __init__(self, model_name, *args, **kwargs):
+            self.model_name = model_name
+
+        def encode(self, texts, normalize_embeddings=False, **kwargs):
+            vectors = []
+            for text in texts:
+                digest = hashlib.sha256(str(text).encode("utf-8")).digest()
+                vec = np.frombuffer(digest[:8], dtype=np.uint8).astype(np.float64) / 255.0
+                if normalize_embeddings:
+                    norm = np.linalg.norm(vec)
+                    if norm:
+                        vec = vec / norm
+                vectors.append(vec)
+            return np.array(vectors)
+
+    _st_stub.SentenceTransformer = _StubSentenceTransformer
+    sys.modules["sentence_transformers"] = _st_stub
 
 from models import Song, PlaylistHistory, RotationStats  # noqa: E402
 

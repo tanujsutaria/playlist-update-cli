@@ -35,3 +35,10 @@ dev = [
 
 [tool.setuptools]
 packages = ["src", "src.storage", "src.nextgen"]
+
+[tool.pytest.ini_options]
+# Put src/ at the front of sys.path so bare imports (`from models import ...`)
+# resolve to this repo's modules, never a stray site-packages install.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
