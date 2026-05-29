@@ -18,8 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from dotenv import load_dotenv
 
-from db_manager import DatabaseManager  # noqa: E402
 from models import Song  # noqa: E402
+from song_store import SongStore  # noqa: E402
+from storage.db import Database  # noqa: E402
+from storage.migrations import ensure_schema  # noqa: E402
+from storage.repos import Repositories  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,9 +50,12 @@ def setup_directories():
 
 
 def test_database():
-    """Test database functionality"""
+    """Test database functionality against the SQLite store."""
     try:
-        db = DatabaseManager()
+        database = Database()
+        conn = database.connect()
+        ensure_schema(conn)
+        db = SongStore(Repositories(conn))
 
         # Test song
         test_song = Song(id="test_artist|||test_song", name="test_song", artist="test_artist")

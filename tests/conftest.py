@@ -377,6 +377,7 @@ def mock_rotation_manager(
     rm.playlist_name = "Test Playlist"
     rm.db = mock_database_manager
     rm.spotify = mock_spotify_manager
+    rm.repos = None
     rm.history = sample_playlist_history
     rm.root_dir = tmp_path
     rm.history_dir = tmp_path / "history"

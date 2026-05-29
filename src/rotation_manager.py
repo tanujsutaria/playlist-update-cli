@@ -1,12 +1,11 @@
 import logging
-import pickle
 import random
 import re as _re
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from db_manager import DatabaseManager
 from models import PlaylistHistory, RotationStats, Song
 from scoring import MatchScorer, PlaylistScoreConfig
 from spotify_manager import SpotifyManager
@@ -14,13 +13,24 @@ from spotify_manager import SpotifyManager
 logger = logging.getLogger(__name__)
 
 
+def _playlist_slug(playlist_name: str) -> str:
+    return _re.sub(r"[^a-z0-9_-]", "_", playlist_name.lower())
+
+
 class RotationManager:
     """Manages the rotation of songs in playlists"""
 
-    def __init__(self, playlist_name: str, db: DatabaseManager, spotify: SpotifyManager):
+    def __init__(
+        self,
+        playlist_name: str,
+        db: Any,
+        spotify: SpotifyManager,
+        repos: Any = None,
+    ):
         self.playlist_name = playlist_name
         self.db = db
         self.spotify = spotify
+        self.repos = repos
 
         # Get project root directory
         self.root_dir = Path(__file__).parent.parent
@@ -39,39 +49,49 @@ class RotationManager:
             logger.info(f"Loaded history with {len(self.history.generations)} generations")
 
     def _load_history(self) -> Optional[PlaylistHistory]:
-        """Load playlist history from disk"""
-        history_dir = self.root_dir / "data/history"
-        history_dir.mkdir(parents=True, exist_ok=True)
+        """Load playlist history from the SQLite rotation tables."""
+        if self.repos is None:
+            return None
 
-        history_file = (
-            history_dir / f"{_re.sub(r'[^a-z0-9_-]', '_', self.playlist_name.lower())}.pkl"
+        slug = _playlist_slug(self.playlist_name)
+        row = self.repos.playlists.get(slug)
+        if row is None:
+            return None
+
+        generations: List[List[str]] = []
+        for gen in self.repos.rotation_generations.list_by_playlist(slug):
+            tracks = self.repos.generation_tracks.list_by_generation(gen["generation_id"])
+            generations.append([t["track_id"] for t in tracks])
+
+        return PlaylistHistory(
+            playlist_id=row["spotify_playlist_id"],
+            name=row["name"],
+            generations=generations,
+            current_generation=row["current_generation"],
         )
-        logger.debug(f"Loading history from: {history_file}")
-
-        if history_file.exists():
-            try:
-                with open(history_file, "rb") as f:
-                    history = pickle.load(f)
-                    logger.info(f"Loaded history with {len(history.generations)} generations")
-                    return history
-            except Exception as e:
-                logger.error(f"Error loading history: {str(e)}")
-        return None
 
     def _save_history(self):
-        """Save playlist history to disk"""
-        history_dir = self.root_dir / "data/history"
-        history_dir.mkdir(parents=True, exist_ok=True)
-        history_file = (
-            history_dir / f"{_re.sub(r'[^a-z0-9_-]', '_', self.playlist_name.lower())}.pkl"
+        """Persist playlist history to the SQLite rotation tables."""
+        if self.repos is None:
+            return
+
+        slug = _playlist_slug(self.playlist_name)
+        now = datetime.now().isoformat()
+        self.repos.playlists.upsert(
+            playlist_id=slug,
+            name=self.history.name,
+            spotify_playlist_id=self.history.playlist_id,
+            current_generation=self.history.current_generation,
+            updated_at=now,
         )
 
-        try:
-            with open(history_file, "wb") as f:
-                pickle.dump(self.history, f)
-                logger.debug(f"Saved history to: {history_file}")
-        except Exception as e:
-            logger.error(f"Error saving history: {str(e)}")
+        for gi, gen in enumerate(self.history.generations):
+            generation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{slug}|{gi}").hex
+            self.repos.rotation_generations.upsert(generation_id, slug, gi, created_at=now)
+            for pos, sid in enumerate(gen):
+                self.repos.generation_tracks.add(generation_id, sid, pos)
+
+        self.repos.conn.commit()
 
     def get_rotation_stats(self) -> RotationStats:
         """Get statistics about the playlist rotation"""

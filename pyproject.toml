@@ -45,7 +45,7 @@ py-modules = [
     "models",
     "spotify_manager",
     "rotation_manager",
-    "db_manager",
+    "song_store",
     "scoring",
     "web_search",
     "arg_parse",
@@ -128,7 +128,6 @@ module = [
     "interactive_app",               # T11 decomposition
     "web_search",                    # T12 hardening
     "rotation_manager",              # T10 storage reroute
-    "db_manager",                    # T10 (module removed)
     "arg_parse",                     # T11 command registry
     "spotify_manager",               # T12 hardening
     "scoring",                       # T8 / T10

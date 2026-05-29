@@ -1,6 +1,6 @@
 """
 Unit tests for the playlist update workflow.
-Tests the integration between RotationManager, SpotifyManager, and DatabaseManager.
+Tests the integration between RotationManager, SpotifyManager, and SongStore.
 """
 
 from unittest.mock import ANY, MagicMock, patch

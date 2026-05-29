@@ -3,6 +3,15 @@ from datetime import datetime
 from typing import List, Optional, Set
 
 
+def track_id_for(artist: str, name: str) -> str:
+    """Canonical track-id derived from an artist/title pair.
+
+    Matches the historical convention ``f"{artist.lower()}|||{name.lower()}"``
+    used as both ``Song.id`` and the SQLite ``tracks.track_id`` primary key.
+    """
+    return f"{artist.lower()}|||{name.lower()}"
+
+
 @dataclass
 class Song:
     """Represents a song with its metadata"""

@@ -14,13 +14,13 @@ from typing import Dict, List, Optional, Tuple, Union
 from dotenv import load_dotenv
 from rich.logging import RichHandler
 
-from db_manager import DatabaseManager
 from models import Song
 from nextgen.embeddings import EmbeddingModel
 from nextgen.pipeline import SearchPipeline, SearchResult
 from nextgen.scoring import SearchScoreConfig
 from rotation_manager import RotationManager
 from scoring import PlaylistScoreConfig
+from song_store import SongStore
 from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
 from storage.db import Database
 from storage.migrations import ensure_schema
@@ -85,11 +85,14 @@ class PlaylistCLI:
         self.last_search_cached = False
 
     @property
-    def db(self) -> DatabaseManager:
-        """Lazy initialization of DatabaseManager"""
+    def db(self) -> SongStore:
+        """Lazy initialization of the SQLite-backed song store."""
         if self._db is None:
             logger.info("Initializing database manager...")
-            self._db = DatabaseManager()
+            self._db = SongStore(
+                self.repos,
+                model_name=os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2"),
+            )
             logger.info(f"Loaded {len(self._db.get_all_songs())} songs from database")
         return self._db
 
@@ -181,7 +184,10 @@ class PlaylistCLI:
         """Get or create a rotation manager for a playlist"""
         if playlist_name not in self._rotation_managers:
             self._rotation_managers[playlist_name] = RotationManager(
-                playlist_name=playlist_name, db=self.db, spotify=self.spotify
+                playlist_name=playlist_name,
+                db=self.db,
+                spotify=self.spotify,
+                repos=self.repos,
             )
         return self._rotation_managers[playlist_name]
 
@@ -1918,41 +1924,6 @@ class PlaylistCLI:
             validated = filtered
 
         return validated, stats
-
-    def add_search_results_to_db(self, results: List[Dict]) -> List[Song]:
-        """Add search results to the database after Spotify validation."""
-        validated, validation_stats = self._resolve_search_results(results)
-        stats = {
-            "total": validation_stats.get("total", 0),
-            "validated": validation_stats.get("validated", 0),
-            "added": 0,
-            "already_exists": 0,
-            "not_found": validation_stats.get("not_found", 0),
-            "popular_artist": validation_stats.get("popular_artist", 0),
-            "obscurity_failed": validation_stats.get("obscurity_failed", 0),
-            "obscurity_unverified": validation_stats.get("obscurity_unverified", 0),
-            "similarity_failed": validation_stats.get("similarity_failed", 0),
-            "similarity_unverified": validation_stats.get("similarity_unverified", 0),
-            "error": validation_stats.get("error", 0),
-        }
-        added_songs: List[Song] = []
-        for song in validated:
-            existing = self.db.get_song_by_id(song.id)
-            if existing:
-                stats["already_exists"] += 1
-                added_songs.append(existing)
-                continue
-            if self.db.add_song(song):
-                stats["added"] += 1
-                added_songs.append(song)
-            else:
-                stats["already_exists"] += 1
-                existing = self.db.get_song_by_id(song.id)
-                if existing:
-                    added_songs.append(existing)
-
-        self._show_search_validation_summary(stats, title="Search Import Summary")
-        return added_songs
 
     def resolve_search_results_for_playlist(self, results: List[Dict]) -> List[Song]:
         songs, validation_stats = self._resolve_search_results(results)
