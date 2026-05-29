@@ -24,8 +24,18 @@ def _set_version(conn: sqlite3.Connection, version: int) -> None:
 def _apply_statements(conn: sqlite3.Connection, statements: Iterable[str]) -> None:
     for statement in statements:
         stmt = statement.strip()
-        if stmt:
+        if not stmt:
+            continue
+        try:
             conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            # Idempotency: tolerate re-adding a column that already exists. This
+            # happens on databases initialized before schema_version tracking
+            # existed (version reads as 0 even though later columns are present).
+            message = str(exc).lower()
+            if "duplicate column name" in message and "add column" in stmt.lower():
+                continue
+            raise
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
