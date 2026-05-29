@@ -1,0 +1,33 @@
+# Local dev hooks mirroring CI (.github/workflows/ci.yml).
+# Install once: `pre-commit install`  (or `make install`).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+  # Pinned to the SAME ruff version the CI quality job installs, so local
+  # and CI never disagree. Bump this rev and pyproject's ruff pin together.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # mypy via the project environment (needs project deps to resolve imports).
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        args: ["src"]
+        language: system
+        types: [python]
+        pass_filenames: false

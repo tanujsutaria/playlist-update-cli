@@ -12,8 +12,9 @@ COV_MIN := 35
 help:
 	@echo "Targets: install lint format format-check typecheck test cov ci clean"
 
-install:  ## Install the package + dev tooling (uses uv)
+install:  ## Install the package + dev tooling (uses uv) and pre-commit hooks
 	uv pip install -e '.[dev]'
+	$(PY) -m pre_commit install
 
 lint:  ## Lint with ruff
 	$(PY) -m ruff check src tests
