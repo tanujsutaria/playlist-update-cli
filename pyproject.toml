@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-tunr = "src.main:main"
+tunr = "main:main"
 
 [project.optional-dependencies]
 dev = [
@@ -35,7 +35,30 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["src", "src.storage", "src.nextgen"]
+# src-layout: src/ is the source root (NOT an importable package named "src").
+# Top-level modules are declared explicitly; sub-packages are auto-discovered.
+# This gives every module a single import identity (e.g. `import models`),
+# eliminating the `import models` vs `import src.models` hazard.
+package-dir = {"" = "src"}
+py-modules = [
+    "main",
+    "models",
+    "spotify_manager",
+    "rotation_manager",
+    "db_manager",
+    "scoring",
+    "web_search",
+    "arg_parse",
+    "ui",
+    "interactive_app",
+    "anthropic_web_search_wrapper",
+    "openai_web_search_wrapper",
+    "openai_web_score_wrapper",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["storage*", "nextgen*"]
 
 [tool.pytest.ini_options]
 # Put src/ at the front of sys.path so bare imports (`from models import ...`)

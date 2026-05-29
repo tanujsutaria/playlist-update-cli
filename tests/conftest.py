@@ -14,10 +14,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-# Put src/ at the FRONT of sys.path (defense-in-depth alongside the
-# pythonpath setting in pyproject.toml) so bare imports resolve to this
+# src/ is placed on sys.path via [tool.pytest.ini_options] pythonpath in
+# pyproject.toml, so bare imports (`from models import ...`) resolve to this
 # repo's modules and never a stray site-packages install.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 # Importing the real `sentence_transformers` takes ~17s and would download a
 # model on first use. No test needs the real encoder, so inject a deterministic,

@@ -1,18 +1,14 @@
+import csv
+import json
 import logging
 import os
 import re
-import sys
-from pathlib import Path
-
-SRC_DIR = Path(__file__).resolve().parent
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-import csv
-import json
 import shutil
+import sys
 import uuid
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv

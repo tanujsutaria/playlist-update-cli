@@ -1,13 +1,26 @@
+"""One-off environment bootstrap: verify Spotify credentials, create data
+directories, and smoke-test the database.
+
+Relocated from src/setup.py (which shadowed the conventional setup.py role and
+shipped inside the package). Run from the repo root:
+
+    python scripts/setup_env.py
+"""
+
 import logging
 import os
+import sys
 from pathlib import Path
+
+# This is a standalone maintenance script (not part of the installed package),
+# so put the source root on sys.path to resolve the bare module imports below.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from dotenv import load_dotenv
 
-from db_manager import DatabaseManager  # Direct import
-from models import Song
+from db_manager import DatabaseManager  # noqa: E402
+from models import Song  # noqa: E402
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -83,4 +96,4 @@ def main():
 
 if __name__ == "__main__":
     success = main()
-    exit(0 if success else 1)
+    sys.exit(0 if success else 1)
