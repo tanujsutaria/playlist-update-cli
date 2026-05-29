@@ -3,9 +3,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable
 
-from .schema import initial_schema, schema_v2, schema_v3
+from .schema import initial_schema, schema_v2, schema_v3, schema_v4
 
-LATEST_VERSION = 3
+LATEST_VERSION = 4
 
 
 def _get_version(conn: sqlite3.Connection) -> int:
@@ -32,6 +32,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     version = _get_version(conn)
     if version >= LATEST_VERSION:
         return
+    if version > LATEST_VERSION:
+        raise RuntimeError(f"Unsupported schema version {version}.")
 
     if version == 0:
         _apply_statements(conn, initial_schema())
@@ -43,7 +45,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
     if version == 2:
         _apply_statements(conn, schema_v3())
-        _set_version(conn, LATEST_VERSION)
-        return
+        version = 3
 
-    raise RuntimeError(f"Unsupported schema version {version}.")
+    if version == 3:
+        _apply_statements(conn, schema_v4())
+        version = 4
+
+    _set_version(conn, LATEST_VERSION)

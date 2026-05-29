@@ -148,3 +148,43 @@ def schema_v3() -> list[str]:
     return [
         "ALTER TABLE search_runs ADD COLUMN score_config_hash TEXT;",
     ]
+
+
+def schema_v4() -> list[str]:
+    return [
+        """
+        CREATE TABLE IF NOT EXISTS playlists (
+          playlist_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          spotify_playlist_id TEXT,
+          current_generation INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT,
+          updated_at TEXT
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS rotation_generations (
+          generation_id TEXT PRIMARY KEY,
+          playlist_id TEXT NOT NULL,
+          generation_index INTEGER NOT NULL,
+          created_at TEXT,
+          UNIQUE (playlist_id, generation_index),
+          FOREIGN KEY (playlist_id) REFERENCES playlists(playlist_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS generation_tracks (
+          generation_id TEXT NOT NULL,
+          track_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          PRIMARY KEY (generation_id, track_id),
+          FOREIGN KEY (generation_id) REFERENCES rotation_generations(generation_id),
+          FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+        );
+        """,
+        (
+            "CREATE INDEX IF NOT EXISTS idx_rotation_generations_playlist "
+            "ON rotation_generations(playlist_id, generation_index);"
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_generation_tracks_track ON generation_tracks(track_id);",
+    ]

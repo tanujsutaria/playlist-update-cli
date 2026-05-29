@@ -407,6 +407,114 @@ class ListenEventsRepo:
 
 
 @dataclass
+class PlaylistsRepo:
+    conn: sqlite3.Connection
+
+    def upsert(
+        self,
+        playlist_id: str,
+        name: str,
+        spotify_playlist_id: Optional[str] = None,
+        current_generation: int = 0,
+        created_at: Optional[str] = None,
+        updated_at: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO playlists (
+              playlist_id, name, spotify_playlist_id, current_generation, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(playlist_id) DO UPDATE SET
+              name=excluded.name,
+              spotify_playlist_id=excluded.spotify_playlist_id,
+              current_generation=excluded.current_generation,
+              created_at=excluded.created_at,
+              updated_at=excluded.updated_at;
+            """,
+            (playlist_id, name, spotify_playlist_id, current_generation, created_at, updated_at),
+        )
+
+    def get(self, playlist_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM playlists WHERE playlist_id = ?;",
+            (playlist_id,),
+        ).fetchone()
+        return _row_dict(row)
+
+
+@dataclass
+class RotationGenerationsRepo:
+    conn: sqlite3.Connection
+
+    def upsert(
+        self,
+        generation_id: str,
+        playlist_id: str,
+        generation_index: int,
+        created_at: Optional[str] = None,
+    ) -> str:
+        self.conn.execute(
+            """
+            INSERT INTO rotation_generations (
+              generation_id, playlist_id, generation_index, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(playlist_id, generation_index) DO NOTHING;
+            """,
+            (generation_id, playlist_id, generation_index, created_at),
+        )
+        row = self.conn.execute(
+            """
+            SELECT generation_id FROM rotation_generations
+            WHERE playlist_id = ? AND generation_index = ?;
+            """,
+            (playlist_id, generation_index),
+        ).fetchone()
+        if row is None:
+            return generation_id
+        return row["generation_id"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def list_by_playlist(self, playlist_id: str) -> Iterable[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM rotation_generations
+            WHERE playlist_id = ?
+            ORDER BY generation_index ASC;
+            """,
+            (playlist_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+@dataclass
+class GenerationTracksRepo:
+    conn: sqlite3.Connection
+
+    def add(self, generation_id: str, track_id: str, position: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO generation_tracks (generation_id, track_id, position)
+            VALUES (?, ?, ?)
+            ON CONFLICT(generation_id, track_id) DO UPDATE SET
+              position=excluded.position;
+            """,
+            (generation_id, track_id, position),
+        )
+
+    def list_by_generation(self, generation_id: str) -> Iterable[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM generation_tracks
+            WHERE generation_id = ?
+            ORDER BY position ASC;
+            """,
+            (generation_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+@dataclass
 class Repositories:
     conn: sqlite3.Connection
 
@@ -445,3 +553,15 @@ class Repositories:
     @property
     def listen_events(self) -> ListenEventsRepo:
         return ListenEventsRepo(self.conn)
+
+    @property
+    def playlists(self) -> PlaylistsRepo:
+        return PlaylistsRepo(self.conn)
+
+    @property
+    def rotation_generations(self) -> RotationGenerationsRepo:
+        return RotationGenerationsRepo(self.conn)
+
+    @property
+    def generation_tracks(self) -> GenerationTracksRepo:
+        return GenerationTracksRepo(self.conn)
