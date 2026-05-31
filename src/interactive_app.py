@@ -50,10 +50,37 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "restore",
     "list-rotations",
     "stats",
+    "profile",
     "plan",
     "search",
     "interactive",
 }
+
+# Task-based grouping for the /help listing. Commands not named here fall into
+# an "Other" bucket; legacy commands are hidden unless `/help all` is used. The
+# descriptions still come from argparse, so this map only controls ORDER/grouping.
+HELP_GROUPS: "list[tuple[str, list[str]]]" = [
+    ("Set up", ["auth-status", "auth-refresh", "ingest", "listen-sync"]),
+    (
+        "Playlists",
+        [
+            "update",
+            "rotate",
+            "sync",
+            "plan",
+            "diff",
+            "view",
+            "extract",
+            "clean",
+            "backup",
+            "restore",
+            "restore-previous-rotation",
+        ],
+    ),
+    ("Discover", ["search"]),
+    ("Insight", ["stats", "profile", "list-rotations", "list-backups"]),
+]
+HELP_LEGACY = {"import"}
 
 
 class UILogHandler(logging.Handler):
@@ -286,8 +313,8 @@ class PlaylistInteractiveApp(App):
             return
         self._refresh_env_status()
 
-        if text in ("help", "?"):
-            self._show_help()
+        if text in ("help", "?") or text in ("help all", "help --all"):
+            self._show_help(show_all=text in ("help all", "help --all"))
             return
         if text in ("setup",):
             self._show_setup()
@@ -385,28 +412,62 @@ class PlaylistInteractiveApp(App):
         welcome.append("Commands are slash-prefixed. Type /help for the list.\n", style="dim")
         self.append_log(Panel(welcome, title="Welcome", border_style="cyan"))
 
-    def _show_help(self) -> None:
-        table = Table(
-            title="Commands", box=box.SIMPLE, show_header=True, header_style="bold", expand=True
-        )
-        table.add_column("Command", style="cyan", overflow="fold", no_wrap=True, width=18)
-        table.add_column("Description", overflow="fold", no_wrap=False)
-        table.add_row("/help, /?", "Show this help screen")
-        table.add_row("/setup", "Show first-time setup instructions")
-        table.add_row("/env, /keys", "Show detected environment keys")
-        table.add_row("/debug", "Show debug info (errors, last, track <id|rank>)")
-        table.add_row("/errors", "Show error log (alias for /debug errors)")
-        table.add_row("/expand, /search-more", "Expand the last search")
-        table.add_row("/clear, /cls", "Clear the output pane")
-        table.add_row("/quit, /exit", "Exit the app")
-        if not self._setup_mode:
-            for name, help_text in self._command_summaries():
-                table.add_row(f"/{name}", help_text or "")
-        self.append_log(table)
-        if not self._setup_mode:
-            self.append_log(
-                Text('Example: /update "My Playlist" --count 10 --fresh-days 21', style="dim")
+    @staticmethod
+    def _help_table(title: str, rows: "list[tuple[str, str]]") -> Table:
+        t = Table(title=title, title_justify="left", box=box.SIMPLE, show_header=False, expand=True)
+        # No fixed width on the command column: it sizes to the longest name so
+        # commands like /restore-previous-rotation aren't truncated.
+        t.add_column("Command", style="cyan", no_wrap=True)
+        t.add_column("Description", overflow="fold", no_wrap=False)
+        for name, help_text in rows:
+            t.add_row(name, help_text or "")
+        return t
+
+    def _show_help(self, show_all: bool = False) -> None:
+        # Session / meta commands first (TUI-only; always available).
+        self.append_log(
+            self._help_table(
+                "Session",
+                [
+                    ("/help, /?", "Show this help (/help all includes legacy commands)"),
+                    ("/setup", "Show first-time setup instructions"),
+                    ("/env, /keys", "Show detected environment keys"),
+                    ("/debug", "Show debug info (errors, last, track <id|rank>)"),
+                    ("/errors", "Show error log (alias for /debug errors)"),
+                    ("/expand, /search-more", "Expand the last search"),
+                    ("/clear, /cls", "Clear the output pane"),
+                    ("/quit, /exit", "Exit the app"),
+                ],
             )
+        )
+        if self._setup_mode:
+            return
+
+        summaries = dict(self._command_summaries())
+        mapped = set(HELP_LEGACY)
+        for title, names in HELP_GROUPS:
+            mapped.update(names)
+            rows = [(f"/{name}", summaries[name]) for name in names if name in summaries]
+            if rows:
+                self.append_log(self._help_table(title, rows))
+
+        if show_all:
+            legacy_rows = [
+                (f"/{name}", summaries[name]) for name in summaries if name in HELP_LEGACY
+            ]
+            if legacy_rows:
+                self.append_log(self._help_table("Legacy", legacy_rows))
+
+        # Any command not placed in a group (e.g. a newly added one) still shows up.
+        misc_rows = [(f"/{name}", summaries[name]) for name in summaries if name not in mapped]
+        if misc_rows:
+            self.append_log(self._help_table("Other", misc_rows))
+
+        if not show_all and any(name in summaries for name in HELP_LEGACY):
+            self.append_log(Text("Type /help all to show legacy commands.", style="dim"))
+        self.append_log(
+            Text('Example: /update "My Playlist" --count 10 --fresh-days 21', style="dim")
+        )
 
     def _command_summaries(self) -> Iterable[Tuple[str, str]]:
         for action in self.parser._actions:
@@ -417,10 +478,7 @@ class PlaylistInteractiveApp(App):
                     # usable but out of the advertised command list.
                     if name in {"interactive", "debug", "rotate-played"}:
                         continue
-                    help_text = choice.help or ""
-                    if help_text.lower().startswith("legacy:"):
-                        help_text = f"{help_text} (legacy)"
-                    yield name, help_text
+                    yield name, choice.help or ""
 
     def _update_top_bar(self) -> None:
         if not self._mounted:
