@@ -87,9 +87,16 @@ class RotationManager:
 
         for gi, gen in enumerate(self.history.generations):
             generation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{slug}|{gi}").hex
-            self.repos.rotation_generations.upsert(generation_id, slug, gi, created_at=now)
+            # upsert() is ON CONFLICT(playlist_id, generation_index) DO NOTHING and
+            # returns the CANONICAL id — the existing row's id when one is already
+            # present (which may differ from the id we just computed). Use that
+            # returned id for generation_tracks, or we'd reference a non-existent
+            # generation row and hit a FOREIGN KEY error.
+            canonical_id = self.repos.rotation_generations.upsert(
+                generation_id, slug, gi, created_at=now
+            )
             for pos, sid in enumerate(gen):
-                self.repos.generation_tracks.add(generation_id, sid, pos)
+                self.repos.generation_tracks.add(canonical_id, sid, pos)
 
         self.repos.conn.commit()
 
