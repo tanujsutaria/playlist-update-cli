@@ -7,7 +7,9 @@ PY := $(shell [ -x $(VENV)/bin/python ] && echo $(VENV)/bin/python || echo pytho
 
 # Minimum total coverage. Ratchet up as tests are backfilled (see
 # docs/REMEDIATION_PLAN.md T13). Baseline at introduction: 38%.
-COV_MIN := 35
+# T13 backfill (config, nextgen canonicalize/providers/embeddings, storage
+# vectors, ui) raised the total to ~45%; floor ratcheted to 42%.
+COV_MIN := 42
 
 help:
 	@echo "Targets: install lint format format-check typecheck test cov ci clean"

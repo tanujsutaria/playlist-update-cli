@@ -26,8 +26,8 @@ class TestImportValidFile:
 
         mock_cli.import_songs(str(csv_file))
 
-        # Should have attempted to add songs
-        assert mock_cli._db.add_song.called or mock_cli._db._save_state.called
+        # Both valid rows pass validation and are added to the store.
+        assert mock_cli._db.add_song.call_count == 2
 
     def test_import_valid_txt(self, mock_cli, tmp_path):
         """Test importing songs from a valid TXT file"""
@@ -41,8 +41,12 @@ class TestImportValidFile:
 
         mock_cli.import_songs(str(txt_file))
 
-        # Should not raise an error
-        assert True
+        # Both valid rows are added; the Song carries name/artist parsed from
+        # the file (lowercased) and the URI from the Spotify search hit.
+        assert mock_cli._db.add_song.call_count == 2
+        added = [call.args[0] for call in mock_cli._db.add_song.call_args_list]
+        assert {s.id for s in added} == {"artist1|||song1", "artist2|||song2"}
+        assert all(s.spotify_uri for s in added)
 
 
 class TestImportSkipsInvalidLines:
@@ -58,8 +62,12 @@ class TestImportSkipsInvalidLines:
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
-        # Should not error on comment lines
         mock_cli.import_songs(str(csv_file))
+
+        # Only the real row is added; the comment line never reaches the store
+        # or even a Spotify lookup.
+        assert mock_cli._db.add_song.call_count == 1
+        assert mock_cli._spotify.sp.search.call_count == 1
 
     def test_import_skips_empty_lines(self, mock_cli, tmp_path):
         """Test that empty lines are skipped"""
@@ -73,6 +81,9 @@ class TestImportSkipsInvalidLines:
 
         mock_cli.import_songs(str(csv_file))
 
+        # The two blank lines are skipped; only the two real rows are added.
+        assert mock_cli._db.add_song.call_count == 2
+
     def test_import_skips_malformed_lines(self, mock_cli, tmp_path):
         """Test that malformed lines (missing columns) are skipped"""
         csv_file = tmp_path / "songs.csv"
@@ -83,8 +94,13 @@ class TestImportSkipsInvalidLines:
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
-        # Should not error on malformed lines
         mock_cli.import_songs(str(csv_file))
+
+        # The single-column line is rejected before any add; only the valid row
+        # is stored.
+        assert mock_cli._db.add_song.call_count == 1
+        added = mock_cli._db.add_song.call_args_list[0].args[0]
+        assert added.id == "artist1|||song1"
 
 
 class TestImportArtistValidation:
@@ -105,8 +121,10 @@ class TestImportArtistValidation:
 
         mock_cli.import_songs(str(csv_file))
 
-        # Song should not be added due to popular artist
-        # The method logs a warning but continues
+        # Artist exceeds the 1M-follower cap, so the song is rejected: the
+        # Spotify lookup happens but nothing is stored.
+        assert mock_cli._spotify.sp.search.called
+        assert mock_cli._db.add_song.call_count == 0
 
     def test_import_accepts_unpopular_artist(self, mock_cli, tmp_path):
         """Test that artists with < 1M followers are accepted"""
@@ -123,6 +141,10 @@ class TestImportArtistValidation:
 
         mock_cli.import_songs(str(csv_file))
 
+        # Under the cap -> stored once.
+        assert mock_cli._db.add_song.call_count == 1
+        assert mock_cli._db.add_song.call_args_list[0].args[0].id == "indie artist|||indie song"
+
 
 class TestImportSpotifyValidation:
     """Tests for Spotify song validation"""
@@ -132,12 +154,15 @@ class TestImportSpotifyValidation:
         csv_file = tmp_path / "songs.csv"
         csv_file.write_text("nonexistent song,unknown artist\n")
 
-        # Spotify returns no results
+        # Spotify returns no results. The conftest mock installs a default
+        # side_effect on search(); clear it so return_value applies.
+        mock_cli._spotify.sp.search.side_effect = None
         mock_cli._spotify.sp.search.return_value = {"tracks": {"items": []}}
 
         mock_cli.import_songs(str(csv_file))
 
-        # Should log warning but not error
+        # No Spotify match -> nothing added.
+        assert mock_cli._db.add_song.call_count == 0
 
     def test_import_stores_spotify_uri(self, mock_cli, tmp_path):
         """Test that found Spotify URI is stored with the song"""
@@ -145,12 +170,21 @@ class TestImportSpotifyValidation:
         csv_file.write_text("found song,known artist\n")
 
         track = create_spotify_track_response("found song", "known artist")
+        # Clear the conftest default side_effect so our return_value applies.
+        mock_cli._spotify.sp.search.side_effect = None
         mock_cli._spotify.sp.search.return_value = {"tracks": {"items": [track]}}
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response(
             "known artist", 500000
         )
 
         mock_cli.import_songs(str(csv_file))
+
+        # The exact URI returned by the Spotify search hit is persisted on the
+        # stored Song.
+        assert mock_cli._db.add_song.call_count == 1
+        stored = mock_cli._db.add_song.call_args_list[0].args[0]
+        assert stored.spotify_uri == track["uri"]
+        assert stored.id == "known artist|||found song"
 
 
 class TestImportDuplicates:
@@ -172,6 +206,10 @@ class TestImportDuplicates:
 
         mock_cli.import_songs(str(csv_file))
 
+        # add_song is still invoked; the store reports the row as a duplicate
+        # (returns False) rather than the importer pre-filtering it.
+        assert mock_cli._db.add_song.call_count == 1
+
 
 class TestImportErrorHandling:
     """Tests for error handling"""
@@ -180,7 +218,9 @@ class TestImportErrorHandling:
         """Test handling of missing file"""
         mock_cli.import_songs("/nonexistent/path/songs.csv")
 
-        # Should log error but not crash
+        # Missing file returns early: no Spotify lookup, no store writes.
+        assert mock_cli._spotify.sp.search.call_count == 0
+        assert mock_cli._db.add_song.call_count == 0
 
     def test_import_handles_api_error(self, mock_cli, tmp_path):
         """Test handling of Spotify API errors"""
@@ -189,14 +229,16 @@ class TestImportErrorHandling:
 
         mock_cli._spotify.sp.search.side_effect = Exception("API Error")
 
-        # Should handle error gracefully
+        # The per-line error is caught; the row is not stored and no exception
+        # propagates out of import_songs.
         mock_cli.import_songs(str(csv_file))
+        assert mock_cli._db.add_song.call_count == 0
 
 
 class TestImportStatistics:
     """Tests for import statistics reporting"""
 
-    def test_import_tracks_statistics(self, mock_cli, tmp_path):
+    def test_import_tracks_statistics(self, mock_cli, tmp_path, capsys):
         """Test that import tracks and reports statistics"""
         csv_file = tmp_path / "songs.csv"
         csv_file.write_text("song1,artist1\nsong2,artist2\n")
@@ -206,8 +248,14 @@ class TestImportStatistics:
         }
         mock_cli._spotify.sp.artist.return_value = create_spotify_artist_response("artist1", 500000)
 
-        # Import should complete and log statistics
         mock_cli.import_songs(str(csv_file))
+
+        # The summary table is rendered with the counts (2 entries, 2 added).
+        out = capsys.readouterr().out
+        assert "Import Summary" in out
+        assert "Total entries processed" in out
+        assert "Songs added" in out
+        assert mock_cli._db.add_song.call_count == 2
 
 
 if __name__ == "__main__":
