@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(.venv/bin/python -m mypy:*)",
+      "Bash(.venv/bin/python -m ruff:*)",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(.venv/bin/ruff:*)",
+      "Bash(.venv/bin/mypy:*)",
+      "Bash(uv pip install:*)",
+      "Bash(uv lock:*)",
+      "Bash(uv run:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
+    ],
+    "deny": [
+      "Read(./.spotify_cache/**)",
+      "Read(./config/.env)",
+      "Read(./config/.env.*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && [ -x .venv/bin/ruff ] && .venv/bin/ruff check --quiet src tests || exit 2"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && make test"
+          }
+        ]
+      }
+    ]
+  }
+}
