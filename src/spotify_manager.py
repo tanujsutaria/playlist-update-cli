@@ -172,14 +172,38 @@ class SpotifyManager:
         self._load_playlists()
 
     def _load_playlists(self):
-        """Load user's playlists into cache"""
+        """Load user's playlists into cache.
+
+        Paginates through ALL pages — current_user_playlists() returns only the
+        first page (<=50), so without this loop playlists beyond the first page
+        (e.g. an older "Favorites") were silently missing from the cache.
+        """
         try:
-            playlists = self.sp.current_user_playlists()
-            for playlist in playlists["items"]:
-                if playlist["owner"]["id"] == self.user_id:
-                    self.playlists[playlist["name"]] = playlist["id"]
+            results = self.sp.current_user_playlists(limit=50)
+            while results:
+                for playlist in results.get("items", []):
+                    if not playlist:
+                        continue
+                    owner_id = (playlist.get("owner") or {}).get("id")
+                    if owner_id == self.user_id:
+                        self.playlists[playlist["name"]] = playlist["id"]
+                results = self.sp.next(results) if results.get("next") else None
         except Exception as e:
             logger.error(f"Error loading playlists: {str(e)}")
+
+    def _resolve_name(self, name: str) -> Optional[str]:
+        """Resolve a requested playlist name to its cached key.
+
+        Tries an exact match first, then a case-insensitive match (so
+        `/view favorites` finds a playlist actually named "Favorites").
+        """
+        if name in self.playlists:
+            return name
+        lowered = name.lower()
+        for key in self.playlists:
+            if key.lower() == lowered:
+                return key
+        return None
 
     def create_playlist(self, name: str, description: str = "") -> str:
         """Create a new playlist"""
@@ -320,11 +344,12 @@ class SpotifyManager:
 
     def get_playlist_tracks(self, name: str) -> List[Dict]:
         """Get all tracks in a playlist with their metadata"""
-        if name not in self.playlists:
+        resolved = self._resolve_name(name)
+        if resolved is None:
             logger.error(f"Playlist '{name}' not found")
             return []
 
-        playlist_id = self.playlists[name]
+        playlist_id = self.playlists[resolved]
         tracks = []
 
         try:
@@ -695,11 +720,12 @@ class SpotifyManager:
             return False
 
     def get_playlist_id(self, name: str) -> Optional[str]:
-        """Get playlist ID by name"""
-        # Check cache first
-        if name in self.playlists:
-            return self.playlists[name]
+        """Get playlist ID by name (exact or case-insensitive)."""
+        resolved = self._resolve_name(name)
+        if resolved is not None:
+            return self.playlists[resolved]
 
-        # Load playlists if not cached
+        # Not cached — (re)load all playlists and try again.
         self._load_playlists()
-        return self.playlists.get(name)
+        resolved = self._resolve_name(name)
+        return self.playlists[resolved] if resolved is not None else None

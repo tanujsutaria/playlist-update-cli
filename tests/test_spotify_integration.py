@@ -3,13 +3,59 @@ Unit tests for SpotifyManager.
 Uses mocked Spotipy client to avoid requiring live API credentials.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from models import Song
+from spotify_manager import SpotifyManager
 from test_mocks import (
     create_spotify_search_response,
     create_spotify_track_response,
 )
+
+
+class TestLoadPlaylistsPagination:
+    """Regression tests for playlist-list pagination + name resolution."""
+
+    def _manager(self, sp):
+        mgr = SpotifyManager.__new__(SpotifyManager)
+        mgr.sp = sp
+        mgr.user_id = "me"
+        mgr.playlists = {}
+        return mgr
+
+    def test_load_playlists_paginates_all_pages(self):
+        """Playlists beyond the first page must still be cached (the bug)."""
+        page1 = {
+            "items": [{"name": "First", "id": "1", "owner": {"id": "me"}}],
+            "next": "url-page-2",
+        }
+        page2 = {
+            "items": [
+                {"name": "Favorites", "id": "fav", "owner": {"id": "me"}},
+                {"name": "SomeoneElse", "id": "x", "owner": {"id": "other"}},
+            ],
+            "next": None,
+        }
+        sp = MagicMock()
+        sp.current_user_playlists.return_value = page1
+        sp.next.return_value = page2
+
+        mgr = self._manager(sp)
+        mgr._load_playlists()
+
+        # Favorites is on page 2 — must be present; non-owned playlist excluded.
+        assert mgr.playlists == {"First": "1", "Favorites": "fav"}
+        sp.next.assert_called_once_with(page1)
+
+    def test_resolve_name_is_case_insensitive(self):
+        mgr = self._manager(MagicMock())
+        mgr.playlists = {"Favorites": "fav"}
+        assert mgr._resolve_name("Favorites") == "Favorites"
+        assert mgr._resolve_name("favorites") == "Favorites"
+        assert mgr._resolve_name("FAVORITES") == "Favorites"
+        assert mgr._resolve_name("missing") is None
 
 
 class TestSpotifyManagerInitialization:
