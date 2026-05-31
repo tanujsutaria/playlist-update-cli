@@ -473,13 +473,14 @@ class TestListenSyncCommand:
 class TestRotateCommand:
     """Tests for rotate command parsing"""
 
-    def test_parse_rotate_default_policy(self):
+    def test_parse_rotate_default(self):
         parser = setup_parsers()
         args = parser.parse_args(["rotate", "My Playlist"])
         assert args.command == "rotate"
         assert args.playlist == "My Playlist"
-        assert args.policy == "played"
         assert args.max_replace is None
+        # `--policy` was removed (it was a single-value, redundant flag).
+        assert not hasattr(args, "policy")
 
     def test_parse_rotate_with_max_replace(self):
         parser = setup_parsers()
@@ -496,6 +497,21 @@ class TestRotatePlayedCommand:
         assert args.command == "rotate-played"
         assert args.playlist == "My Playlist"
         assert args.max_replace is None
+
+
+class TestProfileCommand:
+    """Tests for profile command parsing"""
+
+    def test_parse_profile_default_top(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["profile"])
+        assert args.command == "profile"
+        assert args.top == 15
+
+    def test_parse_profile_custom_top(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["profile", "--top", "5"])
+        assert args.top == 5
 
 
 class TestAuthCommands:

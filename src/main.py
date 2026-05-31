@@ -28,6 +28,7 @@ from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.vectors import decode_vector, vector_norm
 from ui import (
+    bar_chart,
     clear_preview,
     console,
     info,
@@ -35,6 +36,7 @@ from ui import (
     key_value_table,
     preview_table,
     section,
+    sparkline,
     subsection,
     table,
     warning,
@@ -553,6 +555,89 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error viewing playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
+
+    def show_profile(self, top: int = 15) -> None:
+        """Visualize the library: top artists by track count + rotation coverage.
+
+        Built entirely on fully-populated columns (track/artist identity and
+        rotation history), so it is honest on the current corpus — unlike
+        mood/genre views, which depend on track enrichment that has not run yet.
+        """
+        try:
+            conn = self.repos.conn
+            total_tracks = conn.execute("SELECT COUNT(*) AS c FROM tracks").fetchone()["c"]
+            if not total_tracks:
+                info("No tracks in your library yet. Try /ingest or /search to add some.")
+                return
+
+            total_artists = conn.execute("SELECT COUNT(*) AS c FROM artists").fetchone()["c"]
+            rotated = conn.execute(
+                "SELECT COUNT(DISTINCT track_id) AS c FROM generation_tracks"
+            ).fetchone()["c"]
+            generations = conn.execute("SELECT COUNT(*) AS c FROM rotation_generations").fetchone()[
+                "c"
+            ]
+            never = total_tracks - rotated
+
+            def _pct(part: int) -> str:
+                return f"{part} ({part / total_tracks * 100:.0f}%)"
+
+            section("Library Profile")
+            key_value_table(
+                [
+                    ["Tracks", total_tracks],
+                    ["Artists", total_artists],
+                    ["Rotated at least once", _pct(rotated)],
+                    ["Never rotated", _pct(never)],
+                    ["Rotation generations", generations],
+                ]
+            )
+            if never:
+                info(
+                    f"{never} of your {total_tracks} tracks have never been rotated "
+                    f"— plenty of unused library to draw from."
+                )
+
+            # Top artists by track count (drops tracks with no artist via the join).
+            artist_rows = conn.execute(
+                """
+                SELECT a.name AS name, COUNT(*) AS c
+                FROM tracks t
+                JOIN artists a ON t.artist_id = a.artist_id
+                GROUP BY t.artist_id
+                ORDER BY c DESC, name ASC
+                LIMIT ?
+                """,
+                (top,),
+            ).fetchall()
+            if artist_rows:
+                section("Top artists", f"by track count (top {len(artist_rows)})")
+                bar_chart([r["name"] for r in artist_rows], [r["c"] for r in artist_rows])
+
+            # Cumulative distinct-track coverage across generations (a discovery curve).
+            gen_rows = conn.execute(
+                "SELECT generation_id AS gid FROM rotation_generations "
+                "ORDER BY generation_index ASC"
+            ).fetchall()
+            if len(gen_rows) >= 2:
+                seen: set[str] = set()
+                growth: list[int] = []
+                for gen in gen_rows:
+                    for row in conn.execute(
+                        "SELECT track_id FROM generation_tracks WHERE generation_id = ?",
+                        (gen["gid"],),
+                    ).fetchall():
+                        seen.add(row["track_id"])
+                    growth.append(len(seen))
+                section("Rotation coverage growth", f"{len(gen_rows)} generations")
+                key_value_table(
+                    [
+                        ["Coverage curve", sparkline(growth)],
+                        ["First → latest", f"{growth[0]} → {growth[-1]} distinct tracks"],
+                    ]
+                )
+        except Exception as e:
+            logger.error(f"Error showing profile: {str(e)}")
 
     def show_stats(self, playlist_name: Optional[str] = None):
         """Show database and playlist statistics"""
@@ -2264,6 +2349,11 @@ def _handle_stats(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_profile(cli: "PlaylistCLI", args: Any) -> int:
+    cli.show_profile(args.top)
+    return 0
+
+
 def _handle_view(cli: "PlaylistCLI", args: Any) -> int:
     cli.view_playlist(args.playlist)
     return 0
@@ -2453,16 +2543,16 @@ def _handle_listen_sync(cli: "PlaylistCLI", args: Any) -> int:
 
 
 def _handle_rotate_played(cli: "PlaylistCLI", args: Any) -> int:
+    # Deprecated alias for `rotate`; kept one release so existing muscle memory
+    # and scripts get a redirect instead of an "unknown command" error.
+    logger.warning("`rotate-played` is deprecated — use `rotate` instead.")
     cli.rotate_playlist_played(args.playlist, args.max_replace)
     return 0
 
 
 def _handle_rotate(cli: "PlaylistCLI", args: Any) -> int:
-    if args.policy == "played":
-        cli.rotate_playlist_played(args.playlist, args.max_replace)
-        return 0
-    logger.error(f"Unknown rotate policy: {args.policy}")
-    return 1
+    cli.rotate_playlist_played(args.playlist, args.max_replace)
+    return 0
 
 
 def _handle_backup(cli: "PlaylistCLI", args: Any) -> int:
@@ -2510,6 +2600,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "import": _handle_import,
     "update": _handle_update,
     "stats": _handle_stats,
+    "profile": _handle_profile,
     "view": _handle_view,
     "sync": _handle_sync,
     "extract": _handle_extract,

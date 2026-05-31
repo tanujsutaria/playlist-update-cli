@@ -54,6 +54,19 @@ def _make_app(monkeypatch, with_spotify=True):
 # ============================================================================
 
 
+def _logged_text(app, width: int = 100) -> str:
+    """Render every logged renderable to plain text for content assertions."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in app.logged:
+        console.print(renderable)
+    return buf.getvalue()
+
+
 class TestHelpCommand:
     def test_help_routed(self, monkeypatch):
         app = _make_app(monkeypatch)
@@ -66,6 +79,32 @@ class TestHelpCommand:
         app._handle_command("/?")
         assert app.logged
         assert app.commands == []
+
+    def test_help_is_grouped_by_task(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help")
+        text = _logged_text(app)
+        # Task groups render as titled sections...
+        assert "Set up" in text
+        assert "Playlists" in text
+        assert "Insight" in text
+        # ...and commands land in them (e.g. the new /profile under Insight).
+        assert "/profile" in text
+
+    def test_help_hides_legacy_by_default(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help")
+        text = _logged_text(app)
+        assert "/import" not in text  # legacy hidden
+        assert "/help all" in text  # but discoverable
+
+    def test_help_all_reveals_legacy(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help all")
+        text = _logged_text(app)
+        assert "Legacy" in text
+        assert "/import" in text
+        assert app.commands == []  # still not dispatched to argparse
 
 
 class TestSetupCommand:

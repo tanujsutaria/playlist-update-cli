@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 from rich import box
 from rich.console import Console, RenderableType
@@ -100,3 +100,80 @@ def warning(message: str) -> None:
 def json_output(payload: object) -> None:
     rendered = Syntax(json.dumps(payload, indent=2), "json", theme="ansi_dark", word_wrap=True)
     _emit(rendered)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight, dependency-free charts (Unicode block glyphs).
+# These render through `_emit` like every other helper, so they work
+# identically in the console and inside the Textual RichLog sink.
+# ---------------------------------------------------------------------------
+
+_SPARK_TICKS = "▁▂▃▄▅▆▇█"
+# Eighth-width left blocks, indexed by eighths of a cell: idx 0 == empty.
+_BAR_EIGHTHS = " ▏▎▍▌▋▊▉"
+_BAR_FULL = "█"
+
+
+def sparkline(values: Sequence[float]) -> str:
+    """Render a numeric series as a compact one-line Unicode sparkline.
+
+    Values are min-max scaled across the series. An empty series yields an
+    empty string; a flat series yields a row of mid-height ticks (so "no
+    variation" reads differently from "no data").
+    """
+    nums = [float(v) for v in values]
+    if not nums:
+        return ""
+    low = min(nums)
+    high = max(nums)
+    span = high - low
+    if span == 0:
+        return _SPARK_TICKS[len(_SPARK_TICKS) // 2] * len(nums)
+    last = len(_SPARK_TICKS) - 1
+    return "".join(_SPARK_TICKS[int((v - low) / span * last + 0.5)] for v in nums)
+
+
+def _bar(fraction: float, width: int) -> str:
+    """A horizontal bar `width` cells wide filled to `fraction` (0..1),
+    using eighth-of-a-cell partials for sub-cell precision."""
+    fraction = max(0.0, min(1.0, fraction))
+    eighths = int(round(fraction * width * 8))
+    full, remainder = divmod(eighths, 8)
+    bar = _BAR_FULL * full
+    if remainder:
+        bar += _BAR_EIGHTHS[remainder]
+    return bar
+
+
+def bar_chart(
+    labels: Sequence[Any],
+    values: Sequence[float],
+    *,
+    width: int = 28,
+    value_fmt: Optional[Callable[[float], str]] = None,
+) -> None:
+    """Emit a horizontal bar chart as a 3-column table: label | bar | value.
+
+    Bars are scaled to the largest value in the series. `value_fmt` overrides
+    how the numeric column is formatted (defaults to int-or-2dp).
+    """
+    labels = [str(label) for label in labels]
+    nums = [float(v) for v in values]
+    if not nums:
+        info("No data to chart.")
+        return
+    peak = max(nums)
+    scale = peak if peak > 0 else 1.0
+
+    def _fmt(v: float) -> str:
+        if value_fmt is not None:
+            return value_fmt(v)
+        return str(int(v)) if v == int(v) else f"{v:.2f}"
+
+    chart = Table(show_header=False, box=box.SIMPLE, expand=False, pad_edge=False)
+    chart.add_column("Label", style="cyan", overflow="fold", no_wrap=True)
+    chart.add_column("Bar", no_wrap=True)
+    chart.add_column("Value", justify="right", no_wrap=True)
+    for label, value in zip(labels, nums):
+        chart.add_row(label, _bar(value / scale, width), _fmt(value))
+    _emit(chart)
