@@ -1,3 +1,11 @@
+"""Playlist match scoring (local embeddings, Spotify audio features, web).
+
+SECURITY NOTE: the ``WEB_SCORE_*`` (and ``WEB_SEARCH_*``) environment variables
+specify shell-style command lines that the web-scoring provider tokenizes and
+executes as local subprocesses. They run arbitrary local commands with the
+privileges of the current user. Only set them to trusted values.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,12 +13,13 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
-from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -18,10 +27,16 @@ from models import Song
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on chained fallback retries for a single web-scoring command run,
+# guarding against an unexpected retry loop while leaving the known codex
+# fallbacks room to run.
+_MAX_RUN_DEPTH = 4
+
 
 @dataclass
-class ScoreConfig:
+class PlaylistScoreConfig:
     """Configuration for match scoring."""
+
     strategy: str = "local"  # local | web | hybrid
     query: Optional[str] = None
     seed_generations: int = 3
@@ -45,7 +60,9 @@ class ScoreProvider:
 
     name: str = "provider"
 
-    def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
+    def score_candidates(
+        self, candidates: Sequence[Song], profile: PlaylistProfile
+    ) -> Dict[str, float]:
         raise NotImplementedError
 
 
@@ -101,7 +118,9 @@ class LocalEmbeddingProvider(ScoreProvider):
         profile.embedding = np.mean(np.vstack(vectors), axis=0)
         return profile.embedding
 
-    def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
+    def score_candidates(
+        self, candidates: Sequence[Song], profile: PlaylistProfile
+    ) -> Dict[str, float]:
         profile_vec = self._profile_embedding(profile)
         if profile_vec is None:
             return {}
@@ -175,7 +194,7 @@ class SpotifyAudioFeaturesProvider(ScoreProvider):
         results: Dict[str, np.ndarray] = {}
         batch_size = 100
         for i in range(0, len(uris), batch_size):
-            batch = uris[i:i + batch_size]
+            batch = uris[i : i + batch_size]
             try:
                 features_list = self.spotify.sp.audio_features(batch)
             except Exception as exc:
@@ -212,7 +231,9 @@ class SpotifyAudioFeaturesProvider(ScoreProvider):
         profile.audio_vector = np.mean(np.vstack(vectors), axis=0)
         return profile.audio_vector
 
-    def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
+    def score_candidates(
+        self, candidates: Sequence[Song], profile: PlaylistProfile
+    ) -> Dict[str, float]:
         profile_vec = self._profile_vector(profile)
         if profile_vec is None:
             return {}
@@ -243,7 +264,9 @@ class SpotifyAudioFeaturesProvider(ScoreProvider):
 class WebSearchScoreProvider(ScoreProvider):
     name = "web"
 
-    def __init__(self, commands: Dict[str, str], timeout_sec: int = 60, max_candidates: Optional[int] = None):
+    def __init__(
+        self, commands: Dict[str, str], timeout_sec: int = 60, max_candidates: Optional[int] = None
+    ):
         self.commands = commands
         self.timeout_sec = timeout_sec
         self.max_candidates = max_candidates
@@ -258,8 +281,7 @@ class WebSearchScoreProvider(ScoreProvider):
                 for song in profile.seed_songs
             ],
             "candidates": [
-                {"id": song.id, "name": song.name, "artist": song.artist}
-                for song in candidates
+                {"id": song.id, "name": song.name, "artist": song.artist} for song in candidates
             ],
             "requested_at": datetime.utcnow().isoformat() + "Z",
             "instructions": (
@@ -269,16 +291,51 @@ class WebSearchScoreProvider(ScoreProvider):
         }
 
     def _run_command(self, label: str, command: str, payload: dict) -> Dict[str, float]:
+        """Public entry: tokenize the command string ONCE, then delegate.
+
+        The argv list is threaded through recursive retries rather than being
+        re-joined and re-split each time (which previously corrupted multi-word
+        arguments such as ``--output-schema``).
+        """
+
         try:
-            args = shlex.split(command)
+            argv = shlex.split(command)
         except ValueError as exc:
             logger.warning("Invalid command for %s: %s", label, exc)
             return {}
+        return self._run_command_argv(label, argv, payload)
 
+    def _run_command_argv(
+        self, label: str, argv: List[str], payload: dict, _depth: int = 0
+    ) -> Dict[str, float]:
+        if not argv:
+            logger.warning("Empty web scoring command for %s.", label)
+            return {}
+
+        if _depth > _MAX_RUN_DEPTH:
+            logger.warning(
+                "Web scoring command for %s exceeded max retry depth (%s); giving up.",
+                label,
+                _MAX_RUN_DEPTH,
+            )
+            return {}
+
+        args = list(argv)
         input_text = json.dumps(payload)
         is_codex_cli = label == "codex" and self._is_codex_cli(args)
         if is_codex_cli:
             args, input_text = self._prepare_codex_command(args, payload)
+
+        # Validate the executable resolves before running it (the WEB_SCORE_*
+        # env vars run arbitrary local commands; see module note).
+        if shutil.which(args[0]) is None:
+            logger.error(
+                "Web scoring command for %s is not runnable: executable %r not found on PATH.",
+                label,
+                args[0],
+            )
+            return {}
+        logger.debug("Running web scoring command for %s: %r", label, args)
 
         try:
             result = subprocess.run(
@@ -298,23 +355,29 @@ class WebSearchScoreProvider(ScoreProvider):
                 logger.warning("%s stderr: %s", label, result.stderr.strip())
                 if is_codex_cli and self._stderr_needs_tty(result.stderr):
                     logger.info("Retrying %s with codex exec (non-interactive)", label)
-                    return self._run_command(label, "codex exec -", payload)
+                    return self._run_command_argv(
+                        label, ["codex", "exec", "-"], payload, _depth + 1
+                    )
                 if is_codex_cli and self._stderr_unknown_argument(result.stderr):
                     flag = self._stderr_unknown_argument_flag(result.stderr)
                     if flag:
                         logger.info("Retrying %s without unsupported flag %s", label, flag)
                         if flag == "--search" and os.getenv("OPENAI_API_KEY"):
-                            wrapper_cmd = _default_openai_web_score_command()
-                            if wrapper_cmd != command:
+                            wrapper_argv = shlex.split(_default_openai_web_score_command())
+                            if wrapper_argv != args:
                                 logger.info(
                                     "Codex CLI does not support --search; falling back to OpenAI web scoring wrapper."
                                 )
-                                return self._run_command(label, wrapper_cmd, payload)
-                        stripped = self._strip_flag(args, flag, takes_value=(flag == "--output-schema"))
-                        return self._run_command(label, " ".join(stripped), payload)
+                                return self._run_command_argv(
+                                    label, wrapper_argv, payload, _depth + 1
+                                )
+                        stripped = self._strip_flag(
+                            args, flag, takes_value=(flag == "--output-schema")
+                        )
+                        return self._run_command_argv(label, stripped, payload, _depth + 1)
                     logger.info("Retrying %s without unsupported codex flags", label)
                     stripped = self._strip_flag(args, "--search", takes_value=False)
-                    return self._run_command(label, " ".join(stripped), payload)
+                    return self._run_command_argv(label, stripped, payload, _depth + 1)
             return {}
 
         try:
@@ -389,7 +452,9 @@ class WebSearchScoreProvider(ScoreProvider):
             cleaned.append(arg)
         return cleaned
 
-    def score_candidates(self, candidates: Sequence[Song], profile: PlaylistProfile) -> Dict[str, float]:
+    def score_candidates(
+        self, candidates: Sequence[Song], profile: PlaylistProfile
+    ) -> Dict[str, float]:
         if not self.commands:
             return {}
 
@@ -422,7 +487,9 @@ def _default_openai_web_score_command() -> str:
 
 
 class ScorePipeline:
-    def __init__(self, providers: Sequence[ScoreProvider], weights: Optional[Dict[str, float]] = None):
+    def __init__(
+        self, providers: Sequence[ScoreProvider], weights: Optional[Dict[str, float]] = None
+    ):
         self.providers = list(providers)
         self.weights = weights or {}
 
@@ -463,7 +530,7 @@ class ScorePipeline:
 
 
 class MatchScorer:
-    def __init__(self, playlist_name: str, db, spotify, history, config: ScoreConfig):
+    def __init__(self, playlist_name: str, db, spotify, history, config: PlaylistScoreConfig):
         self.playlist_name = playlist_name
         self.db = db
         self.spotify = spotify
@@ -475,7 +542,7 @@ class MatchScorer:
             return []
         seeds: List[Song] = []
         seen = set()
-        generations = self.history.generations[-max(1, self.config.seed_generations):]
+        generations = self.history.generations[-max(1, self.config.seed_generations) :]
         for generation in generations:
             for song_id in generation:
                 if song_id in seen:
@@ -542,22 +609,26 @@ class MatchScorer:
                 logger.info("Spotify audio features unavailable; skipping audio scoring.")
             commands = self._web_commands()
             if commands:
-                providers.append(WebSearchScoreProvider(
-                    commands,
-                    timeout_sec=self.config.web_timeout_sec,
-                    max_candidates=self.config.web_max_candidates
-                ))
+                providers.append(
+                    WebSearchScoreProvider(
+                        commands,
+                        timeout_sec=self.config.web_timeout_sec,
+                        max_candidates=self.config.web_max_candidates,
+                    )
+                )
             else:
                 logger.info("No web scoring command configured; skipping web scoring.")
 
         if strategy == "web":
             commands = self._web_commands()
             if commands:
-                providers.append(WebSearchScoreProvider(
-                    commands,
-                    timeout_sec=self.config.web_timeout_sec,
-                    max_candidates=self.config.web_max_candidates
-                ))
+                providers.append(
+                    WebSearchScoreProvider(
+                        commands,
+                        timeout_sec=self.config.web_timeout_sec,
+                        max_candidates=self.config.web_max_candidates,
+                    )
+                )
             else:
                 logger.info("No web scoring command configured; skipping web scoring.")
 

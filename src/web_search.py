@@ -1,19 +1,30 @@
+"""Web-search provider orchestration.
+
+SECURITY NOTE: the ``WEB_SEARCH_*`` / ``WEB_SCORE_*`` / ``WEB_SEARCH_CMD`` (and
+``WEB_SCORE_CMD``) environment variables specify shell-style command lines that
+this module tokenizes and executes as local subprocesses. They run arbitrary
+local commands with the privileges of the current user. Only set them to
+trusted values; never populate them from untrusted input.
+"""
+
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
-import importlib.util
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+from llm_json import parse_json_output as _parse_json_output
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +53,17 @@ KNOWN_METRICS = {
     "liveness": ["live", "liveness"],
     "popularity": ["popularity", "mainstream", "underground", "obscure"],
     "monthly_listeners": ["monthly listeners", "monthly listener", "listeners"],
-    "release_year": ["year", "release year", "released", "era", "decade", "90s", "80s", "00s", "2010s"],
+    "release_year": [
+        "year",
+        "release year",
+        "released",
+        "era",
+        "decade",
+        "90s",
+        "80s",
+        "00s",
+        "2010s",
+    ],
     "language": ["language", "spanish", "french", "german", "italian", "portuguese"],
     "region": ["region", "scene", "uk", "us", "japan", "korea", "brazil"],
     "mood": ["mood", "vibe", "atmospheric", "chill", "dark", "bright"],
@@ -128,7 +149,12 @@ def extract_constraints(query: str) -> dict:
         if value:
             constraints["min_monthly_listeners"] = value
 
-    if "similar" in lowered or "like " in lowered or "in the style" in lowered or "in the vein" in lowered:
+    if (
+        "similar" in lowered
+        or "like " in lowered
+        or "in the style" in lowered
+        or "in the vein" in lowered
+    ):
         constraints["similarity_requested"] = True
 
     return constraints
@@ -242,7 +268,7 @@ def build_search_payload(
                                 "value": "string or list",
                                 "sources": ["url"],
                                 "confidence": "float 0-1",
-                                "strict": "bool (true if sourced)"
+                                "strict": "bool (true if sourced)",
                             }
                         ],
                         "moods": ["string"],
@@ -252,12 +278,19 @@ def build_search_payload(
                         "era": ["string"],
                         "themes": ["string"],
                         "sources": ["url"],
-                        "confidence": "float 0-1"
+                        "confidence": "float 0-1",
                     },
                 }
             ]
         },
     }
+
+
+# Hard cap on the number of fallback retries a single _run_command invocation
+# may chain through. The known fallback paths (codex->wrapper, --json strip,
+# wrapper->CLI, fallback-model) are at most a couple deep; this bound guards
+# against an unexpected loop while leaving real fallbacks room to run.
+_MAX_RUN_DEPTH = 4
 
 
 def _run_command(
@@ -268,16 +301,66 @@ def _run_command(
     env_overrides: Optional[dict] = None,
     allow_claude_cli_fallback: bool = True,
 ) -> Tuple[List[dict], str]:
+    """Public entry point: tokenize the command string ONCE, then delegate.
+
+    The command line is shlex-split here a single time; the resulting argv list
+    is threaded through every recursive retry without being re-joined and
+    re-split (which previously corrupted the multi-word ``--output-schema``
+    argument).
+    """
+
     try:
-        args = shlex.split(command)
+        argv = shlex.split(command)
     except ValueError as exc:
         logger.warning("Invalid search command for %s: %s", label, exc)
         return [], ""
+    return _run_command_argv(
+        label,
+        argv,
+        payload,
+        timeout_sec,
+        env_overrides=env_overrides,
+        allow_claude_cli_fallback=allow_claude_cli_fallback,
+    )
 
+
+def _run_command_argv(
+    label: str,
+    argv: List[str],
+    payload: dict,
+    timeout_sec: int,
+    env_overrides: Optional[dict] = None,
+    allow_claude_cli_fallback: bool = True,
+    _depth: int = 0,
+) -> Tuple[List[dict], str]:
+    if not argv:
+        logger.warning("Empty search command for %s.", label)
+        return [], ""
+
+    if _depth > _MAX_RUN_DEPTH:
+        logger.warning(
+            "Search command for %s exceeded max retry depth (%s); giving up.",
+            label,
+            _MAX_RUN_DEPTH,
+        )
+        return [], ""
+
+    args = list(argv)
     input_text = json.dumps(payload)
     is_codex_cli = label == "codex" and _is_codex_cli(args)
     if is_codex_cli:
         args, input_text = _prepare_codex_command(args, payload)
+
+    # Validate the executable resolves before attempting to run it. shutil.which
+    # handles both bare names (PATH lookup) and absolute/relative paths.
+    if shutil.which(args[0]) is None:
+        logger.error(
+            "Search command for %s is not runnable: executable %r not found on PATH.",
+            label,
+            args[0],
+        )
+        return [], ""
+    logger.debug("Running search command for %s: %r", label, args)
 
     env = os.environ.copy()
     if env_overrides:
@@ -295,14 +378,16 @@ def _run_command(
     except subprocess.TimeoutExpired:
         logger.warning("Search command for %s timed out after %ss.", label, timeout_sec)
         fallback_model = env.get("WEB_SEARCH_FALLBACK_MODEL", "").strip()
-        if fallback_model and _is_openai_wrapper_command(command) and not env_overrides:
+        if fallback_model and _is_openai_wrapper_argv(args) and not env_overrides:
             logger.info("Retrying %s with fallback model %s.", label, fallback_model)
-            return _run_command(
+            return _run_command_argv(
                 label,
-                command,
+                args,
                 payload,
                 timeout_sec,
                 env_overrides={"WEB_SEARCH_MODEL": fallback_model},
+                allow_claude_cli_fallback=allow_claude_cli_fallback,
+                _depth=_depth + 1,
             )
         return [], ""
     except Exception as exc:
@@ -317,78 +402,93 @@ def _run_command(
             if "--json" in args and _stderr_has_unknown_json(result.stderr):
                 logger.info("Retrying %s without --json flag", label)
                 args = [arg for arg in args if arg != "--json"]
-                return _run_command(
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
             if is_codex_cli and _stderr_needs_tty(result.stderr):
                 logger.info("Retrying %s with codex exec (non-interactive)", label)
-                args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
-                return _run_command(
+                retry_args, _ = _prepare_codex_command(["codex", "exec", "-"], payload)
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    retry_args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
             if is_codex_cli and _stderr_unknown_argument(result.stderr):
                 flag = _stderr_unknown_argument_flag(result.stderr)
                 if flag:
                     logger.info("Retrying %s without unsupported flag %s", label, flag)
                     if flag == "--search" and os.getenv("OPENAI_API_KEY"):
-                        wrapper_cmd = _default_openai_web_search_command()
-                        if wrapper_cmd != command:
+                        wrapper_argv = shlex.split(_default_openai_web_search_command())
+                        if wrapper_argv != args:
                             logger.info(
                                 "Codex CLI does not support --search; falling back to OpenAI web search wrapper."
                             )
-                            return _run_command(
+                            return _run_command_argv(
                                 label,
-                                wrapper_cmd,
+                                wrapper_argv,
                                 payload,
                                 timeout_sec,
                                 env_overrides=env_overrides,
                                 allow_claude_cli_fallback=allow_claude_cli_fallback,
+                                _depth=_depth + 1,
                             )
                     args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
                     if flag == "--search":
-                        logger.warning("Codex CLI does not support --search; running without web search.")
-                    return _run_command(
+                        logger.warning(
+                            "Codex CLI does not support --search; running without web search."
+                        )
+                    return _run_command_argv(
                         label,
-                        " ".join(args),
+                        args,
                         payload,
                         timeout_sec,
                         env_overrides=env_overrides,
                         allow_claude_cli_fallback=allow_claude_cli_fallback,
+                        _depth=_depth + 1,
                     )
                 logger.info("Retrying %s without unsupported codex flags", label)
                 args = _strip_flag(args, "--search", takes_value=False)
                 args = _strip_flag(args, "--output-schema", takes_value=True)
-                return _run_command(
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
         return [], ""
 
     output = _parse_json_output(result.stdout)
     if output is None:
         logger.warning("Search command for %s returned invalid JSON.", label)
-        if label == "claude" and _should_retry_claude_with_wrapper(command):
-            wrapper_cmd = _default_anthropic_web_search_command()
-            if wrapper_cmd != command:
+        if label == "claude" and _should_retry_claude_with_wrapper_argv(args):
+            wrapper_argv = shlex.split(_default_anthropic_web_search_command())
+            if wrapper_argv != args:
                 logger.info("Retrying %s via Anthropic web search wrapper.", label)
-                return _run_command(label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides)
+                return _run_command_argv(
+                    label,
+                    wrapper_argv,
+                    payload,
+                    timeout_sec,
+                    env_overrides=env_overrides,
+                    allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
+                )
         if label == "claude" and not _module_available("anthropic"):
             logger.info(
-                "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m src.anthropic_web_search_wrapper' "
+                "Tip: set WEB_SEARCH_CLAUDE_CMD to 'python -m anthropic_web_search_wrapper' "
                 "or install the anthropic package for structured JSON output."
             )
         return [], ""
@@ -397,22 +497,25 @@ def _run_command(
     if (
         label == "claude"
         and allow_claude_cli_fallback
-        and _is_anthropic_wrapper_command(command)
+        and _is_anthropic_wrapper_argv(args)
         and not results
         and _command_exists("claude")
         and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=True)
     ):
         if summary:
-            logger.info("Claude wrapper returned no results (summary only); retrying with claude CLI.")
+            logger.info(
+                "Claude wrapper returned no results (summary only); retrying with claude CLI."
+            )
         else:
             logger.info("Claude wrapper returned empty output; retrying with claude CLI.")
-        return _run_command(
+        return _run_command_argv(
             label,
-            "claude --json",
+            ["claude", "--json"],
             payload,
             timeout_sec,
             env_overrides=env_overrides,
             allow_claude_cli_fallback=False,
+            _depth=_depth + 1,
         )
     return results, summary
 
@@ -442,6 +545,14 @@ def _is_anthropic_wrapper_command(command: str) -> bool:
     return "anthropic_web_search_wrapper" in lowered
 
 
+def _is_openai_wrapper_argv(argv: List[str]) -> bool:
+    return any("openai_web_search_wrapper" in arg.lower() for arg in argv)
+
+
+def _is_anthropic_wrapper_argv(argv: List[str]) -> bool:
+    return any("anthropic_web_search_wrapper" in arg.lower() for arg in argv)
+
+
 def _should_retry_claude_with_wrapper(command: str) -> bool:
     lowered = command.lower()
     if "anthropic_web_search_wrapper" in lowered:
@@ -451,9 +562,17 @@ def _should_retry_claude_with_wrapper(command: str) -> bool:
     return _module_available("anthropic")
 
 
+def _should_retry_claude_with_wrapper_argv(argv: List[str]) -> bool:
+    if _is_anthropic_wrapper_argv(argv):
+        return False
+    if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
+        return False
+    return _module_available("anthropic")
+
+
 def _default_codex_command() -> str:
     schema = _codex_schema()
-    return f'codex exec --search --output-schema {schema} -'
+    return f"codex exec --search --output-schema {schema} -"
 
 
 def _default_openai_web_search_command() -> str:
@@ -467,9 +586,7 @@ def _default_anthropic_web_search_command() -> str:
 
 
 def _codex_schema() -> str:
-    return (
-        '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]},"spotify_url":{"type":["string","null"]},"spotify_uri":{"type":["string","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
-    )
+    return '{"type":"object","properties":{"summary":{"type":"string"},"results":{"type":"array","items":{"type":"object","properties":{"song":{"type":"string"},"artist":{"type":"string"},"year":{"type":["string","number"]},"why":{"type":"string"},"sources":{"type":"array","items":{"type":"string"}},"metrics":{"type":"object"},"score":{"type":["number","null"]},"spotify_url":{"type":["string","null"]},"spotify_uri":{"type":["string","null"]}},"required":["song","artist","sources","metrics"]}}},"required":["summary","results"]}'
 
 
 def _module_available(name: str) -> bool:
@@ -487,17 +604,10 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-
-
 def _build_prompt_from_payload(payload: dict) -> str:
     instructions = payload.get("instructions") or DEFAULT_INSTRUCTIONS
     filtered = {key: value for key, value in payload.items() if key != "instructions"}
-    return (
-        f"{instructions}\n\n"
-        "Input JSON:\n"
-        f"{json.dumps(filtered, indent=2)}\n\n"
-        "Return JSON only."
-    )
+    return f"{instructions}\n\nInput JSON:\n{json.dumps(filtered, indent=2)}\n\nReturn JSON only."
 
 
 def _stderr_has_unknown_json(stderr: str) -> bool:
@@ -520,74 +630,6 @@ def _stderr_unknown_argument_flag(stderr: str) -> Optional[str]:
     if match:
         return match.group(1)
     return None
-
-
-def _parse_json_output(text: str) -> Optional[object]:
-    if text:
-        candidate = text.strip()
-        if candidate.startswith("```json"):
-            candidate = candidate[len("```json") :]
-        if candidate.startswith("```"):
-            candidate = candidate[len("```") :]
-        if candidate.endswith("```"):
-            candidate = candidate[: -3]
-        candidate = candidate.strip()
-        if candidate.startswith("{") and candidate.endswith("}"):
-            parsed = _try_parse_json(candidate)
-            if parsed is not None:
-                return parsed
-        if candidate.startswith("[") and candidate.endswith("]"):
-            parsed = _try_parse_json(candidate)
-            if parsed is not None:
-                return parsed
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    fenced = re.search(r"```json\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
-    if fenced:
-        candidate = fenced.group(1).strip()
-        parsed = _try_parse_json(candidate)
-        if parsed is not None:
-            return parsed
-
-    fenced = re.search(r"```\s*([\s\S]*?)```", text)
-    if fenced:
-        candidate = fenced.group(1).strip()
-        parsed = _try_parse_json(candidate)
-        if parsed is not None:
-            return parsed
-
-    brace_match = _extract_json_block(text, "{", "}")
-    if brace_match:
-        parsed = _try_parse_json(brace_match)
-        if parsed is not None:
-            return parsed
-
-    bracket_match = _extract_json_block(text, "[", "]")
-    if bracket_match:
-        parsed = _try_parse_json(bracket_match)
-        if parsed is not None:
-            return parsed
-
-    return None
-
-
-def _try_parse_json(candidate: str) -> Optional[object]:
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-
-def _extract_json_block(text: str, open_char: str, close_char: str) -> Optional[str]:
-    start = text.find(open_char)
-    end = text.rfind(close_char)
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1].strip()
 
 
 def _extract_text_from_response(output: object) -> Optional[str]:
@@ -655,7 +697,9 @@ def _extract_output(output: object) -> Tuple[List[dict], str]:
     results: Iterable = []
     summary = ""
     if isinstance(output, dict):
-        summary = str(output.get("summary") or output.get("overview") or output.get("rationale") or "")
+        summary = str(
+            output.get("summary") or output.get("overview") or output.get("rationale") or ""
+        )
         results = (
             output.get("results")
             or output.get("songs")
@@ -742,12 +786,19 @@ def _normalize_item(item: object) -> Optional[dict]:
     normalized_sources: List[str] = []
     for source in sources:
         if isinstance(source, dict):
-            url = source.get("url") or source.get("link") or source.get("source") or source.get("href")
+            url = (
+                source.get("url")
+                or source.get("link")
+                or source.get("source")
+                or source.get("href")
+            )
             if url:
                 normalized_sources.append(str(url))
                 detail = {"url": str(url)}
                 title = source.get("title") or source.get("name")
-                snippet = source.get("snippet") or source.get("summary") or source.get("description")
+                snippet = (
+                    source.get("snippet") or source.get("summary") or source.get("description")
+                )
                 if title:
                     detail["title"] = str(title)
                 if snippet:
@@ -786,7 +837,11 @@ def _normalize_item(item: object) -> Optional[dict]:
         "song": str(song),
         "artist": str(artist),
         "year": item.get("year") or item.get("release_year") or item.get("released") or "",
-        "why": item.get("why") or item.get("reason") or item.get("rationale") or item.get("notes") or "",
+        "why": item.get("why")
+        or item.get("reason")
+        or item.get("rationale")
+        or item.get("notes")
+        or "",
         "sources": normalized_sources,
         "source_details": source_details,
         "metrics": metrics,
@@ -878,17 +933,29 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
                 if not existing:
                     combined[key]["context"] = context
                 else:
-                    if isinstance(existing.get("fields"), list) and isinstance(context.get("fields"), list):
+                    if isinstance(existing.get("fields"), list) and isinstance(
+                        context.get("fields"), list
+                    ):
                         existing_fields = existing.get("fields") or []
                         existing_fields.extend(context.get("fields") or [])
                         existing["fields"] = existing_fields
-                    for key_name in ("moods", "genres", "instrumentation", "comparisons", "era", "themes", "sources"):
+                    for key_name in (
+                        "moods",
+                        "genres",
+                        "instrumentation",
+                        "comparisons",
+                        "era",
+                        "themes",
+                        "sources",
+                    ):
                         if context.get(key_name):
                             existing.setdefault(key_name, [])
-                            existing[key_name] = list({
-                                *existing.get(key_name, []),
-                                *context.get(key_name, []),
-                            })
+                            existing[key_name] = list(
+                                {
+                                    *existing.get(key_name, []),
+                                    *context.get(key_name, []),
+                                }
+                            )
                     if context.get("confidence") and not existing.get("confidence"):
                         existing["confidence"] = context.get("confidence")
                     combined[key]["context"] = existing
@@ -916,7 +983,9 @@ def synthesize_results(provider_results: Dict[str, List[dict]], limit: int) -> L
             }
         )
 
-    results.sort(key=lambda item: (item["_rank"][0], item["_rank"][1], item["_rank"][2]), reverse=True)
+    results.sort(
+        key=lambda item: (item["_rank"][0], item["_rank"][1], item["_rank"][2]), reverse=True
+    )
     trimmed = results[:limit] if limit else results
     for item in trimmed:
         item.pop("_rank", None)
@@ -933,7 +1002,16 @@ def run_deep_search(
     commands = detect_search_commands()
     selected = select_commands(commands, provider)
     if not selected:
-        return [], {}, [], "No search providers configured.", [], "", {}, build_source_policy(expanded)
+        return (
+            [],
+            {},
+            [],
+            "No search providers configured.",
+            [],
+            "",
+            {},
+            build_source_policy(expanded),
+        )
 
     env_timeout = os.getenv("WEB_SEARCH_TIMEOUT_SEC")
     if env_timeout:
@@ -1015,16 +1093,36 @@ def run_deep_search(
 
     filtered_results = {label: results for label, results in provider_results.items() if results}
     if not filtered_results:
-        return [], {}, [], "No results returned by providers.", requested_metrics, "", constraints, build_source_policy(expanded)
+        return (
+            [],
+            {},
+            [],
+            "No results returned by providers.",
+            requested_metrics,
+            "",
+            constraints,
+            build_source_policy(expanded),
+        )
 
     logger.info("Synthesizing results across providers...")
     combined = synthesize_results(filtered_results, resolved_limit)
     total_elapsed = time.monotonic() - started_at
     logger.info("Deep search complete (%s results, %.1fs).", len(combined), total_elapsed)
     providers = list(filtered_results.keys())
-    filtered_summaries = {label: summary for label, summary in provider_summaries.items() if label in filtered_results}
+    filtered_summaries = {
+        label: summary for label, summary in provider_summaries.items() if label in filtered_results
+    }
     summary = synthesize_summary(filtered_summaries, query)
-    return combined, filtered_results, providers, None, requested_metrics, summary, constraints, build_source_policy(expanded)
+    return (
+        combined,
+        filtered_results,
+        providers,
+        None,
+        requested_metrics,
+        summary,
+        constraints,
+        build_source_policy(expanded),
+    )
 
 
 def synthesize_summary(provider_summaries: Dict[str, str], query: str) -> str:

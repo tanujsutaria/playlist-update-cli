@@ -63,16 +63,18 @@ def build_context_card(
     else:
         strict_ratio = 0.0
 
-    fields_json = json.dumps([
-        {
-            "field": field.name,
-            "value": field.value,
-            "strict": field.strict,
-            "confidence": field.confidence,
-            "sources": field.sources,
-        }
-        for field in extracted.fields
-    ])
+    fields_json = json.dumps(
+        [
+            {
+                "field": field.name,
+                "value": field.value,
+                "strict": field.strict,
+                "confidence": field.confidence,
+                "sources": field.sources,
+            }
+            for field in extracted.fields
+        ]
+    )
 
     return ContextCard(
         context_text=context_text,

@@ -1,6 +1,6 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import main
 
@@ -68,7 +68,9 @@ class TestListBackups:
         table_calls = []
         monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
         monkeypatch.setattr(main, "section", lambda *a, **kw: None)
-        monkeypatch.setattr(main, "table", lambda headers, rows: table_calls.append((headers, rows)))
+        monkeypatch.setattr(
+            main, "table", lambda headers, rows: table_calls.append((headers, rows))
+        )
 
         backups_dir = tmp_path / "backups"
         backups_dir.mkdir()
@@ -111,7 +113,9 @@ class TestListBackups:
         table_calls = []
         monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
         monkeypatch.setattr(main, "section", lambda *a, **kw: None)
-        monkeypatch.setattr(main, "table", lambda headers, rows: table_calls.append((headers, rows)))
+        monkeypatch.setattr(
+            main, "table", lambda headers, rows: table_calls.append((headers, rows))
+        )
 
         backups_dir = tmp_path / "backups"
         backups_dir.mkdir()
@@ -153,7 +157,9 @@ class TestListBackupsIntegration:
         section_calls = []
         monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
         monkeypatch.setattr(main, "section", lambda *a, **kw: section_calls.append(a))
-        monkeypatch.setattr(main, "table", lambda headers, rows: table_calls.append((headers, rows)))
+        monkeypatch.setattr(
+            main, "table", lambda headers, rows: table_calls.append((headers, rows))
+        )
 
         # Create backups directory with test data
         backups_dir = tmp_path / "backups"

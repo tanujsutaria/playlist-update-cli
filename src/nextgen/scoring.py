@@ -7,7 +7,7 @@ import numpy as np
 
 
 @dataclass
-class ScoreConfig:
+class SearchScoreConfig:
     strict_weight: float = 0.4
     base_weight: float = 0.6
     source_weight: float = 0.05
@@ -37,7 +37,9 @@ def _parse_year(value: object) -> Optional[int]:
     return None
 
 
-def _year_similarity(track_year: Optional[int], target_year: Optional[int], tolerance: int) -> float:
+def _year_similarity(
+    track_year: Optional[int], target_year: Optional[int], tolerance: int
+) -> float:
     if not track_year or not target_year or tolerance <= 0:
         return 0.0
     diff = abs(track_year - target_year)
@@ -50,7 +52,7 @@ def score_candidates(
     query_vec: List[float],
     track_vecs: Iterable[List[float]],
     strict_ratios: Iterable[float],
-    config: ScoreConfig,
+    config: SearchScoreConfig,
     metadata: Optional[List[Dict[str, Any]]] = None,
 ) -> List[float]:
     matrix = np.array(list(track_vecs), dtype=float)

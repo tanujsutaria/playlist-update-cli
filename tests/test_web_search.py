@@ -2,12 +2,12 @@ import os
 import shutil
 
 from web_search import (
-    detect_search_commands,
-    synthesize_results,
-    extract_constraints,
-    extract_requested_metrics,
     _extract_output,
     _run_command,
+    detect_search_commands,
+    extract_constraints,
+    extract_requested_metrics,
+    synthesize_results,
 )
 
 
@@ -26,12 +26,27 @@ def test_detect_search_commands_prefers_explicit(monkeypatch):
 def test_synthesize_results_merges_providers():
     provider_results = {
         "claude": [
-            {"song": "Track A", "artist": "Artist 1", "why": "fits mood", "sources": ["https://example.com/a"]},
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "why": "fits mood",
+                "sources": ["https://example.com/a"],
+            },
             {"song": "Track B", "artist": "Artist 2", "why": "similar tempo", "sources": []},
         ],
         "codex": [
-            {"song": "Track A", "artist": "Artist 1", "why": "matches theme", "sources": ["https://example.com/b"]},
-            {"song": "Track C", "artist": "Artist 3", "why": "recommended by critics", "sources": []},
+            {
+                "song": "Track A",
+                "artist": "Artist 1",
+                "why": "matches theme",
+                "sources": ["https://example.com/b"],
+            },
+            {
+                "song": "Track C",
+                "artist": "Artist 3",
+                "why": "recommended by critics",
+                "sources": [],
+            },
         ],
     }
 
@@ -133,7 +148,11 @@ def test_normalize_item_with_source_details():
                     "song": "Track A",
                     "artist": "Artist 1",
                     "sources": [
-                        {"url": "https://example.com/a", "title": "Source A", "snippet": "Snippet A"}
+                        {
+                            "url": "https://example.com/a",
+                            "title": "Source A",
+                            "snippet": "Snippet A",
+                        }
                     ],
                     "metrics": {},
                 }
@@ -179,3 +198,52 @@ def test_claude_wrapper_fallbacks_to_cli(monkeypatch):
 
     assert summary == "ok"
     assert len(results) == 1
+
+
+def test_run_command_nonexistent_executable_fails_gracefully(monkeypatch):
+    # A command whose executable does not resolve must fail gracefully (return
+    # the empty result, not raise) and must never spawn a subprocess.
+    def fail_run(*args, **kwargs):
+        raise AssertionError("subprocess.run should not be called for a missing executable")
+
+    monkeypatch.setattr("web_search.subprocess.run", fail_run)
+
+    results, summary = _run_command(
+        "web",
+        "definitely-not-a-real-binary-xyz --json",
+        {"query": "x"},
+        10,
+    )
+
+    assert results == []
+    assert summary == ""
+
+
+def test_run_command_retry_depth_is_bounded(monkeypatch):
+    # Force the codex "unexpected argument" retry condition on every call and
+    # confirm the recursion stops at the depth cap instead of looping forever.
+    # The reported flag is NOT present in argv, so _strip_flag is a no-op and
+    # the same argv recurses each time, exercising the depth guard.
+    from web_search import _MAX_RUN_DEPTH
+
+    calls = {"count": 0}
+
+    class DummyResult:
+        returncode = 1
+        stdout = ""
+        stderr = "error: unexpected argument '--bogus' found"
+
+    def fake_run(*args, **kwargs):
+        calls["count"] += 1
+        return DummyResult()
+
+    monkeypatch.setattr("web_search.subprocess.run", fake_run)
+    # Make the executable resolve so we reach subprocess.run on each attempt.
+    monkeypatch.setattr("web_search.shutil.which", lambda name: "/usr/bin/codex")
+
+    results, summary = _run_command("codex", "codex exec -", {"query": "x"}, 10)
+
+    assert results == []
+    assert summary == ""
+    # Initial call + at most _MAX_RUN_DEPTH retries before the guard trips.
+    assert calls["count"] <= _MAX_RUN_DEPTH + 1

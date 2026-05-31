@@ -258,14 +258,14 @@ class DatabaseManager:
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
         self.songs = self._load_songs()
-        
+
     def _load_songs(self) -> dict:
         songs_path = self.data_dir / "songs.pkl"
         if songs_path.exists():
             with open(songs_path, 'rb') as f:
                 return pickle.load(f)
         return {}
-        
+
     def add_song(self, song: Song) -> bool:
         if song.id in self.songs:
             return False
@@ -289,31 +289,31 @@ class FileSongRepository:
         self.storage_path = storage_path
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self._songs = self._load()
-        
+
     def _load(self) -> Dict[str, Song]:
         songs_path = self.storage_path / "songs.pkl"
         if songs_path.exists():
             with open(songs_path, 'rb') as f:
                 return pickle.load(f)
         return {}
-        
+
     def _save(self) -> None:
         with open(self.storage_path / "songs.pkl", 'wb') as f:
             pickle.dump(self._songs, f)
-            
+
     def get_all(self) -> List[Song]:
         return list(self._songs.values())
-        
+
     def get_by_id(self, song_id: str) -> Optional[Song]:
         return self._songs.get(song_id)
-        
+
     def add(self, song: Song) -> bool:
         if song.id in self._songs:
             return False
         self._songs[song.id] = song
         self._save()
         return True
-        
+
     def remove(self, song_id: str) -> bool:
         if song_id not in self._songs:
             return False
@@ -329,7 +329,7 @@ class FileSongRepository:
 def main():
     cli = PlaylistCLI()
     command, args = parse_args()
-    
+
     if command == 'update':
         cli.update_playlist(args.playlist, args.count, args.fresh_days)
 
@@ -351,14 +351,14 @@ def update(playlist, count, fresh_days):
     from playlist_update_cli.core.database import get_song_repository
     from playlist_update_cli.services.spotify import get_spotify_service
     from playlist_update_cli.core.rotation import get_rotation_manager
-    
+
     song_repo = get_song_repository()
     spotify_service = get_spotify_service()
     rotation_manager = get_rotation_manager(playlist, song_repo, spotify_service)
-    
+
     cmd = UpdateCommand(rotation_manager)
     result = cmd.execute(count=count, fresh_days=fresh_days)
-    
+
     if result.success:
         click.echo(click.style(f"Successfully updated playlist '{playlist}'", fg='green'))
         click.echo(f"Added {len(result.songs)} songs")
@@ -384,4 +384,4 @@ The migration to pyproject.toml will enable the use of modern tools like uv for 
 2. Set up the new project structure and dependency management
 3. Begin incremental refactoring of core components
 4. Implement comprehensive tests
-5. Document the new architecture and usage 
+5. Document the new architecture and usage

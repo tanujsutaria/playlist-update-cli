@@ -1,5 +1,11 @@
 # Spotify Playlist Manager - Design Document
 
+> **⚠️ Historical (pre-remediation) design doc.** Parts of this describe the
+> original pickle/numpy storage and module layout that have since been
+> consolidated onto a single SQLite store with a unified `src/` layout. For the
+> current architecture see `ARCHITECTURE.md` and `CLAUDE.md`; for what changed
+> see `docs/REMEDIATION_PLAN.md`.
+
 ## System Overview
 
 The Spotify Playlist Manager is a command-line tool that provides intelligent management of Spotify playlists. It enables users to import songs, update playlists with smart rotation algorithms, and perform various playlist management operations.

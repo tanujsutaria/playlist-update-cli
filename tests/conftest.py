@@ -2,23 +2,53 @@
 Shared pytest fixtures for all tests.
 Provides mocked managers and sample data to enable testing without Spotify credentials.
 """
+
+import hashlib
 import sys
-from pathlib import Path
+import types
 from datetime import datetime
+from pathlib import Path
+from typing import List
 from unittest.mock import MagicMock, patch
-from typing import List, Dict
 
 import numpy as np
 import pytest
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+# src/ is placed on sys.path via [tool.pytest.ini_options] pythonpath in
+# pyproject.toml, so bare imports (`from models import ...`) resolve to this
+# repo's modules and never a stray site-packages install.
 
-from models import Song, PlaylistHistory, RotationStats  # noqa: E402
+# Importing the real `sentence_transformers` takes ~17s and would download a
+# model on first use. No test needs the real encoder, so inject a deterministic,
+# dependency-free stub before any module lazily imports it.
+if "sentence_transformers" not in sys.modules:
+    _st_stub = types.ModuleType("sentence_transformers")
 
+    class _StubSentenceTransformer:
+        def __init__(self, model_name, *args, **kwargs):
+            self.model_name = model_name
+
+        def encode(self, texts, normalize_embeddings=False, **kwargs):
+            vectors = []
+            for text in texts:
+                digest = hashlib.sha256(str(text).encode("utf-8")).digest()
+                vec = np.frombuffer(digest[:8], dtype=np.uint8).astype(np.float64) / 255.0
+                if normalize_embeddings:
+                    norm = np.linalg.norm(vec)
+                    if norm:
+                        vec = vec / norm
+                vectors.append(vec)
+            return np.array(vectors)
+
+    _st_stub.SentenceTransformer = _StubSentenceTransformer
+    sys.modules["sentence_transformers"] = _st_stub
+
+from models import PlaylistHistory, RotationStats, Song  # noqa: E402
 
 # =============================================================================
 # Sample Data Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def sample_songs() -> List[Song]:
@@ -30,7 +60,7 @@ def sample_songs() -> List[Song]:
             artist="artist1",
             embedding=np.random.rand(384).tolist(),
             spotify_uri="spotify:track:abc123",
-            first_added=datetime(2024, 1, 1)
+            first_added=datetime(2024, 1, 1),
         ),
         Song(
             id="artist2|||song2",
@@ -38,7 +68,7 @@ def sample_songs() -> List[Song]:
             artist="artist2",
             embedding=np.random.rand(384).tolist(),
             spotify_uri="spotify:track:def456",
-            first_added=datetime(2024, 1, 2)
+            first_added=datetime(2024, 1, 2),
         ),
         Song(
             id="artist3|||song3",
@@ -46,7 +76,7 @@ def sample_songs() -> List[Song]:
             artist="artist3",
             embedding=np.random.rand(384).tolist(),
             spotify_uri="spotify:track:ghi789",
-            first_added=datetime(2024, 1, 3)
+            first_added=datetime(2024, 1, 3),
         ),
         Song(
             id="artist4|||song4",
@@ -54,7 +84,7 @@ def sample_songs() -> List[Song]:
             artist="artist4",
             embedding=np.random.rand(384).tolist(),
             spotify_uri="spotify:track:jkl012",
-            first_added=datetime(2024, 1, 4)
+            first_added=datetime(2024, 1, 4),
         ),
         Song(
             id="artist5|||song5",
@@ -62,7 +92,7 @@ def sample_songs() -> List[Song]:
             artist="artist5",
             embedding=np.random.rand(384).tolist(),
             spotify_uri="spotify:track:mno345",
-            first_added=datetime(2024, 1, 5)
+            first_added=datetime(2024, 1, 5),
         ),
     ]
 
@@ -76,7 +106,7 @@ def sample_song() -> Song:
         artist="testartist",
         embedding=np.random.rand(384).tolist(),
         spotify_uri="spotify:track:test123",
-        first_added=datetime(2024, 1, 1)
+        first_added=datetime(2024, 1, 1),
     )
 
 
@@ -91,7 +121,7 @@ def sample_playlist_history() -> PlaylistHistory:
             ["artist3|||song3", "artist4|||song4"],
             ["artist5|||song5", "artist1|||song1"],
         ],
-        current_generation=2
+        current_generation=2,
     )
 
 
@@ -104,7 +134,7 @@ def sample_rotation_stats() -> RotationStats:
         generations_count=10,
         songs_never_used=50,
         complete_rotation_achieved=False,
-        current_strategy="similarity-based"
+        current_strategy="similarity-based",
     )
 
 
@@ -112,62 +142,64 @@ def sample_rotation_stats() -> RotationStats:
 # Mock Spotify Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def mock_spotipy():
     """Create a mocked spotipy.Spotify client"""
     mock_sp = MagicMock()
 
     # Mock current_user
-    mock_sp.current_user.return_value = {'id': 'test_user_id'}
+    mock_sp.current_user.return_value = {"id": "test_user_id"}
 
     # Mock current_user_playlists
     mock_sp.current_user_playlists.return_value = {
-        'items': [
-            {'name': 'Test Playlist', 'id': 'playlist_123', 'owner': {'id': 'test_user_id'}},
-            {'name': 'Another Playlist', 'id': 'playlist_456', 'owner': {'id': 'test_user_id'}},
+        "items": [
+            {"name": "Test Playlist", "id": "playlist_123", "owner": {"id": "test_user_id"}},
+            {"name": "Another Playlist", "id": "playlist_456", "owner": {"id": "test_user_id"}},
         ]
     }
 
     # Mock search
-    def mock_search(query, type='track', limit=10):
+    def mock_search(query, type="track", limit=10):
         return {
-            'tracks': {
-                'items': [
+            "tracks": {
+                "items": [
                     {
-                        'name': 'Test Track',
-                        'uri': 'spotify:track:mock123',
-                        'artists': [{'id': 'artist_id', 'name': 'Test Artist'}]
+                        "name": "Test Track",
+                        "uri": "spotify:track:mock123",
+                        "artists": [{"id": "artist_id", "name": "Test Artist"}],
                     }
                 ]
             }
         }
+
     mock_sp.search.side_effect = mock_search
 
     # Mock playlist_tracks
     mock_sp.playlist_tracks.return_value = {
-        'items': [
+        "items": [
             {
-                'added_at': '2024-01-01T00:00:00Z',
-                'track': {
-                    'name': 'Track 1',
-                    'uri': 'spotify:track:track1',
-                    'artists': [{'name': 'Artist 1'}]
-                }
+                "added_at": "2024-01-01T00:00:00Z",
+                "track": {
+                    "name": "Track 1",
+                    "uri": "spotify:track:track1",
+                    "artists": [{"name": "Artist 1"}],
+                },
             },
             {
-                'added_at': '2024-01-02T00:00:00Z',
-                'track': {
-                    'name': 'Track 2',
-                    'uri': 'spotify:track:track2',
-                    'artists': [{'name': 'Artist 2'}]
-                }
-            }
+                "added_at": "2024-01-02T00:00:00Z",
+                "track": {
+                    "name": "Track 2",
+                    "uri": "spotify:track:track2",
+                    "artists": [{"name": "Artist 2"}],
+                },
+            },
         ],
-        'next': None
+        "next": None,
     }
 
     # Mock user_playlist_create
-    mock_sp.user_playlist_create.return_value = {'id': 'new_playlist_id'}
+    mock_sp.user_playlist_create.return_value = {"id": "new_playlist_id"}
 
     # Mock playlist_add_items
     mock_sp.playlist_add_items.return_value = None
@@ -177,16 +209,16 @@ def mock_spotipy():
 
     # Mock artist
     mock_sp.artist.return_value = {
-        'id': 'artist_id',
-        'name': 'Test Artist',
-        'followers': {'total': 500000}
+        "id": "artist_id",
+        "name": "Test Artist",
+        "followers": {"total": 500000},
     }
 
     # Mock track
     mock_sp.track.return_value = {
-        'name': 'Test Track',
-        'uri': 'spotify:track:mock123',
-        'artists': [{'id': 'artist_id', 'name': 'Test Artist'}]
+        "name": "Test Track",
+        "uri": "spotify:track:mock123",
+        "artists": [{"id": "artist_id", "name": "Test Artist"}],
     }
 
     return mock_sp
@@ -198,28 +230,35 @@ def mock_spotify_manager(mock_spotipy):
     # Create a MagicMock for the manager itself
     manager = MagicMock()
     manager.sp = mock_spotipy
-    manager.user_id = 'test_user_id'
-    manager.playlists = {
-        'Test Playlist': 'playlist_123',
-        'Another Playlist': 'playlist_456'
-    }
-    manager.cache_dir = Path('/tmp/test_spotify_cache')
-    manager.cache_path = manager.cache_dir / '.spotify_token'
+    manager.user_id = "test_user_id"
+    manager.playlists = {"Test Playlist": "playlist_123", "Another Playlist": "playlist_456"}
+    manager.cache_dir = Path("/tmp/test_spotify_cache")
+    manager.cache_path = manager.cache_dir / ".spotify_token"
 
     # Mock manager methods
-    manager.search_song.return_value = 'spotify:track:mock123'
-    manager.create_playlist.return_value = 'new_playlist_id'
+    manager.search_song.return_value = "spotify:track:mock123"
+    manager.create_playlist.return_value = "new_playlist_id"
     manager.refresh_playlist.return_value = True
     manager.append_to_playlist.return_value = True
     manager.remove_from_playlist.return_value = True
     manager.get_playlist_tracks.return_value = [
-        {'name': 'Track 1', 'artist': 'Artist 1', 'uri': 'spotify:track:track1', 'added_at': '2024-01-01T00:00:00Z'},
-        {'name': 'Track 2', 'artist': 'Artist 2', 'uri': 'spotify:track:track2', 'added_at': '2024-01-02T00:00:00Z'},
+        {
+            "name": "Track 1",
+            "artist": "Artist 1",
+            "uri": "spotify:track:track1",
+            "added_at": "2024-01-01T00:00:00Z",
+        },
+        {
+            "name": "Track 2",
+            "artist": "Artist 2",
+            "uri": "spotify:track:track2",
+            "added_at": "2024-01-02T00:00:00Z",
+        },
     ]
     manager.get_track_info.return_value = {
-        'name': 'Test Track',
-        'artist': 'Test Artist',
-        'uri': 'spotify:track:mock123'
+        "name": "Test Track",
+        "artist": "Test Artist",
+        "uri": "spotify:track:mock123",
     }
     manager.get_playlist_id.side_effect = lambda name: manager.playlists.get(name)
 
@@ -229,25 +268,28 @@ def mock_spotify_manager(mock_spotipy):
 @pytest.fixture
 def real_spotify_manager_with_mock_client(mock_spotipy):
     """Create a real SpotifyManager with mocked spotipy client for testing actual methods"""
-    with patch('spotify_manager.spotipy.Spotify', return_value=mock_spotipy):
-        with patch('spotify_manager.SpotifyOAuth'):
-            with patch.dict('os.environ', {
-                'SPOTIFY_CLIENT_ID': 'test_client_id',
-                'SPOTIFY_CLIENT_SECRET': 'test_client_secret',
-                'SPOTIFY_REDIRECT_URI': 'http://localhost:8888/callback'
-            }):
+    with patch("spotify_manager.spotipy.Spotify", return_value=mock_spotipy):
+        with patch("spotify_manager.SpotifyOAuth"):
+            with patch.dict(
+                "os.environ",
+                {
+                    "SPOTIFY_CLIENT_ID": "test_client_id",
+                    "SPOTIFY_CLIENT_SECRET": "test_client_secret",
+                    "SPOTIFY_REDIRECT_URI": "http://localhost:8888/callback",
+                },
+            ):
                 from spotify_manager import SpotifyManager
 
                 # Create instance without triggering real __init__
                 manager = SpotifyManager.__new__(SpotifyManager)
                 manager.sp = mock_spotipy
-                manager.user_id = 'test_user_id'
+                manager.user_id = "test_user_id"
                 manager.playlists = {
-                    'Test Playlist': 'playlist_123',
-                    'Another Playlist': 'playlist_456'
+                    "Test Playlist": "playlist_123",
+                    "Another Playlist": "playlist_456",
                 }
-                manager.cache_dir = Path('/tmp/test_spotify_cache')
-                manager.cache_path = manager.cache_dir / '.spotify_token'
+                manager.cache_dir = Path("/tmp/test_spotify_cache")
+                manager.cache_path = manager.cache_dir / ".spotify_token"
 
                 yield manager
 
@@ -255,6 +297,7 @@ def real_spotify_manager_with_mock_client(mock_spotipy):
 # =============================================================================
 # Mock Database Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def mock_database_manager(tmp_path, sample_songs):
@@ -277,9 +320,9 @@ def mock_database_manager(tmp_path, sample_songs):
     db.remove_song.return_value = True
     db.find_similar_songs.return_value = sample_songs[:2]
     db.get_stats.return_value = {
-        'total_songs': len(sample_songs),
-        'embedding_dimensions': 384,
-        'storage_size_mb': 1.5
+        "total_songs": len(sample_songs),
+        "embedding_dimensions": 384,
+        "storage_size_mb": 1.5,
     }
 
     # Set up embeddings array
@@ -310,11 +353,7 @@ def empty_database_manager(tmp_path):
     db.add_song.return_value = True
     db.remove_song.return_value = False
     db.find_similar_songs.return_value = []
-    db.get_stats.return_value = {
-        'total_songs': 0,
-        'embedding_dimensions': 0,
-        'storage_size_mb': 0
-    }
+    db.get_stats.return_value = {"total_songs": 0, "embedding_dimensions": 0, "storage_size_mb": 0}
     db.songs = {}
     db.embeddings = np.array([])
 
@@ -325,8 +364,11 @@ def empty_database_manager(tmp_path):
 # Mock Rotation Manager Fixtures
 # =============================================================================
 
+
 @pytest.fixture
-def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_playlist_history, sample_songs, tmp_path):
+def mock_rotation_manager(
+    mock_database_manager, mock_spotify_manager, sample_playlist_history, sample_songs, tmp_path
+):
     """Create a mocked RotationManager"""
     from rotation_manager import RotationManager
 
@@ -335,6 +377,7 @@ def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_pl
     rm.playlist_name = "Test Playlist"
     rm.db = mock_database_manager
     rm.spotify = mock_spotify_manager
+    rm.repos = None
     rm.history = sample_playlist_history
     rm.root_dir = tmp_path
     rm.history_dir = tmp_path / "history"
@@ -350,6 +393,7 @@ def mock_rotation_manager(mock_database_manager, mock_spotify_manager, sample_pl
 # =============================================================================
 # Mock CLI Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def mock_cli(mock_database_manager, mock_spotify_manager):
@@ -381,6 +425,7 @@ def cli_no_init():
 # =============================================================================
 # File System Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def csv_file(tmp_path):

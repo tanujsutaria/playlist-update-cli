@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from models import Song, PlaylistHistory  # noqa: E402
+from models import PlaylistHistory, Song  # noqa: E402
 from rotation_manager import RotationManager  # noqa: E402
 
 

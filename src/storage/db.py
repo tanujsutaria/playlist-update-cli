@@ -38,6 +38,14 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Threading contract: check_same_thread=False lets the connection be
+            # used from a thread other than the one that created it (the Textual
+            # UI dispatches commands on a single background worker thread). It is
+            # NOT a license for concurrent access. This connection is intended
+            # for single-threaded / serialized use only: commands run one at a
+            # time, and callers must not share a cursor (or run overlapping
+            # queries) across concurrent threads. A code-level lock could enforce
+            # this but is intentionally out of scope here.
             self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             _apply_pragmas(self._conn)

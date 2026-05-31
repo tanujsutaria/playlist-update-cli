@@ -1,36 +1,34 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shlex
-import json
-from typing import Iterable, Tuple, List, Optional
-
-from rich.console import Group
+from typing import Iterable, List, Optional, Tuple
 
 from rich import box
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.reactive import reactive
 from textual.widgets import Input, RichLog, Static
 
-from arg_parse import setup_parsers, parse_tokens
-from main import PlaylistCLI, dispatch_command, configure_logging
+from arg_parse import parse_tokens, setup_parsers
+from main import PlaylistCLI, configure_logging, dispatch_command
 from ui import (
+    info,
+    json_output,
+    key_value_table,
+    section,
     set_output_sink,
     set_preview_sink,
-    section,
     subsection,
     table,
-    key_value_table,
-    info,
     warning,
-    json_output,
 )
 from web_search import detect_search_commands
 
@@ -319,7 +317,13 @@ class PlaylistInteractiveApp(App):
         try:
             tokens = shlex.split(text)
         except ValueError as exc:
-            self.append_log(Panel(Text(f"Invalid command syntax: {exc}", style="red"), title="Error", border_style="red"))
+            self.append_log(
+                Panel(
+                    Text(f"Invalid command syntax: {exc}", style="red"),
+                    title="Error",
+                    border_style="red",
+                )
+            )
             return
         command, args, error = parse_tokens(tokens)
         if error:
@@ -357,7 +361,11 @@ class PlaylistInteractiveApp(App):
             logger.exception("Command failed: /%s", command)
             self.call_from_thread(
                 self.append_log,
-                Panel(Text(f"Command /{command} failed: {exc}", style="red"), title="Error", border_style="red"),
+                Panel(
+                    Text(f"Command /{command} failed: {exc}", style="red"),
+                    title="Error",
+                    border_style="red",
+                ),
             )
         finally:
             self.call_from_thread(self._post_command, command)
@@ -378,7 +386,9 @@ class PlaylistInteractiveApp(App):
         self.append_log(Panel(welcome, title="Welcome", border_style="cyan"))
 
     def _show_help(self) -> None:
-        table = Table(title="Commands", box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        table = Table(
+            title="Commands", box=box.SIMPLE, show_header=True, header_style="bold", expand=True
+        )
         table.add_column("Command", style="cyan", overflow="fold", no_wrap=True, width=18)
         table.add_column("Description", overflow="fold", no_wrap=False)
         table.add_row("/help, /?", "Show this help screen")
@@ -394,7 +404,9 @@ class PlaylistInteractiveApp(App):
                 table.add_row(f"/{name}", help_text or "")
         self.append_log(table)
         if not self._setup_mode:
-            self.append_log(Text('Example: /update "My Playlist" --count 10 --fresh-days 21', style="dim"))
+            self.append_log(
+                Text('Example: /update "My Playlist" --count 10 --fresh-days 21', style="dim")
+            )
 
     def _command_summaries(self) -> Iterable[Tuple[str, str]]:
         for action in self.parser._actions:
@@ -499,7 +511,13 @@ class PlaylistInteractiveApp(App):
         try:
             tokens = shlex.split(raw)
         except ValueError as exc:
-            self.append_log(Panel(Text(f"Invalid debug command: {exc}", style="red"), title="Error", border_style="red"))
+            self.append_log(
+                Panel(
+                    Text(f"Invalid debug command: {exc}", style="red"),
+                    title="Error",
+                    border_style="red",
+                )
+            )
             return
         if not tokens:
             return
@@ -640,8 +658,18 @@ class PlaylistInteractiveApp(App):
                 ["Artist", found.get("artist") or ""],
                 ["Year", found.get("year") or "-"],
                 ["Providers", ", ".join(found.get("providers") or []) or "unknown"],
-                ["Score", f"{found.get('score', 0):.3f}" if isinstance(found.get("score"), (int, float)) else found.get("score")],
-                ["Strict Ratio", f"{found.get('strict_ratio', 0):.2f}" if isinstance(found.get("strict_ratio"), (int, float)) else found.get("strict_ratio")],
+                [
+                    "Score",
+                    f"{found.get('score', 0):.3f}"
+                    if isinstance(found.get("score"), (int, float))
+                    else found.get("score"),
+                ],
+                [
+                    "Strict Ratio",
+                    f"{found.get('strict_ratio', 0):.2f}"
+                    if isinstance(found.get("strict_ratio"), (int, float))
+                    else found.get("strict_ratio"),
+                ],
             ]
             section("Debug", "Track")
             key_value_table(rows)
@@ -670,21 +698,24 @@ class PlaylistInteractiveApp(App):
                 except Exception as exc:
                     logger.debug("Failed to parse debug JSON: %s", exc)
                 subsection("Context")
-                json_output({
-                    "context_text": context.get("context_text"),
-                    "strict_text": context.get("strict_text"),
-                    "lenient_text": context.get("lenient_text"),
-                    "strict_ratio": context.get("strict_ratio"),
-                    "fields": fields_payload,
-                    "sources": sources_payload,
-                })
+                json_output(
+                    {
+                        "context_text": context.get("context_text"),
+                        "strict_text": context.get("strict_text"),
+                        "lenient_text": context.get("lenient_text"),
+                        "strict_ratio": context.get("strict_ratio"),
+                        "fields": fields_payload,
+                        "sources": sources_payload,
+                    }
+                )
             if sources:
                 subsection("Sources (DB)")
+
                 def _shorten(value: object, limit: int = 120) -> str:
                     text = str(value or "").replace("\n", " ").strip()
                     if len(text) <= limit:
                         return text
-                    return f"{text[:limit - 3]}..."
+                    return f"{text[: limit - 3]}..."
 
                 table(
                     ["#", "URL", "Title", "Snippet", "Provider", "Strict"],
@@ -706,7 +737,12 @@ class PlaylistInteractiveApp(App):
                     [
                         ["Model", embedding.get("model_name") or ""],
                         ["Dimensions", embedding.get("embedding_dim") or ""],
-                        ["Norm", f"{embedding.get('embedding_norm', 0):.4f}" if embedding.get("embedding_norm") is not None else ""],
+                        [
+                            "Norm",
+                            f"{embedding.get('embedding_norm', 0):.4f}"
+                            if embedding.get("embedding_norm") is not None
+                            else "",
+                        ],
                         ["Created", embedding.get("created_at") or ""],
                     ]
                 )
@@ -741,7 +777,13 @@ class PlaylistInteractiveApp(App):
         warning(f"No track found for id: {track_id}")
 
     def _env_table(self) -> Table:
-        table = Table(title="Environment Keys", box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        table = Table(
+            title="Environment Keys",
+            box=box.SIMPLE,
+            show_header=True,
+            header_style="bold",
+            expand=True,
+        )
         table.add_column("Key", overflow="fold")
         table.add_column("Required", justify="center")
         table.add_column("Status", justify="center")
@@ -781,13 +823,17 @@ class PlaylistInteractiveApp(App):
         setup.append("   SPOTIFY_CLIENT_SECRET=...\n", style="dim")
         setup.append("   SPOTIFY_REDIRECT_URI=http://localhost:8888/callback\n", style="dim")
         setup.append("2) Restart tunr after editing .env\n", style="dim")
-        setup.append("3) Optional: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY for /search\n", style="dim")
+        setup.append(
+            "3) Optional: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY for /search\n", style="dim"
+        )
         providers = sorted(detect_search_commands().keys())
         provider_text = Text(
             f"Deep search providers: {', '.join(providers) if providers else 'none detected'}",
             style="dim",
         )
-        return Group(Panel(setup, title="Setup", border_style="cyan"), self._env_table(), provider_text)
+        return Group(
+            Panel(setup, title="Setup", border_style="cyan"), self._env_table(), provider_text
+        )
 
     def _prompt_search_followup(self) -> None:
         self._pending_action = "search_confirm"
@@ -795,7 +841,12 @@ class PlaylistInteractiveApp(App):
             "track_ids": self.cli.last_search_track_ids or [],
             "query": self.cli.last_search_query,
         }
-        self.append_log(Text("Cached. Mark these recommendations and/or create a playlist? (yes/no)", style="bold"))
+        self.append_log(
+            Text(
+                "Cached. Mark these recommendations and/or create a playlist? (yes/no)",
+                style="bold",
+            )
+        )
         self.append_log(Text("Or run /expand to broaden the search.", style="dim"))
 
     def _handle_pending_input(self, raw: str) -> None:
@@ -806,7 +857,9 @@ class PlaylistInteractiveApp(App):
                 self.append_log(Text("Choose: db, playlist, both, or cancel", style="bold"))
                 return
             if value in {"no", "n"}:
-                self.append_log(Text("No problem. Try /search <criteria> or /expand to broaden.", style="dim"))
+                self.append_log(
+                    Text("No problem. Try /search <criteria> or /expand to broaden.", style="dim")
+                )
                 self._clear_pending()
                 return
             self.append_log(Text("Please answer yes or no.", style="yellow"))
@@ -827,7 +880,9 @@ class PlaylistInteractiveApp(App):
                 self.append_log(Text("Playlist name?", style="bold"))
                 return
             if value in {"cancel", "no", "n"}:
-                self.append_log(Text("Cancelled. Try /search <criteria> to run again.", style="dim"))
+                self.append_log(
+                    Text("Cancelled. Try /search <criteria> to run again.", style="dim")
+                )
                 self._clear_pending()
                 return
             self.append_log(Text("Please choose db, playlist, both, or cancel.", style="yellow"))
@@ -871,7 +926,9 @@ class PlaylistInteractiveApp(App):
             self.append_log(Text("Finish setup before running searches.", style="yellow"))
             return
         if not self.cli.last_search_query:
-            self.append_log(Text("No previous search to expand. Run /search <criteria> first.", style="yellow"))
+            self.append_log(
+                Text("No previous search to expand. Run /search <criteria> first.", style="yellow")
+            )
             return
         if self.status != "Idle":
             self.append_log(Text("Another command is already running.", style="yellow"))

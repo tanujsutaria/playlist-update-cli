@@ -2,8 +2,9 @@
 Unit tests for dispatch_command routing.
 Verifies that every CLI command routes to the correct PlaylistCLI method.
 """
+
 import argparse
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,13 +53,22 @@ class TestDispatchUpdate:
     def test_update_routes_correctly(self, cli):
         cli.update_playlist = MagicMock()
         args = _make_args(
-            playlist="My Playlist", count=10, fresh_days=30,
-            dry_run=False, score_strategy="local", query=None,
+            playlist="My Playlist",
+            count=10,
+            fresh_days=30,
+            dry_run=False,
+            score_strategy="local",
+            query=None,
         )
         rc = dispatch_command(cli, "update", args)
         assert rc == 0
         cli.update_playlist.assert_called_once_with(
-            "My Playlist", 10, 30, False, "local", None,
+            "My Playlist",
+            10,
+            30,
+            False,
+            "local",
+            None,
         )
 
 
@@ -114,8 +124,12 @@ class TestDispatchPlan:
     def test_plan_routes_correctly(self, cli):
         cli.plan_playlist = MagicMock()
         args = _make_args(
-            playlist="PL", count=8, fresh_days=14,
-            generations=3, score_strategy="hybrid", query="chill",
+            playlist="PL",
+            count=8,
+            fresh_days=14,
+            generations=3,
+            score_strategy="hybrid",
+            query="chill",
         )
         rc = dispatch_command(cli, "plan", args)
         assert rc == 0
@@ -127,8 +141,11 @@ class TestDispatchDiff:
     def test_diff_routes_correctly(self, cli):
         cli.diff_playlist = MagicMock()
         args = _make_args(
-            playlist="PL", count=6, fresh_days=21,
-            score_strategy="web", query="jazz",
+            playlist="PL",
+            count=6,
+            fresh_days=21,
+            score_strategy="web",
+            query="jazz",
         )
         rc = dispatch_command(cli, "diff", args)
         assert rc == 0

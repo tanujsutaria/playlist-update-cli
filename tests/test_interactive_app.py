@@ -3,10 +3,13 @@ Unit tests for interactive app command routing and handling.
 Tests all interactive-only commands, aliases, shlex error handling,
 setup mode gating, and worker error display.
 """
-import os
 
 from arg_parse import setup_parsers
-from interactive_app import PlaylistInteractiveApp, SPOTIFY_REQUIRED_KEYS, COMMANDS_ALLOWED_WITHOUT_SPOTIFY
+from interactive_app import (
+    COMMANDS_ALLOWED_WITHOUT_SPOTIFY,
+    SPOTIFY_REQUIRED_KEYS,
+    PlaylistInteractiveApp,
+)
 from main import PlaylistCLI
 
 
@@ -49,6 +52,7 @@ def _make_app(monkeypatch, with_spotify=True):
 # ============================================================================
 # Interactive-only command routing
 # ============================================================================
+
 
 class TestHelpCommand:
     def test_help_routed(self, monkeypatch):
@@ -175,6 +179,7 @@ class TestQuitCommand:
 # Argparse-based command routing through interactive
 # ============================================================================
 
+
 class TestArgparseCommandRouting:
     def test_stats_dispatched(self, monkeypatch):
         app = _make_app(monkeypatch)
@@ -251,6 +256,7 @@ class TestArgparseCommandRouting:
 # shlex.split() ValueError handling
 # ============================================================================
 
+
 class TestShlexErrorHandling:
     def test_unbalanced_single_quote(self, monkeypatch):
         """Unbalanced single quote should show error, not crash."""
@@ -277,6 +283,7 @@ class TestShlexErrorHandling:
 # Interactive command handler
 # ============================================================================
 
+
 class TestInteractiveCommandInInteractive:
     def test_interactive_command_shows_message(self, monkeypatch):
         """/interactive when already in interactive mode should show a message, not dispatch."""
@@ -289,6 +296,7 @@ class TestInteractiveCommandInInteractive:
 # ============================================================================
 # Setup mode gating
 # ============================================================================
+
 
 class TestSetupModeGating:
     def test_setup_mode_blocks_spotify_commands(self, monkeypatch):
@@ -368,6 +376,7 @@ class TestSetupModeGating:
 # Empty / whitespace input
 # ============================================================================
 
+
 class TestEmptyInput:
     def test_empty_string_ignored(self, monkeypatch):
         app = _make_app(monkeypatch)
@@ -389,6 +398,7 @@ class TestEmptyInput:
 # ============================================================================
 # Parse error display
 # ============================================================================
+
 
 class TestParseErrorDisplay:
     def test_invalid_command_shows_error(self, monkeypatch):

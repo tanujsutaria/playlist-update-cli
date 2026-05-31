@@ -47,7 +47,13 @@ Thumbs.db
 data/
 imports/
 backups/
-spotify_playlist_manager.egg-info/
+
+# Python build artifacts
+*.egg-info/
+
+# Derived lockfile — uv.lock is the committed source of truth.
+# Regenerate with: uv pip compile pyproject.toml -o requirements.txt
+requirements.txt
 
 # old scripts
 spotify.py

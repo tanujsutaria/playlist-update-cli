@@ -2,10 +2,9 @@
 Unit tests for OpenAI web search/score wrapper JSON parsing.
 Validates regex patterns correctly extract fenced code blocks.
 """
-import pytest
 
-from openai_web_search_wrapper import _parse_json_output as search_parse
 from openai_web_score_wrapper import _parse_json_output as score_parse
+from openai_web_search_wrapper import _parse_json_output as search_parse
 
 
 class TestSearchWrapperJsonParsing:
@@ -101,16 +100,7 @@ class TestScoreWrapperJsonParsing:
         assert score_parse("No JSON here.") is None
 
     def test_multiline_fenced_json(self):
-        text = (
-            "```json\n"
-            "{\n"
-            '  "scores": {\n'
-            '    "track1": 0.95,\n'
-            '    "track2": 0.42\n'
-            "  }\n"
-            "}\n"
-            "```"
-        )
+        text = '```json\n{\n  "scores": {\n    "track1": 0.95,\n    "track2": 0.42\n  }\n}\n```'
         result = score_parse(text)
         assert result is not None
         assert result["scores"]["track1"] == 0.95

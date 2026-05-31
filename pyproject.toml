@@ -19,19 +19,121 @@ dependencies = [
     "textual>=0.52.1",
     "openai>=1.40.0",
     "scikit-learn>=1.3.0",
-    "matplotlib>=3.7.1",
-    "click>=8.1.3",
-    "tabulate>=0.9.0",
     "sentence-transformers>=2.2.2",
 ]
 
 [project.scripts]
-tunr = "src.main:main"
+tunr = "main:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.3.1",
+    "pytest-cov>=4.0",
+    "ruff>=0.6.0",
+    "mypy>=1.8",
+    "pre-commit>=3.5",
 ]
 
 [tool.setuptools]
-packages = ["src", "src.storage", "src.nextgen"]
+# src-layout: src/ is the source root (NOT an importable package named "src").
+# Top-level modules are declared explicitly; sub-packages are auto-discovered.
+# This gives every module a single import identity (e.g. `import models`),
+# eliminating the `import models` vs `import src.models` hazard.
+package-dir = {"" = "src"}
+py-modules = [
+    "main",
+    "config",
+    "models",
+    "spotify_manager",
+    "rotation_manager",
+    "song_store",
+    "scoring",
+    "web_search",
+    "arg_parse",
+    "ui",
+    "interactive_app",
+    "anthropic_web_search_wrapper",
+    "openai_web_search_wrapper",
+    "openai_web_score_wrapper",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["storage*", "nextgen*"]
+
+[tool.pytest.ini_options]
+# Put src/ at the front of sys.path so bare imports (`from models import ...`)
+# resolve to this repo's modules, never a stray site-packages install.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = [
+    "src/setup.py",
+    "src/*/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["specs", "proposals", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+extend-ignore = [
+    "E501",  # line-too-long: not auto-fixable for comments/strings; address incrementally
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and a few modules adjust sys.path before importing; E402 is expected
+# until the package layout is unified (T7 in docs/REMEDIATION_PLAN.md).
+"tests/*" = ["E402"]
+"src/main.py" = ["E402"]
+"src/setup.py" = ["E402"]
+
+[tool.mypy]
+# Analysis target (mypy 2.x dropped 3.9). The package still supports 3.9 at
+# runtime — ruff's target-version = "py39" enforces the syntax floor.
+python_version = "3.10"
+mypy_path = "src"
+explicit_package_bases = true
+namespace_packages = true
+# Non-strict baseline: only check typed signatures, not the bodies of untyped
+# functions (the legacy modules are largely untyped). Third-party libs
+# (spotipy, tqdm, sklearn, ...) ship no stubs. Tighten incrementally:
+# flip check_untyped_defs back on per-module as types are added.
+check_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["tests/", "specs/", "proposals/", "build/", "src/setup.py"]
+
+# --- Type-check baseline -----------------------------------------------------
+# These legacy modules are not yet type-clean and are scheduled for
+# refactor/removal (see docs/REMEDIATION_PLAN.md). Drop each module from this
+# ignore list as its task lands. The already-typed core (models, storage.*,
+# most of nextgen.*, ui) IS fully checked today.
+[[tool.mypy.overrides]]
+module = [
+    "main",                          # T11 decomposition
+    "interactive_app",               # T11 decomposition
+    "web_search",                    # T12 hardening
+    "rotation_manager",              # T10 storage reroute
+    "arg_parse",                     # T11 command registry
+    "spotify_manager",               # T12 hardening
+    "scoring",                       # T8 / T10
+    "nextgen.pipeline",              # T9 / T12
+    "openai_web_search_wrapper",     # T8 consolidation
+    "anthropic_web_search_wrapper",  # T8 consolidation
+]
+ignore_errors = true

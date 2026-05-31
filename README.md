@@ -44,7 +44,7 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
    ```bash
    tunr
    ```
-   You can also run `python src/main.py` with no arguments.
+   (`tunr` is the installed entry point; run it from a terminal with a TTY.)
 
 ## First-time setup
 - On launch, `tunr` auto-detects keys in your environment.
