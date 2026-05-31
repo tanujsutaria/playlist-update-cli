@@ -1,4 +1,4 @@
-.PHONY: install lint format format-check typecheck test cov ci clean help
+.PHONY: install lint format format-check typecheck test cov ci clean test-live help
 
 # Use the project venv automatically when present; fall back to bare python
 # (e.g. in CI, where deps are pip-installed into the job's interpreter).
@@ -9,10 +9,13 @@ PY := $(shell [ -x $(VENV)/bin/python ] && echo $(VENV)/bin/python || echo pytho
 # docs/REMEDIATION_PLAN.md T13). Baseline at introduction: 38%.
 # T13 backfill (config, nextgen canonicalize/providers/embeddings, storage
 # vectors, ui) raised the total to ~45%; floor ratcheted to 42%.
-COV_MIN := 42
+# The pytest-bdd integration suite (tests/bdd/**) drives main.py / dispatch /
+# rotation / spotify_manager end to end, lifting the total to ~52.6%; floor
+# ratcheted to 50.
+COV_MIN := 50
 
 help:
-	@echo "Targets: install lint format format-check typecheck test cov ci clean"
+	@echo "Targets: install lint format format-check typecheck test cov ci clean test-live"
 
 install:  ## Install the package + dev tooling (uses uv) and pre-commit hooks
 	uv pip install -e '.[dev]'
@@ -37,6 +40,9 @@ cov:  ## Run tests with coverage gate
 	$(PY) -m pytest --cov=src --cov-report=term-missing --cov-fail-under=$(COV_MIN)
 
 ci: lint format-check typecheck cov  ## Everything CI runs
+
+test-live:  ## Opt-in READ-ONLY live Spotify smoke test (needs real creds in config/.env or env)
+	RUN_LIVE_SPOTIFY=1 $(PY) -m pytest tests/bdd/test_live_smoke.py -m live -v
 
 clean:  ## Remove caches and build artifacts
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov build dist *.egg-info

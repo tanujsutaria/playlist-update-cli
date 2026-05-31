@@ -29,6 +29,7 @@ tunr = "main:main"
 dev = [
     "pytest>=7.3.1",
     "pytest-cov>=4.0",
+    "pytest-bdd>=7",
     "ruff>=0.6.0",
     "mypy>=1.8",
     "pre-commit>=3.5",
@@ -67,6 +68,12 @@ include = ["storage*", "nextgen*"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
+# pytest-bdd: resolve feature filenames in step modules relative to this dir,
+# so `scenarios("stats.feature")` finds tests/bdd/features/stats.feature.
+bdd_features_base_dir = "tests/bdd/features"
+markers = [
+    "live: opt-in tests that hit real external services (skipped by default in CI)",
+]
 
 [tool.coverage.run]
 source = ["src"]
