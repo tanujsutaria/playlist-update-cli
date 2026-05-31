@@ -82,6 +82,17 @@ def setup_parsers(
     )
     stats_parser.add_argument("--output", help="Output file path (optional)", default=None)
 
+    # Profile command (library visualization)
+    profile_parser = subparsers.add_parser(
+        "profile", help="Visualize your library: top artists + rotation coverage"
+    )
+    profile_parser.add_argument(
+        "--top",
+        type=_positive_int,
+        default=15,
+        help="Number of top artists to chart (default: 15)",
+    )
+
     # View command
     view_parser = subparsers.add_parser("view", help="View current playlist contents")
     view_parser.add_argument("playlist", help="Name of the playlist")
@@ -213,12 +224,11 @@ def setup_parsers(
         help="Maximum number of played tracks to replace (default: all)",
     )
 
-    # Consolidated rotate command
-    rotate_parser = subparsers.add_parser("rotate", help="Rotate a playlist")
-    rotate_parser.add_argument("playlist", help="Name of the playlist")
-    rotate_parser.add_argument(
-        "--policy", choices=["played"], default="played", help="Rotation policy (default: played)"
+    # Consolidated rotate command (replaces the legacy rotate-played twin)
+    rotate_parser = subparsers.add_parser(
+        "rotate", help="Rotate a playlist (replace tracks you've already played)"
     )
+    rotate_parser.add_argument("playlist", help="Name of the playlist")
     rotate_parser.add_argument(
         "--max-replace",
         type=int,

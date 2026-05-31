@@ -109,3 +109,53 @@ class TestPreviewSink:
         ui.set_preview_sink(captured.append)
         ui.clear_preview()
         assert captured == [None]
+
+
+class TestSparkline:
+    TICKS = "▁▂▃▄▅▆▇█"
+
+    def test_empty_series_is_empty_string(self):
+        assert ui.sparkline([]) == ""
+
+    def test_length_matches_input(self):
+        assert len(ui.sparkline([1, 2, 3, 4, 5])) == 5
+
+    def test_uses_only_block_ticks(self):
+        spark = ui.sparkline([0, 1, 2, 3, 4, 5, 6, 7])
+        assert all(ch in self.TICKS for ch in spark)
+
+    def test_monotonic_increase_is_non_decreasing(self):
+        idxs = [self.TICKS.index(ch) for ch in ui.sparkline([1, 2, 3, 4, 5])]
+        assert idxs == sorted(idxs)
+        assert idxs[0] == 0
+        assert idxs[-1] == len(self.TICKS) - 1
+
+    def test_flat_series_uses_constant_mid_tick(self):
+        spark = ui.sparkline([3, 3, 3])
+        assert len(spark) == 3
+        # All identical: signals "no variation", not "no data".
+        assert len(set(spark)) == 1
+
+
+class TestBarChart:
+    def test_renders_labels_and_values(self, capsys, reset_sinks):
+        ui.bar_chart(["alpha", "beta"], [3, 9])
+        out = capsys.readouterr().out
+        assert "alpha" in out
+        assert "beta" in out
+        assert "9" in out
+        assert "█" in out  # the peak value draws a full bar
+
+    def test_empty_data_emits_message_not_error(self, capsys, reset_sinks):
+        ui.bar_chart([], [])
+        assert "No data" in capsys.readouterr().out
+
+    def test_emits_single_renderable_to_sink(self, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.bar_chart(["a", "b"], [1, 2])
+        assert len(captured) == 1
+
+    def test_value_fmt_applied(self, capsys, reset_sinks):
+        ui.bar_chart(["a"], [0.5], value_fmt=lambda v: f"{v * 100:.0f}%")
+        assert "50%" in capsys.readouterr().out

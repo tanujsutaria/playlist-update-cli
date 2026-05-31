@@ -227,7 +227,7 @@ class TestDispatchListenSync:
         cli.sync_listen_history.assert_called_once_with(50)
 
 
-# ---- rotate-played ----
+# ---- rotate-played (deprecated alias) ----
 class TestDispatchRotatePlayed:
     def test_rotate_played_routes_correctly(self, cli):
         cli.rotate_playlist_played = MagicMock()
@@ -239,17 +239,22 @@ class TestDispatchRotatePlayed:
 
 # ---- rotate ----
 class TestDispatchRotate:
-    def test_rotate_played_policy(self, cli):
+    def test_rotate_routes_correctly(self, cli):
         cli.rotate_playlist_played = MagicMock()
-        args = _make_args(playlist="PL", policy="played", max_replace=None)
+        args = _make_args(playlist="PL", max_replace=None)
         rc = dispatch_command(cli, "rotate", args)
         assert rc == 0
         cli.rotate_playlist_played.assert_called_once_with("PL", None)
 
-    def test_rotate_unknown_policy_returns_error(self, cli):
-        args = _make_args(playlist="PL", policy="random", max_replace=None)
-        rc = dispatch_command(cli, "rotate", args)
-        assert rc == 1
+
+# ---- profile ----
+class TestDispatchProfile:
+    def test_profile_routes_correctly(self, cli):
+        cli.show_profile = MagicMock()
+        args = _make_args(top=15)
+        rc = dispatch_command(cli, "profile", args)
+        assert rc == 0
+        cli.show_profile.assert_called_once_with(15)
 
 
 # ---- backup ----

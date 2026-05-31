@@ -413,7 +413,9 @@ class PlaylistInteractiveApp(App):
             if isinstance(action, argparse._SubParsersAction):
                 for choice in action._choices_actions:
                     name = choice.dest
-                    if name in {"interactive", "debug"}:
+                    # `rotate-played` is a deprecated alias for `rotate`; keep it
+                    # usable but out of the advertised command list.
+                    if name in {"interactive", "debug", "rotate-played"}:
                         continue
                     help_text = choice.help or ""
                     if help_text.lower().startswith("legacy:"):
