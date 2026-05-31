@@ -42,6 +42,7 @@ dev = [
 package-dir = {"" = "src"}
 py-modules = [
     "main",
+    "config",
     "models",
     "spotify_manager",
     "rotation_manager",

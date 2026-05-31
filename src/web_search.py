@@ -1,3 +1,12 @@
+"""Web-search provider orchestration.
+
+SECURITY NOTE: the ``WEB_SEARCH_*`` / ``WEB_SCORE_*`` / ``WEB_SEARCH_CMD`` (and
+``WEB_SCORE_CMD``) environment variables specify shell-style command lines that
+this module tokenizes and executes as local subprocesses. They run arbitrary
+local commands with the privileges of the current user. Only set them to
+trusted values; never populate them from untrusted input.
+"""
+
 from __future__ import annotations
 
 import importlib.util
@@ -277,6 +286,13 @@ def build_search_payload(
     }
 
 
+# Hard cap on the number of fallback retries a single _run_command invocation
+# may chain through. The known fallback paths (codex->wrapper, --json strip,
+# wrapper->CLI, fallback-model) are at most a couple deep; this bound guards
+# against an unexpected loop while leaving real fallbacks room to run.
+_MAX_RUN_DEPTH = 4
+
+
 def _run_command(
     label: str,
     command: str,
@@ -285,16 +301,66 @@ def _run_command(
     env_overrides: Optional[dict] = None,
     allow_claude_cli_fallback: bool = True,
 ) -> Tuple[List[dict], str]:
+    """Public entry point: tokenize the command string ONCE, then delegate.
+
+    The command line is shlex-split here a single time; the resulting argv list
+    is threaded through every recursive retry without being re-joined and
+    re-split (which previously corrupted the multi-word ``--output-schema``
+    argument).
+    """
+
     try:
-        args = shlex.split(command)
+        argv = shlex.split(command)
     except ValueError as exc:
         logger.warning("Invalid search command for %s: %s", label, exc)
         return [], ""
+    return _run_command_argv(
+        label,
+        argv,
+        payload,
+        timeout_sec,
+        env_overrides=env_overrides,
+        allow_claude_cli_fallback=allow_claude_cli_fallback,
+    )
 
+
+def _run_command_argv(
+    label: str,
+    argv: List[str],
+    payload: dict,
+    timeout_sec: int,
+    env_overrides: Optional[dict] = None,
+    allow_claude_cli_fallback: bool = True,
+    _depth: int = 0,
+) -> Tuple[List[dict], str]:
+    if not argv:
+        logger.warning("Empty search command for %s.", label)
+        return [], ""
+
+    if _depth > _MAX_RUN_DEPTH:
+        logger.warning(
+            "Search command for %s exceeded max retry depth (%s); giving up.",
+            label,
+            _MAX_RUN_DEPTH,
+        )
+        return [], ""
+
+    args = list(argv)
     input_text = json.dumps(payload)
     is_codex_cli = label == "codex" and _is_codex_cli(args)
     if is_codex_cli:
         args, input_text = _prepare_codex_command(args, payload)
+
+    # Validate the executable resolves before attempting to run it. shutil.which
+    # handles both bare names (PATH lookup) and absolute/relative paths.
+    if shutil.which(args[0]) is None:
+        logger.error(
+            "Search command for %s is not runnable: executable %r not found on PATH.",
+            label,
+            args[0],
+        )
+        return [], ""
+    logger.debug("Running search command for %s: %r", label, args)
 
     env = os.environ.copy()
     if env_overrides:
@@ -312,14 +378,16 @@ def _run_command(
     except subprocess.TimeoutExpired:
         logger.warning("Search command for %s timed out after %ss.", label, timeout_sec)
         fallback_model = env.get("WEB_SEARCH_FALLBACK_MODEL", "").strip()
-        if fallback_model and _is_openai_wrapper_command(command) and not env_overrides:
+        if fallback_model and _is_openai_wrapper_argv(args) and not env_overrides:
             logger.info("Retrying %s with fallback model %s.", label, fallback_model)
-            return _run_command(
+            return _run_command_argv(
                 label,
-                command,
+                args,
                 payload,
                 timeout_sec,
                 env_overrides={"WEB_SEARCH_MODEL": fallback_model},
+                allow_claude_cli_fallback=allow_claude_cli_fallback,
+                _depth=_depth + 1,
             )
         return [], ""
     except Exception as exc:
@@ -334,78 +402,89 @@ def _run_command(
             if "--json" in args and _stderr_has_unknown_json(result.stderr):
                 logger.info("Retrying %s without --json flag", label)
                 args = [arg for arg in args if arg != "--json"]
-                return _run_command(
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
             if is_codex_cli and _stderr_needs_tty(result.stderr):
                 logger.info("Retrying %s with codex exec (non-interactive)", label)
-                args, input_text = _prepare_codex_command(["codex", "exec", "-"], payload)
-                return _run_command(
+                retry_args, _ = _prepare_codex_command(["codex", "exec", "-"], payload)
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    retry_args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
             if is_codex_cli and _stderr_unknown_argument(result.stderr):
                 flag = _stderr_unknown_argument_flag(result.stderr)
                 if flag:
                     logger.info("Retrying %s without unsupported flag %s", label, flag)
                     if flag == "--search" and os.getenv("OPENAI_API_KEY"):
-                        wrapper_cmd = _default_openai_web_search_command()
-                        if wrapper_cmd != command:
+                        wrapper_argv = shlex.split(_default_openai_web_search_command())
+                        if wrapper_argv != args:
                             logger.info(
                                 "Codex CLI does not support --search; falling back to OpenAI web search wrapper."
                             )
-                            return _run_command(
+                            return _run_command_argv(
                                 label,
-                                wrapper_cmd,
+                                wrapper_argv,
                                 payload,
                                 timeout_sec,
                                 env_overrides=env_overrides,
                                 allow_claude_cli_fallback=allow_claude_cli_fallback,
+                                _depth=_depth + 1,
                             )
                     args = _strip_flag(args, flag, takes_value=(flag == "--output-schema"))
                     if flag == "--search":
                         logger.warning(
                             "Codex CLI does not support --search; running without web search."
                         )
-                    return _run_command(
+                    return _run_command_argv(
                         label,
-                        " ".join(args),
+                        args,
                         payload,
                         timeout_sec,
                         env_overrides=env_overrides,
                         allow_claude_cli_fallback=allow_claude_cli_fallback,
+                        _depth=_depth + 1,
                     )
                 logger.info("Retrying %s without unsupported codex flags", label)
                 args = _strip_flag(args, "--search", takes_value=False)
                 args = _strip_flag(args, "--output-schema", takes_value=True)
-                return _run_command(
+                return _run_command_argv(
                     label,
-                    " ".join(args),
+                    args,
                     payload,
                     timeout_sec,
                     env_overrides=env_overrides,
                     allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
         return [], ""
 
     output = _parse_json_output(result.stdout)
     if output is None:
         logger.warning("Search command for %s returned invalid JSON.", label)
-        if label == "claude" and _should_retry_claude_with_wrapper(command):
-            wrapper_cmd = _default_anthropic_web_search_command()
-            if wrapper_cmd != command:
+        if label == "claude" and _should_retry_claude_with_wrapper_argv(args):
+            wrapper_argv = shlex.split(_default_anthropic_web_search_command())
+            if wrapper_argv != args:
                 logger.info("Retrying %s via Anthropic web search wrapper.", label)
-                return _run_command(
-                    label, wrapper_cmd, payload, timeout_sec, env_overrides=env_overrides
+                return _run_command_argv(
+                    label,
+                    wrapper_argv,
+                    payload,
+                    timeout_sec,
+                    env_overrides=env_overrides,
+                    allow_claude_cli_fallback=allow_claude_cli_fallback,
+                    _depth=_depth + 1,
                 )
         if label == "claude" and not _module_available("anthropic"):
             logger.info(
@@ -418,7 +497,7 @@ def _run_command(
     if (
         label == "claude"
         and allow_claude_cli_fallback
-        and _is_anthropic_wrapper_command(command)
+        and _is_anthropic_wrapper_argv(args)
         and not results
         and _command_exists("claude")
         and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=True)
@@ -429,13 +508,14 @@ def _run_command(
             )
         else:
             logger.info("Claude wrapper returned empty output; retrying with claude CLI.")
-        return _run_command(
+        return _run_command_argv(
             label,
-            "claude --json",
+            ["claude", "--json"],
             payload,
             timeout_sec,
             env_overrides=env_overrides,
             allow_claude_cli_fallback=False,
+            _depth=_depth + 1,
         )
     return results, summary
 
@@ -465,9 +545,25 @@ def _is_anthropic_wrapper_command(command: str) -> bool:
     return "anthropic_web_search_wrapper" in lowered
 
 
+def _is_openai_wrapper_argv(argv: List[str]) -> bool:
+    return any("openai_web_search_wrapper" in arg.lower() for arg in argv)
+
+
+def _is_anthropic_wrapper_argv(argv: List[str]) -> bool:
+    return any("anthropic_web_search_wrapper" in arg.lower() for arg in argv)
+
+
 def _should_retry_claude_with_wrapper(command: str) -> bool:
     lowered = command.lower()
     if "anthropic_web_search_wrapper" in lowered:
+        return False
+    if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
+        return False
+    return _module_available("anthropic")
+
+
+def _should_retry_claude_with_wrapper_argv(argv: List[str]) -> bool:
+    if _is_anthropic_wrapper_argv(argv):
         return False
     if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
         return False

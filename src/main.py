@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dotenv import load_dotenv
 from rich.logging import RichHandler
 
+from config import AppConfig, env_flag, env_int
 from models import Song
 from nextgen.embeddings import EmbeddingModel
 from nextgen.pipeline import SearchPipeline, SearchResult
@@ -126,43 +127,21 @@ class PlaylistCLI:
         if not hasattr(self, "_search_pipeline"):
             self._search_pipeline = None
         if self._search_pipeline is None:
+            app_config = AppConfig.from_env()
 
-            def _env_float(name: str, default: float) -> float:
-                value = os.getenv(name)
-                if not value:
-                    return default
-                try:
-                    return float(value)
-                except ValueError:
-                    return default
-
-            def _env_int(name: str, default: int) -> int:
-                value = os.getenv(name)
-                if not value:
-                    return default
-                try:
-                    return int(value)
-                except ValueError:
-                    return default
-
-            model_name = os.getenv("SEARCH_EMBEDDING_MODEL", "all-mpnet-base-v2")
-            strict_threshold = _env_float("SEARCH_STRICT_THRESHOLD", 0.6)
-            lenient_threshold = _env_float("SEARCH_LENIENT_THRESHOLD", 0.75)
-            score_config_cls = SearchScoreConfig
-
-            score_config = score_config_cls(
-                strict_weight=_env_float("SEARCH_SCORE_STRICT_WEIGHT", 0.4),
-                base_weight=_env_float("SEARCH_SCORE_BASE_WEIGHT", 0.6),
-                source_weight=_env_float("SEARCH_SCORE_SOURCE_WEIGHT", 0.05),
-                year_weight=_env_float("SEARCH_SCORE_YEAR_WEIGHT", 0.05),
-                year_tolerance=_env_int("SEARCH_SCORE_YEAR_TOLERANCE", 10),
-                source_cap=_env_int("SEARCH_SCORE_SOURCE_CAP", 5),
+            score_config = SearchScoreConfig(
+                strict_weight=app_config.strict_weight,
+                base_weight=app_config.base_weight,
+                source_weight=app_config.source_weight,
+                year_weight=app_config.year_weight,
+                year_tolerance=app_config.year_tolerance,
+                source_cap=app_config.source_cap,
             )
             self._search_pipeline = SearchPipeline(
                 self.repos,
-                model_name=model_name,
-                strict_threshold=strict_threshold,
-                lenient_threshold=lenient_threshold,
+                model_name=app_config.model_name,
+                strict_threshold=app_config.strict_threshold,
+                lenient_threshold=app_config.lenient_threshold,
                 score_config=score_config,
             )
         return self._search_pipeline
@@ -1067,32 +1046,17 @@ class PlaylistCLI:
         def _progress(stage: str) -> None:
             info(f"Stage: {stage}")
 
-        def _env_int(name: str, default: int) -> int:
-            value = os.getenv(name)
-            if not value:
-                return default
-            try:
-                return int(value)
-            except ValueError:
-                return default
-
-        def _env_flag(name: str, default: bool = False) -> bool:
-            value = os.getenv(name)
-            if value is None or value == "":
-                return default
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-
         interactive = os.getenv("TUNR_INTERACTIVE") == "1"
         status_label = "fresh"
         live_mode = os.getenv("SEARCH_LIVE_MODE", "full").strip().lower()
         if live_mode not in {"full", "compact"}:
             live_mode = "full"
         preview_rows: List[List[object]] = []
-        preview_limit = max(0, _env_int("SEARCH_PREVIEW_LIMIT", 20))
-        preview_stride = max(1, _env_int("SEARCH_PREVIEW_STRIDE", 5))
-        live_page_size = max(1, _env_int("SEARCH_LIVE_PAGE_SIZE", 50))
-        live_page = max(1, _env_int("SEARCH_LIVE_PAGE", 1))
-        stream_full = _env_flag("SEARCH_STREAM_FULL", interactive)
+        preview_limit = max(0, env_int("SEARCH_PREVIEW_LIMIT", 20))
+        preview_stride = max(1, env_int("SEARCH_PREVIEW_STRIDE", 5))
+        live_page_size = max(1, env_int("SEARCH_LIVE_PAGE_SIZE", 50))
+        live_page = max(1, env_int("SEARCH_LIVE_PAGE", 1))
+        stream_full = env_flag("SEARCH_STREAM_FULL", interactive)
         final_table_mode = os.getenv("SEARCH_FINAL_TABLE_MODE", "").strip().lower()
         if not final_table_mode:
             final_table_mode = "none" if (interactive and stream_full) else "full"

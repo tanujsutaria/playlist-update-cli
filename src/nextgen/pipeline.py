@@ -37,11 +37,13 @@ def _extract_year_target(query: str) -> Optional[int]:
         return None
     token = match.group(1)
     if len(token) == 2:
+        # Two-digit decades (e.g. "30s") are ambiguous: prefer the 20xx reading
+        # only when it is not in the future, otherwise fall back to 19xx. This
+        # keeps "30s"/"40s" mapping to 1935/1945 rather than future years, while
+        # "20s" still resolves to the current-century decade once it is reached.
         decade = int(token)
-        if decade >= 50:
-            base = 1900 + decade
-        else:
-            base = 2000 + decade
+        candidate = 2000 + decade
+        base = candidate if candidate <= datetime.now().year else 1900 + decade
     else:
         base = int(token)
         if base < 1900:

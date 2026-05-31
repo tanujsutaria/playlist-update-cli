@@ -1,3 +1,11 @@
+"""Playlist match scoring (local embeddings, Spotify audio features, web).
+
+SECURITY NOTE: the ``WEB_SCORE_*`` (and ``WEB_SEARCH_*``) environment variables
+specify shell-style command lines that the web-scoring provider tokenizes and
+executes as local subprocesses. They run arbitrary local commands with the
+privileges of the current user. Only set them to trusted values.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,6 +13,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,6 +26,11 @@ import numpy as np
 from models import Song
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on chained fallback retries for a single web-scoring command run,
+# guarding against an unexpected retry loop while leaving the known codex
+# fallbacks room to run.
+_MAX_RUN_DEPTH = 4
 
 
 @dataclass
@@ -277,16 +291,51 @@ class WebSearchScoreProvider(ScoreProvider):
         }
 
     def _run_command(self, label: str, command: str, payload: dict) -> Dict[str, float]:
+        """Public entry: tokenize the command string ONCE, then delegate.
+
+        The argv list is threaded through recursive retries rather than being
+        re-joined and re-split each time (which previously corrupted multi-word
+        arguments such as ``--output-schema``).
+        """
+
         try:
-            args = shlex.split(command)
+            argv = shlex.split(command)
         except ValueError as exc:
             logger.warning("Invalid command for %s: %s", label, exc)
             return {}
+        return self._run_command_argv(label, argv, payload)
 
+    def _run_command_argv(
+        self, label: str, argv: List[str], payload: dict, _depth: int = 0
+    ) -> Dict[str, float]:
+        if not argv:
+            logger.warning("Empty web scoring command for %s.", label)
+            return {}
+
+        if _depth > _MAX_RUN_DEPTH:
+            logger.warning(
+                "Web scoring command for %s exceeded max retry depth (%s); giving up.",
+                label,
+                _MAX_RUN_DEPTH,
+            )
+            return {}
+
+        args = list(argv)
         input_text = json.dumps(payload)
         is_codex_cli = label == "codex" and self._is_codex_cli(args)
         if is_codex_cli:
             args, input_text = self._prepare_codex_command(args, payload)
+
+        # Validate the executable resolves before running it (the WEB_SCORE_*
+        # env vars run arbitrary local commands; see module note).
+        if shutil.which(args[0]) is None:
+            logger.error(
+                "Web scoring command for %s is not runnable: executable %r not found on PATH.",
+                label,
+                args[0],
+            )
+            return {}
+        logger.debug("Running web scoring command for %s: %r", label, args)
 
         try:
             result = subprocess.run(
@@ -306,25 +355,29 @@ class WebSearchScoreProvider(ScoreProvider):
                 logger.warning("%s stderr: %s", label, result.stderr.strip())
                 if is_codex_cli and self._stderr_needs_tty(result.stderr):
                     logger.info("Retrying %s with codex exec (non-interactive)", label)
-                    return self._run_command(label, "codex exec -", payload)
+                    return self._run_command_argv(
+                        label, ["codex", "exec", "-"], payload, _depth + 1
+                    )
                 if is_codex_cli and self._stderr_unknown_argument(result.stderr):
                     flag = self._stderr_unknown_argument_flag(result.stderr)
                     if flag:
                         logger.info("Retrying %s without unsupported flag %s", label, flag)
                         if flag == "--search" and os.getenv("OPENAI_API_KEY"):
-                            wrapper_cmd = _default_openai_web_score_command()
-                            if wrapper_cmd != command:
+                            wrapper_argv = shlex.split(_default_openai_web_score_command())
+                            if wrapper_argv != args:
                                 logger.info(
                                     "Codex CLI does not support --search; falling back to OpenAI web scoring wrapper."
                                 )
-                                return self._run_command(label, wrapper_cmd, payload)
+                                return self._run_command_argv(
+                                    label, wrapper_argv, payload, _depth + 1
+                                )
                         stripped = self._strip_flag(
                             args, flag, takes_value=(flag == "--output-schema")
                         )
-                        return self._run_command(label, " ".join(stripped), payload)
+                        return self._run_command_argv(label, stripped, payload, _depth + 1)
                     logger.info("Retrying %s without unsupported codex flags", label)
                     stripped = self._strip_flag(args, "--search", takes_value=False)
-                    return self._run_command(label, " ".join(stripped), payload)
+                    return self._run_command_argv(label, stripped, payload, _depth + 1)
             return {}
 
         try:
