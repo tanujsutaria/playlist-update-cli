@@ -22,7 +22,12 @@ from nextgen.scoring import SearchScoreConfig
 from rotation_manager import RotationManager
 from scoring import PlaylistScoreConfig
 from song_store import SongStore
-from spotify_manager import SpotifyManager, get_cached_token_info, refresh_cached_token
+from spotify_manager import (
+    SpotifyManager,
+    get_cached_token_info,
+    refresh_cached_token,
+    scope_error_hint,
+)
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
@@ -1390,7 +1395,8 @@ class PlaylistCLI:
                 warning(f"Unknown ingest source: {source}")
                 return
         except Exception as exc:
-            warning(f"Ingest failed: {exc}")
+            hint = scope_error_hint(exc)
+            warning(hint if hint else f"Ingest failed: {exc}")
             return
 
         info(f"Ingested {ingested} tracks.")
@@ -1439,7 +1445,8 @@ class PlaylistCLI:
             payload = sp.current_user_recently_played(limit=limit)
             items = payload.get("items") or []
         except Exception as exc:
-            warning(f"Listen sync failed: {exc}")
+            hint = scope_error_hint(exc)
+            warning(hint if hint else f"Listen sync failed: {exc}")
             return
 
         added = 0

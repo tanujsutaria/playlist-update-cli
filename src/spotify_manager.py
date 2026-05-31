@@ -69,7 +69,33 @@ SPOTIFY_SCOPES = [
     "playlist-modify-private",
     "playlist-read-private",
     "user-library-read",
+    # Reading the user's listening signal (recently-played + top tracks/artists)
+    # for /listen-sync and /ingest {recent,top}. Without these the API returns
+    # 403 "Insufficient client scope".
+    "user-read-recently-played",
+    "user-top-read",
 ]
+
+SCOPE_REAUTH_HINT = (
+    "Spotify denied this request for a missing permission (scope). The app's "
+    "requested scopes changed since you last authorized, so your cached token is "
+    "stale. Re-authorize: delete .spotify_cache/.spotify_token and re-run the "
+    "command, then approve the Spotify consent screen."
+)
+
+
+def scope_error_hint(exc: Exception) -> Optional[str]:
+    """Return an actionable re-auth hint if `exc` is a Spotify insufficient-scope
+    error (HTTP 403 whose message mentions scope), otherwise None.
+
+    Matches spotipy's SpotifyException, which exposes `http_status`; falls back
+    to the stringified message so it also catches wrapped/re-raised errors.
+    """
+    status = getattr(exc, "http_status", None)
+    message = str(exc).lower()
+    if status == 403 and "scope" in message:
+        return SCOPE_REAUTH_HINT
+    return None
 
 
 class _SecureCacheFileHandler(spotipy.cache_handler.CacheFileHandler):
