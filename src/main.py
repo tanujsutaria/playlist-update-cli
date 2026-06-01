@@ -17,6 +17,7 @@ from rich.logging import RichHandler
 from config import AppConfig, env_flag, env_int
 from models import Song, track_id_for
 from nextgen.embeddings import EmbeddingModel
+from nextgen.enrich import enrich_track
 from nextgen.pipeline import SearchPipeline, SearchResult
 from nextgen.scoring import SearchScoreConfig
 from rotation_manager import RotationManager
@@ -2263,6 +2264,77 @@ class PlaylistCLI:
             warning(f"Failed to undo the last change to '{playlist_name}'.")
         return success
 
+    def enrich_library(self, limit: int = 25, dry_run: bool = False) -> int:
+        """Backfill semantic context + re-embed library tracks that lack context.
+
+        Each track is a real deep-search call, so this is bounded by `limit`
+        (default 25) — a full-library backfill is an explicit, larger `--limit`.
+        Tracks whose deep-search results don't surface them are left untouched.
+        Returns the number of tracks enriched.
+        """
+        section("Enrich Library")
+        info("Semantic context only (genre/mood/era/style) — not acoustic audio features.")
+        rows = self.repos.conn.execute(
+            """
+            SELECT t.track_id, t.name, t.artist_id, a.name AS artist_name
+            FROM tracks t
+            LEFT JOIN track_context c ON c.track_id = t.track_id
+            LEFT JOIN artists a ON a.artist_id = t.artist_id
+            WHERE c.track_id IS NULL
+            ORDER BY t.track_id
+            LIMIT ?
+            """,
+            (max(0, limit),),
+        ).fetchall()
+        if not rows:
+            info("Nothing to enrich — every track already has context.")
+            return 0
+
+        def _name_artist(row: Any) -> Tuple[str, str]:
+            return (row["name"] or "", row["artist_name"] or row["artist_id"] or "")
+
+        total = len(rows)
+        info(f"Found {total} track(s) without context (limit {limit}).")
+        if dry_run:
+            for row in rows:
+                name, artist = _name_artist(row)
+                info(f"  would enrich: {name} — {artist}")
+            info(f"Dry run: {total} track(s) would be enriched. Re-run without --dry-run.")
+            return 0
+
+        pipeline = self.search_pipeline  # single source of truth for model + thresholds
+        enriched = skipped = failed = 0
+        for row in rows:
+            name, artist = _name_artist(row)
+            try:
+                ok = enrich_track(
+                    self.repos,
+                    track_id=row["track_id"],
+                    name=name,
+                    artist=artist,
+                    model_name=pipeline.model_name,
+                    strict_threshold=pipeline.strict_threshold,
+                    lenient_threshold=pipeline.lenient_threshold,
+                )
+            except Exception as exc:
+                failed += 1
+                warning(f"Enrich failed for {name} — {artist}: {exc}")
+                continue
+            if ok:
+                enriched += 1
+                info(f"  enriched: {name} — {artist}")
+            else:
+                skipped += 1
+                info(f"  no match, left as-is: {name} — {artist}")
+        key_value_table(
+            [
+                ["Enriched", enriched],
+                ["No match (skipped)", skipped],
+                ["Failed", failed],
+            ]
+        )
+        return enriched
+
     def debug_last_search(self) -> Optional[Dict[str, object]]:
         """Return debug payload for the last search run."""
         run_id = self.last_search_run_id
@@ -2624,6 +2696,11 @@ def _handle_undo(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_enrich(cli: "PlaylistCLI", args: Any) -> int:
+    cli.enrich_library(limit=getattr(args, "limit", 25), dry_run=getattr(args, "dry_run", False))
+    return 0
+
+
 def _present_debug_track(payload: dict) -> None:
     """Render the `debug track` payload as tables (output unchanged)."""
     track = payload.get("track") or {}
@@ -2838,6 +2915,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "clean": _handle_clean,
     "search": _handle_search,
     "undo": _handle_undo,
+    "enrich": _handle_enrich,
     "debug": _handle_debug,
     "ingest": _handle_ingest,
     "listen-sync": _handle_listen_sync,

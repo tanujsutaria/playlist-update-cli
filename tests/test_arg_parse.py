@@ -42,6 +42,7 @@ class TestSetupParsers:
             "auth-refresh",
             "search",
             "undo",
+            "enrich",
             "debug",
             "interactive",
             "ingest",
@@ -455,6 +456,23 @@ class TestUndoCommand:
         parser = setup_parsers()
         args = parser.parse_args(["undo"])
         assert args.command == "undo"
+
+
+class TestEnrichCommand:
+    """/enrich backfills semantic context; bounded by --limit, with --dry-run."""
+
+    def test_parse_enrich_defaults(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["enrich"])
+        assert args.command == "enrich"
+        assert args.limit == 25
+        assert args.dry_run is False
+
+    def test_parse_enrich_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["enrich", "--limit", "100", "--dry-run"])
+        assert args.limit == 100
+        assert args.dry_run is True
 
 
 class TestIngestCommand:

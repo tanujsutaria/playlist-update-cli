@@ -210,6 +210,23 @@ def setup_parsers(
     # Undo command (reverts the last playlist write this session)
     subparsers.add_parser("undo", help="Undo the last playlist change made this session")
 
+    # Enrich command (semantic context backfill + re-embed)
+    enrich_parser = subparsers.add_parser(
+        "enrich", help="Backfill semantic context + re-embed tracks (genre/mood/era; not acoustic)"
+    )
+    enrich_parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        metavar="N",
+        help="Max tracks to enrich (default 25; each is a deep-search call)",
+    )
+    enrich_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the tracks that would be enriched without calling out or writing",
+    )
+
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")
     debug_parser.add_argument(
