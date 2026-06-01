@@ -90,6 +90,8 @@ class TestHelpCommand:
         assert "Insight" in text
         # ...and commands land in them (e.g. the new /profile under Insight).
         assert "/profile" in text
+        # /undo is surfaced under Playlists.
+        assert "/undo" in text
 
     def test_help_hides_legacy_by_default(self, monkeypatch):
         app = _make_app(monkeypatch)

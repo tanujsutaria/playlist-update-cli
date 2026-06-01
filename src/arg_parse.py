@@ -207,6 +207,9 @@ def setup_parsers(
         help="With --to: only add the top N ranked results (default: all)",
     )
 
+    # Undo command (reverts the last playlist write this session)
+    subparsers.add_parser("undo", help="Undo the last playlist change made this session")
+
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")
     debug_parser.add_argument(

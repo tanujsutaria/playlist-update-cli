@@ -43,7 +43,9 @@ def _cli(tmp_path):
     cli = PlaylistCLI.__new__(PlaylistCLI)
     cli._repos = Repositories(conn)
     cli._spotify = MagicMock()
+    cli._spotify.get_playlist_tracks.return_value = []  # empty playlist before the write
     cli._db = MagicMock()
+    cli._undo_stack = []
     return cli
 
 
@@ -61,6 +63,9 @@ class TestAddSearchToPlaylist:
         assert [s.name for s in songs] == ["Alpha", "Beta"]
         assert {s.artist for s in songs} == {"Wild Nothing"}
         cli._db._save_state.assert_called_once()
+        # A successful write records an undo snapshot of the pre-write contents.
+        assert len(cli._undo_stack) == 1
+        assert cli._undo_stack[-1]["playlist"] == "My Mix"
 
     def test_replace_routes_to_replace_items(self, tmp_path, capsys):
         cli = _cli(tmp_path)
@@ -88,6 +93,7 @@ class TestAddSearchToPlaylist:
         cli._spotify.append_to_playlist.return_value = False
         assert cli.add_search_to_playlist("Mix", ["wild nothing|||a"]) is False
         cli._db._save_state.assert_not_called()
+        assert cli._undo_stack == []  # a failed write leaves nothing to undo
 
     def test_never_uses_destructive_refresh(self, tmp_path):
         """Safety invariant: a typo'd NAME can never delete+recreate a playlist."""
