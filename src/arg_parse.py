@@ -93,6 +93,17 @@ def setup_parsers(
         help="Number of top artists to chart (default: 15)",
     )
 
+    # Taste command (current sonic/semantic preference card)
+    taste_parser = subparsers.add_parser(
+        "taste", help="Show your current taste profile (representative tracks)"
+    )
+    taste_parser.add_argument(
+        "--top",
+        type=_positive_int,
+        default=8,
+        help="Number of representative tracks to show (default: 8)",
+    )
+
     # View command
     view_parser = subparsers.add_parser("view", help="View current playlist contents")
     view_parser.add_argument("playlist", help="Name of the playlist")

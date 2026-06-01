@@ -51,6 +51,7 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "list-rotations",
     "stats",
     "profile",
+    "taste",
     "plan",
     "search",
     "interactive",
@@ -78,7 +79,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         ],
     ),
     ("Discover", ["search"]),
-    ("Insight", ["stats", "profile", "list-rotations", "list-backups"]),
+    ("Insight", ["stats", "profile", "taste", "list-rotations", "list-backups"]),
 ]
 HELP_LEGACY = {"import"}
 
