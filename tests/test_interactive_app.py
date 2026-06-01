@@ -92,6 +92,8 @@ class TestHelpCommand:
         assert "/profile" in text
         # /undo is surfaced under Playlists.
         assert "/undo" in text
+        # /enrich is surfaced under Set up.
+        assert "/enrich" in text
 
     def test_help_hides_legacy_by_default(self, monkeypatch):
         app = _make_app(monkeypatch)
