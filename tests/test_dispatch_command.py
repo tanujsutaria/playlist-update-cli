@@ -172,6 +172,62 @@ class TestDispatchSearch:
         cli.search_songs.assert_called_once_with(["late", "night", "jazz"])
 
 
+# ---- search write-through (--to / --save / --replace / --limit) ----
+class TestDispatchSearchWriteThrough:
+    def _args(self, **over):
+        base = dict(query=["jazz"], to_playlist=None, replace=False, save=False, limit=None)
+        base.update(over)
+        return _make_args(**base)
+
+    def test_to_playlist_appends_by_default(self, cli):
+        cli.search_songs = MagicMock()
+        cli.add_search_to_playlist = MagicMock()
+        cli.mark_search_tracks = MagicMock()
+        cli.last_search_track_ids = ["a|||x", "b|||y"]
+        rc = dispatch_command(cli, "search", self._args(to_playlist="My Mix"))
+        assert rc == 0
+        cli.add_search_to_playlist.assert_called_once_with(
+            "My Mix", ["a|||x", "b|||y"], replace=False
+        )
+        cli.mark_search_tracks.assert_not_called()
+        assert cli.last_search_handled is True
+
+    def test_replace_and_limit_are_threaded(self, cli):
+        cli.search_songs = MagicMock()
+        cli.add_search_to_playlist = MagicMock()
+        cli.last_search_track_ids = ["a|||x", "b|||y", "c|||z"]
+        dispatch_command(cli, "search", self._args(to_playlist="Mix", replace=True, limit=2))
+        cli.add_search_to_playlist.assert_called_once_with("Mix", ["a|||x", "b|||y"], replace=True)
+
+    def test_save_marks_accepted_without_writing(self, cli):
+        cli.search_songs = MagicMock()
+        cli.mark_search_tracks = MagicMock()
+        cli.add_search_to_playlist = MagicMock()
+        cli.last_search_track_ids = ["a|||x", "b|||y"]
+        dispatch_command(cli, "search", self._args(save=True))
+        cli.mark_search_tracks.assert_called_once_with(["a|||x", "b|||y"], status="accepted")
+        cli.add_search_to_playlist.assert_not_called()
+        assert cli.last_search_handled is True
+
+    def test_no_flags_neither_writes_nor_marks(self, cli):
+        cli.search_songs = MagicMock()
+        cli.mark_search_tracks = MagicMock()
+        cli.add_search_to_playlist = MagicMock()
+        cli.last_search_track_ids = ["a|||x"]
+        cli.last_search_handled = False
+        dispatch_command(cli, "search", self._args())
+        cli.mark_search_tracks.assert_not_called()
+        cli.add_search_to_playlist.assert_not_called()
+        assert cli.last_search_handled is False
+
+    def test_no_results_skips_write(self, cli):
+        cli.search_songs = MagicMock()
+        cli.add_search_to_playlist = MagicMock()
+        cli.last_search_track_ids = None
+        dispatch_command(cli, "search", self._args(to_playlist="Mix"))
+        cli.add_search_to_playlist.assert_not_called()
+
+
 # ---- debug ----
 class TestDispatchDebug:
     def test_debug_last_default(self, cli):

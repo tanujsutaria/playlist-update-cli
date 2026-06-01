@@ -182,6 +182,30 @@ def setup_parsers(
     # Search command
     search_parser = subparsers.add_parser("search", help="Deep web search for new songs")
     search_parser.add_argument("query", nargs="+", help="Search criteria (freeform)")
+    search_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        default=None,
+        help="Add the results straight to playlist NAME (skips the interactive prompts)",
+    )
+    search_parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="With --to: swap the playlist's contents (keeps the playlist/ID); default is to append",
+    )
+    search_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Mark the results as accepted in the local library",
+    )
+    search_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --to: only add the top N ranked results (default: all)",
+    )
 
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")

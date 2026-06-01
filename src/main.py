@@ -91,6 +91,7 @@ class PlaylistCLI:
         self.last_search_run_id = None
         self.last_search_track_ids = None
         self.last_search_cached = False
+        self.last_search_handled = False
 
     @property
     def db(self) -> SongStore:
@@ -165,6 +166,9 @@ class PlaylistCLI:
         self.last_search_run_id = None
         self.last_search_track_ids = None
         self.last_search_cached = False
+        # True once a /search invocation already handled its own follow-up
+        # (via --to/--save), so the interactive UI skips the modal prompts.
+        self.last_search_handled = False
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
@@ -1419,6 +1423,9 @@ class PlaylistCLI:
         self.last_search_policy = {"path": "nextgen", "expanded": expanded}
         self.last_search_run_id = run_id
         self.last_search_track_ids = [item.track_id for item in results]
+        # A fresh search re-arms the interactive follow-up; the handler flips
+        # this back on if --to/--save already dealt with the results.
+        self.last_search_handled = False
 
     def ingest_tracks(
         self, source: str, name: Optional[str] = None, time_range: str = "medium_term"
@@ -2147,11 +2154,8 @@ class PlaylistCLI:
             self.repos.tracks.update_status(track_id, status, reason, now)
         self.repos.conn.commit()
 
-    def create_playlist_from_track_ids(self, playlist_name: str, track_ids: List[str]) -> bool:
-        """Create or append to a playlist using cached track IDs."""
-        if not track_ids:
-            warning("No tracks available to create a playlist.")
-            return False
+    def _songs_from_track_ids(self, track_ids: List[str]) -> List[Song]:
+        """Resolve cached track IDs into Song objects, skipping any unknown IDs."""
         songs: List[Song] = []
         for track_id in track_ids:
             record = self.repos.tracks.get(track_id)
@@ -2161,15 +2165,65 @@ class PlaylistCLI:
             artist_record = self.repos.artists.get(record.get("artist_id") or "")
             if artist_record and artist_record.get("name"):
                 artist_name = artist_record.get("name")
-            song = Song(
-                id=track_id,
-                name=record.get("name") or "",
-                artist=artist_name,
-                spotify_uri=record.get("spotify_id"),
-                first_added=datetime.now(),
+            songs.append(
+                Song(
+                    id=track_id,
+                    name=record.get("name") or "",
+                    artist=artist_name,
+                    spotify_uri=record.get("spotify_id"),
+                    first_added=datetime.now(),
+                )
             )
-            songs.append(song)
-        return self.create_playlist_from_search_results(playlist_name, songs)
+        return songs
+
+    def create_playlist_from_track_ids(self, playlist_name: str, track_ids: List[str]) -> bool:
+        """Create or append to a playlist using cached track IDs."""
+        if not track_ids:
+            warning("No tracks available to create a playlist.")
+            return False
+        return self.create_playlist_from_search_results(
+            playlist_name, self._songs_from_track_ids(track_ids)
+        )
+
+    def add_search_to_playlist(
+        self,
+        playlist_name: str,
+        track_ids: List[str],
+        *,
+        replace: bool = False,
+    ) -> bool:
+        """Add cached search-result tracks to a Spotify playlist.
+
+        Two non-destructive modes:
+          * append (default) — add the tracks, leaving any existing ones in place.
+          * replace          — swap the playlist's contents while keeping the same
+            playlist (and its Spotify ID, URL, and followers).
+
+        The destructive delete-and-recreate path (refresh_playlist) is never used
+        here, so a typo'd NAME can at worst create/append to a playlist — it can
+        never wipe an unrelated playlist's identity.
+        """
+        if not track_ids:
+            warning("No tracks available to add.")
+            return False
+        songs = self._songs_from_track_ids(track_ids)
+        if not songs:
+            warning("None of the search results could be resolved to tracks.")
+            return False
+        section("Replace Playlist" if replace else "Add to Playlist", playlist_name)
+        if replace:
+            info(f"Swapping the contents of '{playlist_name}' (the playlist itself is kept).")
+            success = self.spotify.replace_playlist_items(playlist_name, songs)
+        else:
+            success = self.spotify.append_to_playlist(playlist_name, songs)
+        if success:
+            # Persist any Spotify URIs discovered while matching the tracks.
+            self.db._save_state()
+            verb = "Replaced" if replace else "Added"
+            info(f"{verb} {len(songs)} track(s) in playlist '{playlist_name}'.")
+        else:
+            warning(f"Failed to update playlist '{playlist_name}'.")
+        return success
 
     def debug_last_search(self) -> Optional[Dict[str, object]]:
         """Return debug payload for the last search run."""
@@ -2506,6 +2560,24 @@ def _handle_clean(cli: "PlaylistCLI", args: Any) -> int:
 
 def _handle_search(cli: "PlaylistCLI", args: Any) -> int:
     cli.search_songs(args.query)
+    track_ids = cli.last_search_track_ids or []
+    if not track_ids:
+        return 0
+    handled = False
+    if getattr(args, "save", False):
+        cli.mark_search_tracks(track_ids, status="accepted")
+        info(f"Marked {len(track_ids)} result(s) as accepted.")
+        handled = True
+    to_playlist = getattr(args, "to_playlist", None)
+    if to_playlist:
+        limit = getattr(args, "limit", None)
+        chosen = track_ids[:limit] if limit else track_ids
+        cli.add_search_to_playlist(to_playlist, chosen, replace=getattr(args, "replace", False))
+        handled = True
+    # Tell the interactive UI the results are already dealt with, so it doesn't
+    # also pop the yes/no -> db/playlist -> name follow-up prompts.
+    if handled:
+        cli.last_search_handled = True
     return 0
 
 
