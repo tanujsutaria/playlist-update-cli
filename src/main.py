@@ -31,7 +31,7 @@ from spotify_manager import (
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
-from storage.vectors import decode_vector, vector_norm
+from storage.vectors import decode_vector, taste_centroid, vector_norm
 from ui import (
     bar_chart,
     clear_preview,
@@ -643,6 +643,107 @@ class PlaylistCLI:
                 )
         except Exception as e:
             logger.error(f"Error showing profile: {str(e)}")
+
+    def _taste_seed(self) -> Tuple[list, str]:
+        """Return (rows, source_label) of embedded tracks that define current taste.
+
+        Prefers real listening (listen_events), falls back to rotation membership,
+        then the whole library. Uses JOINs (not Python IN-lists) so it stays correct
+        even when the seed is the full corpus (past SQLite's bound-variable limit).
+        """
+        conn = self.repos.conn
+        if conn.execute("SELECT 1 FROM listen_events LIMIT 1").fetchone():
+            rows = conn.execute(
+                "SELECT te.track_id AS track_id, te.embedding_blob AS embedding_blob "
+                "FROM track_embeddings te JOIN listen_events le ON le.track_id = te.track_id "
+                "GROUP BY te.track_id ORDER BY MAX(le.played_at) DESC LIMIT 200"
+            ).fetchall()
+            if rows:
+                return rows, "recent plays"
+        if conn.execute("SELECT 1 FROM generation_tracks LIMIT 1").fetchone():
+            rows = conn.execute(
+                "SELECT DISTINCT te.track_id AS track_id, te.embedding_blob AS embedding_blob "
+                "FROM track_embeddings te JOIN generation_tracks gt ON gt.track_id = te.track_id"
+            ).fetchall()
+            if rows:
+                return rows, "your rotation"
+        rows = conn.execute("SELECT track_id, embedding_blob FROM track_embeddings").fetchall()
+        return rows, "your library"
+
+    def _taste_display_rows(self, items: list, start: int = 1) -> list:
+        """Build [#, Track, Artist] rows for a list of (track_id, vec) pairs."""
+        out = []
+        for i, (track_id, _vec) in enumerate(items, start):
+            track = self.repos.tracks.get(track_id) or {}
+            artist = self.repos.artists.get(track.get("artist_id") or "") or {}
+            out.append([i, track.get("name") or track_id, artist.get("name") or "?"])
+        return out
+
+    def show_taste(self, top: int = 8) -> None:
+        """Render a 'current taste' card: the tracks most/least representative of the
+        centroid of your recent-listening (or rotation) embeddings.
+
+        HONEST CAVEAT: until /enrich runs, embeddings are derived from track titles +
+        artists (text), not acoustic features — so this is a SEMANTIC taste, not a
+        sonic one. Rows are ranked by closeness to the centroid; we deliberately show
+        RANKING, not raw cosine %, since normalized text-embedding cosines sit in a
+        compressed band where absolute percentages mislead.
+        """
+        try:
+            conn = self.repos.conn
+            rows, source = self._taste_seed()
+            seed = [(r["track_id"], decode_vector(r["embedding_blob"])) for r in rows]
+            if len(seed) < 3:
+                info(
+                    f"Not enough embedded tracks ({len(seed)}) to profile your taste yet — "
+                    "try /ingest or /search to add more."
+                )
+                return
+
+            centroid = taste_centroid(vec for _, vec in seed)
+            cnorm = vector_norm(centroid) or 1.0
+
+            def cos_to_centroid(vec: list) -> float:
+                denom = vector_norm(vec) * cnorm
+                return sum(a * b for a, b in zip(vec, centroid)) / denom if denom else 0.0
+
+            ranked = sorted(seed, key=lambda tv: cos_to_centroid(tv[1]), reverse=True)
+            # Distinct artists are free: track_id is "artist|||name".
+            n_artists = len({track_id.split("|||")[0] for track_id, _ in seed})
+
+            enriched = bool(conn.execute("SELECT 1 FROM track_context LIMIT 1").fetchone())
+            signal = (
+                "enriched (mood/genre/era + titles)"
+                if enriched
+                else "text-based (titles + artists)"
+            )
+
+            section("Your Taste", f"{source} · {signal}")
+            key_value_table(
+                [
+                    ["Built from", f"{len(seed)} tracks"],
+                    ["Distinct artists", n_artists],
+                    ["Signal", signal],
+                ]
+            )
+
+            subsection("Most representative")
+            table(["#", "Track", "Artist"], self._taste_display_rows(ranked[:top]))
+
+            if len(ranked) > top:
+                widest = list(reversed(ranked[top:]))[:top]  # lowest-cosine tracks first
+                subsection("Widest-ranging")
+                table(["#", "Track", "Artist"], self._taste_display_rows(widest))
+
+            hint = (
+                "Ranked by closeness to your taste centroid."
+                if enriched
+                else "Ranked by closeness to your taste centroid. This is a TEXT/semantic "
+                "profile (titles + artists) — run /enrich to make it reflect mood, genre, and sound."
+            )
+            info(hint)
+        except Exception as e:
+            logger.error(f"Error showing taste: {str(e)}")
 
     def show_stats(self, playlist_name: Optional[str] = None):
         """Show database and playlist statistics"""
@@ -2361,6 +2462,11 @@ def _handle_profile(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_taste(cli: "PlaylistCLI", args: Any) -> int:
+    cli.show_taste(args.top)
+    return 0
+
+
 def _handle_view(cli: "PlaylistCLI", args: Any) -> int:
     cli.view_playlist(args.playlist)
     return 0
@@ -2608,6 +2714,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "update": _handle_update,
     "stats": _handle_stats,
     "profile": _handle_profile,
+    "taste": _handle_taste,
     "view": _handle_view,
     "sync": _handle_sync,
     "extract": _handle_extract,

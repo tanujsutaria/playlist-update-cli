@@ -514,6 +514,21 @@ class TestProfileCommand:
         assert args.top == 5
 
 
+class TestTasteCommand:
+    """Tests for taste command parsing"""
+
+    def test_parse_taste_default_top(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["taste"])
+        assert args.command == "taste"
+        assert args.top == 8
+
+    def test_parse_taste_custom_top(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["taste", "--top", "3"])
+        assert args.top == 3
+
+
 class TestAuthCommands:
     """Tests for auth-status and auth-refresh command parsing"""
 

@@ -257,6 +257,16 @@ class TestDispatchProfile:
         cli.show_profile.assert_called_once_with(15)
 
 
+# ---- taste ----
+class TestDispatchTaste:
+    def test_taste_routes_correctly(self, cli):
+        cli.show_taste = MagicMock()
+        args = _make_args(top=8)
+        rc = dispatch_command(cli, "taste", args)
+        assert rc == 0
+        cli.show_taste.assert_called_once_with(8)
+
+
 # ---- backup ----
 class TestDispatchBackup:
     def test_backup_routes_correctly(self, cli):
