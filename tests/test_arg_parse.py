@@ -448,6 +448,11 @@ class TestSearchCommand:
         assert args.save is True
         assert args.to_playlist is None
 
+    def test_search_json_flag(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["search", "jazz"]).json is False
+        assert parser.parse_args(["search", "jazz", "--json"]).json is True
+
 
 class TestUndoCommand:
     """The /undo command takes no arguments."""
@@ -572,6 +577,11 @@ class TestProfileCommand:
         args = parser.parse_args(["profile", "--top", "5"])
         assert args.top == 5
 
+    def test_parse_profile_json(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["profile"]).json is False
+        assert parser.parse_args(["profile", "--json"]).json is True
+
 
 class TestTasteCommand:
     """Tests for taste command parsing"""
@@ -586,6 +596,11 @@ class TestTasteCommand:
         parser = setup_parsers()
         args = parser.parse_args(["taste", "--top", "3"])
         assert args.top == 3
+
+    def test_parse_taste_json(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["taste"]).json is False
+        assert parser.parse_args(["taste", "--json"]).json is True
 
 
 class TestAuthCommands:
