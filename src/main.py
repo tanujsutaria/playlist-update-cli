@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from rich.logging import RichHandler
 
 from config import AppConfig, env_flag, env_int
-from models import Song
+from models import Song, track_id_for
 from nextgen.embeddings import EmbeddingModel
 from nextgen.pipeline import SearchPipeline, SearchResult
 from nextgen.scoring import SearchScoreConfig
@@ -92,6 +92,9 @@ class PlaylistCLI:
         self.last_search_track_ids = None
         self.last_search_cached = False
         self.last_search_handled = False
+        # Session-scoped undo: each entry snapshots a playlist's tracks just
+        # before a write, so /undo can restore it. Cleared on restart.
+        self._undo_stack: List[Dict[str, Any]] = []
 
     @property
     def db(self) -> SongStore:
@@ -2125,21 +2128,6 @@ class PlaylistCLI:
         self._show_search_validation_summary(summary_stats, title="Search Validation Summary")
         return songs
 
-    def create_playlist_from_search_results(self, playlist_name: str, songs: List[Song]) -> bool:
-        """Create or append to a playlist from search results."""
-        if not songs:
-            warning("No songs available to create a playlist.")
-            return False
-        section("Create Playlist", playlist_name)
-        success = self.spotify.append_to_playlist(playlist_name, songs)
-        if success:
-            # Persist any URI changes discovered during Spotify search
-            self.db._save_state()
-            info(f"Playlist '{playlist_name}' updated with {len(songs)} tracks.")
-        else:
-            warning(f"Failed to update playlist '{playlist_name}'.")
-        return success
-
     def mark_search_tracks(
         self,
         track_ids: List[str],
@@ -2176,15 +2164,6 @@ class PlaylistCLI:
             )
         return songs
 
-    def create_playlist_from_track_ids(self, playlist_name: str, track_ids: List[str]) -> bool:
-        """Create or append to a playlist using cached track IDs."""
-        if not track_ids:
-            warning("No tracks available to create a playlist.")
-            return False
-        return self.create_playlist_from_search_results(
-            playlist_name, self._songs_from_track_ids(track_ids)
-        )
-
     def add_search_to_playlist(
         self,
         playlist_name: str,
@@ -2193,6 +2172,10 @@ class PlaylistCLI:
         replace: bool = False,
     ) -> bool:
         """Add cached search-result tracks to a Spotify playlist.
+
+        This is the single add-path: the interactive wizard and the headless
+        `/search --to` flags both route through here, so /undo only has to snapshot
+        in one place.
 
         Two non-destructive modes:
           * append (default) — add the tracks, leaving any existing ones in place.
@@ -2210,6 +2193,8 @@ class PlaylistCLI:
         if not songs:
             warning("None of the search results could be resolved to tracks.")
             return False
+        # Snapshot the current contents *before* mutating, so /undo can restore them.
+        prior = self._snapshot_playlist(playlist_name)
         section("Replace Playlist" if replace else "Add to Playlist", playlist_name)
         if replace:
             info(f"Swapping the contents of '{playlist_name}' (the playlist itself is kept).")
@@ -2219,10 +2204,63 @@ class PlaylistCLI:
         if success:
             # Persist any Spotify URIs discovered while matching the tracks.
             self.db._save_state()
+            self._record_undo(playlist_name, prior)
             verb = "Replaced" if replace else "Added"
             info(f"{verb} {len(songs)} track(s) in playlist '{playlist_name}'.")
+            info("Run /undo to revert this change.")
         else:
             warning(f"Failed to update playlist '{playlist_name}'.")
+        return success
+
+    def _snapshot_playlist(self, playlist_name: str) -> List[Dict[str, Any]]:
+        """Capture a playlist's current tracks (name/artist/uri) for undo.
+
+        Returns an empty list if the playlist doesn't exist yet (a write that
+        creates it) — undoing such a write then correctly clears it.
+        """
+        try:
+            return list(self.spotify.get_playlist_tracks(playlist_name) or [])
+        except Exception as exc:  # pragma: no cover - defensive; Spotify call
+            logger.warning(f"Could not snapshot '{playlist_name}' for undo: {exc}")
+            return []
+
+    def _record_undo(self, playlist_name: str, tracks: List[Dict[str, Any]]) -> None:
+        """Push a pre-write snapshot onto the session undo stack."""
+        self._undo_stack.append({"playlist": playlist_name, "tracks": list(tracks)})
+
+    def undo_last_write(self) -> bool:
+        """Restore the most recent playlist write made this session.
+
+        Uses the ID-preserving replace, so undo keeps the same playlist — it never
+        deletes and recreates it. The snapshot is popped only when the restore
+        succeeds, so a failed undo can be retried.
+        """
+        if not self._undo_stack:
+            info("Nothing to undo.")
+            return False
+        entry = self._undo_stack[-1]
+        playlist_name = entry["playlist"]
+        tracks = entry["tracks"]
+        section("Undo", playlist_name)
+        songs = [
+            Song(
+                id=track_id_for(track.get("artist") or "", track.get("name") or ""),
+                name=track.get("name") or "",
+                artist=track.get("artist") or "",
+                spotify_uri=track.get("uri"),
+                first_added=datetime.now(),
+            )
+            for track in tracks
+        ]
+        success = self.spotify.replace_playlist_items(playlist_name, songs)
+        if success:
+            self._undo_stack.pop()
+            if tracks:
+                info(f"Restored '{playlist_name}' to its previous {len(tracks)} track(s).")
+            else:
+                info(f"Cleared '{playlist_name}' (it had no tracks before the last change).")
+        else:
+            warning(f"Failed to undo the last change to '{playlist_name}'.")
         return success
 
     def debug_last_search(self) -> Optional[Dict[str, object]]:
@@ -2581,6 +2619,11 @@ def _handle_search(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_undo(cli: "PlaylistCLI", args: Any) -> int:
+    cli.undo_last_write()
+    return 0
+
+
 def _present_debug_track(payload: dict) -> None:
     """Render the `debug track` payload as tables (output unchanged)."""
     track = payload.get("track") or {}
@@ -2794,6 +2837,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "diff": _handle_diff,
     "clean": _handle_clean,
     "search": _handle_search,
+    "undo": _handle_undo,
     "debug": _handle_debug,
     "ingest": _handle_ingest,
     "listen-sync": _handle_listen_sync,

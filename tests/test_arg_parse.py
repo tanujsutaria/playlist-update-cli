@@ -41,6 +41,7 @@ class TestSetupParsers:
             "auth-status",
             "auth-refresh",
             "search",
+            "undo",
             "debug",
             "interactive",
             "ingest",
@@ -445,6 +446,15 @@ class TestSearchCommand:
         args = parser.parse_args(["search", "jazz", "--save"])
         assert args.save is True
         assert args.to_playlist is None
+
+
+class TestUndoCommand:
+    """The /undo command takes no arguments."""
+
+    def test_parse_undo(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["undo"])
+        assert args.command == "undo"
 
 
 class TestIngestCommand:

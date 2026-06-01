@@ -68,6 +68,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "update",
             "rotate",
             "sync",
+            "undo",
             "plan",
             "diff",
             "view",
@@ -978,7 +979,7 @@ class PlaylistInteractiveApp(App):
                 if mode in {"playlist", "both"}:
                     if not playlist_name:
                         return
-                    self.cli.create_playlist_from_track_ids(playlist_name, track_ids)
+                    self.cli.add_search_to_playlist(playlist_name, track_ids)
             finally:
                 self.call_from_thread(self._set_idle)
 

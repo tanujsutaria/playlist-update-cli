@@ -323,6 +323,16 @@ class TestDispatchTaste:
         cli.show_taste.assert_called_once_with(8)
 
 
+# ---- undo ----
+class TestDispatchUndo:
+    def test_undo_routes_correctly(self, cli):
+        cli.undo_last_write = MagicMock()
+        args = _make_args()
+        rc = dispatch_command(cli, "undo", args)
+        assert rc == 0
+        cli.undo_last_write.assert_called_once()
+
+
 # ---- backup ----
 class TestDispatchBackup:
     def test_backup_routes_correctly(self, cli):
