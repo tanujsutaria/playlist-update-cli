@@ -415,6 +415,37 @@ class TestSearchCommand:
         with pytest.raises(SystemExit):
             parser.parse_args(["search"])
 
+    def test_search_write_flags_default_off(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["search", "late", "night", "jazz"])
+        assert args.to_playlist is None
+        assert args.replace is False
+        assert args.save is False
+        assert args.limit is None
+
+    def test_search_to_playlist(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["search", "jazz", "--to", "My Mix"])
+        assert args.query == ["jazz"]
+        assert args.to_playlist == "My Mix"
+        assert args.replace is False
+
+    def test_search_replace_save_and_limit(self):
+        parser = setup_parsers()
+        args = parser.parse_args(
+            ["search", "jazz", "--to", "My Mix", "--replace", "--save", "--limit", "5"]
+        )
+        assert args.to_playlist == "My Mix"
+        assert args.replace is True
+        assert args.save is True
+        assert args.limit == 5
+
+    def test_search_save_without_to(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["search", "jazz", "--save"])
+        assert args.save is True
+        assert args.to_playlist is None
+
 
 class TestIngestCommand:
     """Tests for ingest command parsing"""

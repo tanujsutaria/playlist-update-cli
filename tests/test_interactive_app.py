@@ -451,3 +451,32 @@ class TestParseErrorDisplay:
         app._handle_command("/update")  # missing playlist argument
         assert app.commands == []
         assert app.logged  # error panel was shown
+
+
+# ============================================================================
+# Search follow-up prompt (the modal wizard) — fires for a plain /search but is
+# suppressed once --to/--save already handled the results.
+# ============================================================================
+
+
+class TestSearchFollowupSuppression:
+    def test_wizard_fires_for_plain_search(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = [{"song": "X"}]
+        app.cli.last_search_handled = False
+        app._post_command("search")
+        assert app._pending_action == "search_confirm"
+
+    def test_wizard_suppressed_when_flags_handled(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = [{"song": "X"}]
+        app.cli.last_search_handled = True  # /search --to ... already added them
+        app._post_command("search")
+        assert app._pending_action is None
+
+    def test_no_wizard_without_results(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app.cli.last_search_handled = False
+        app._post_command("search")
+        assert app._pending_action is None

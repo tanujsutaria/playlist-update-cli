@@ -399,7 +399,11 @@ class PlaylistInteractiveApp(App):
             self.call_from_thread(self._post_command, command)
 
     def _post_command(self, command: str) -> None:
-        if command == "search" and self.cli.last_search_results:
+        if (
+            command == "search"
+            and self.cli.last_search_results
+            and not getattr(self.cli, "last_search_handled", False)
+        ):
             self._prompt_search_followup()
         self._set_idle()
 
