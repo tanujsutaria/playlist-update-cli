@@ -92,6 +92,9 @@ def setup_parsers(
         default=15,
         help="Number of top artists to chart (default: 15)",
     )
+    profile_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
 
     # Taste command (current sonic/semantic preference card)
     taste_parser = subparsers.add_parser(
@@ -102,6 +105,9 @@ def setup_parsers(
         type=_positive_int,
         default=8,
         help="Number of representative tracks to show (default: 8)",
+    )
+    taste_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
     )
 
     # View command
@@ -205,6 +211,11 @@ def setup_parsers(
         default=None,
         metavar="N",
         help="With --to: only add the top N ranked results (default: all)",
+    )
+    search_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the ranked results as machine-readable JSON (suppresses tables)",
     )
 
     # Undo command (reverts the last playlist write this session)

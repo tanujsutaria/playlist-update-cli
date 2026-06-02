@@ -14,6 +14,31 @@ from rich.text import Text
 console = Console()
 _output_sink: Optional[Callable[[RenderableType], None]] = None
 _preview_sink: Optional[Callable[[Optional[RenderableType]], None]] = None
+_json_mode: bool = False
+
+
+def set_json_mode(enabled: bool) -> None:
+    """Toggle machine-readable JSON mode.
+
+    While on, every decorative helper (section/table/info/charts/…) is silenced
+    at the single `_emit` choke point, so a command emits nothing but the one
+    `emit_json` payload — keeping stdout clean for piping.
+    """
+    global _json_mode
+    _json_mode = enabled
+
+
+def is_json_mode() -> bool:
+    return _json_mode
+
+
+def emit_json(payload: object) -> None:
+    """Print a JSON payload to stdout, bypassing Rich entirely.
+
+    Uses the builtin `print` (not the Rich console) so the output is never
+    wrapped, styled, or routed to a TUI sink — it stays valid JSON for `| jq`.
+    """
+    print(json.dumps(payload, indent=2, default=str))
 
 
 def set_output_sink(sink: Optional[Callable[[RenderableType], None]]) -> None:
@@ -29,6 +54,8 @@ def set_preview_sink(sink: Optional[Callable[[Optional[RenderableType]], None]])
 
 
 def _emit(renderable: Union[RenderableType, str]) -> None:
+    if _json_mode:
+        return
     if isinstance(renderable, str):
         renderable = Text(renderable)
     if _output_sink:
@@ -38,6 +65,8 @@ def _emit(renderable: Union[RenderableType, str]) -> None:
 
 
 def _emit_preview(renderable: Optional[RenderableType]) -> None:
+    if _json_mode:
+        return
     if _preview_sink:
         _preview_sink(renderable)
 

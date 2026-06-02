@@ -37,11 +37,13 @@ from ui import (
     bar_chart,
     clear_preview,
     console,
+    emit_json,
     info,
     json_output,
     key_value_table,
     preview_table,
     section,
+    set_json_mode,
     sparkline,
     subsection,
     table,
@@ -569,19 +571,30 @@ class PlaylistCLI:
             logger.error(f"Error viewing playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
 
-    def show_profile(self, top: int = 15) -> None:
+    def show_profile(self, top: int = 15) -> Optional[Dict[str, Any]]:
         """Visualize the library: top artists by track count + rotation coverage.
 
         Built entirely on fully-populated columns (track/artist identity and
         rotation history), so it is honest on the current corpus — unlike
         mood/genre views, which depend on track enrichment that has not run yet.
+
+        Returns the underlying data as a dict (also used for `--json`); None only
+        on error.
         """
         try:
             conn = self.repos.conn
             total_tracks = conn.execute("SELECT COUNT(*) AS c FROM tracks").fetchone()["c"]
             if not total_tracks:
                 info("No tracks in your library yet. Try /ingest or /search to add some.")
-                return
+                return {
+                    "tracks": 0,
+                    "artists": 0,
+                    "rotated": 0,
+                    "never_rotated": 0,
+                    "generations": 0,
+                    "top_artists": [],
+                    "coverage_growth": [],
+                }
 
             total_artists = conn.execute("SELECT COUNT(*) AS c FROM artists").fetchone()["c"]
             rotated = conn.execute(
@@ -632,9 +645,9 @@ class PlaylistCLI:
                 "SELECT generation_id AS gid FROM rotation_generations "
                 "ORDER BY generation_index ASC"
             ).fetchall()
+            growth: list[int] = []
             if len(gen_rows) >= 2:
                 seen: set[str] = set()
-                growth: list[int] = []
                 for gen in gen_rows:
                     for row in conn.execute(
                         "SELECT track_id FROM generation_tracks WHERE generation_id = ?",
@@ -649,8 +662,19 @@ class PlaylistCLI:
                         ["First → latest", f"{growth[0]} → {growth[-1]} distinct tracks"],
                     ]
                 )
+
+            return {
+                "tracks": total_tracks,
+                "artists": total_artists,
+                "rotated": rotated,
+                "never_rotated": never,
+                "generations": generations,
+                "top_artists": [{"name": r["name"], "tracks": r["c"]} for r in artist_rows],
+                "coverage_growth": growth,
+            }
         except Exception as e:
             logger.error(f"Error showing profile: {str(e)}")
+            return None
 
     def _taste_seed(self) -> Tuple[list, str]:
         """Return (rows, source_label) of embedded tracks that define current taste.
@@ -678,16 +702,28 @@ class PlaylistCLI:
         rows = conn.execute("SELECT track_id, embedding_blob FROM track_embeddings").fetchall()
         return rows, "your library"
 
-    def _taste_display_rows(self, items: list, start: int = 1) -> list:
-        """Build [#, Track, Artist] rows for a list of (track_id, vec) pairs."""
-        out = []
-        for i, (track_id, _vec) in enumerate(items, start):
+    def _taste_rows(self, items: list) -> list:
+        """Resolve a list of (track_id, vec) pairs to [{track_id, name, artist}]."""
+        rows = []
+        for track_id, _vec in items:
             track = self.repos.tracks.get(track_id) or {}
             artist = self.repos.artists.get(track.get("artist_id") or "") or {}
-            out.append([i, track.get("name") or track_id, artist.get("name") or "?"])
-        return out
+            rows.append(
+                {
+                    "track_id": track_id,
+                    "name": track.get("name") or track_id,
+                    "artist": artist.get("name") or "?",
+                }
+            )
+        return rows
 
-    def show_taste(self, top: int = 8) -> None:
+    def _taste_display_rows(self, items: list, start: int = 1) -> list:
+        """Build [#, Track, Artist] table rows for a list of (track_id, vec) pairs."""
+        return [
+            [i, row["name"], row["artist"]] for i, row in enumerate(self._taste_rows(items), start)
+        ]
+
+    def show_taste(self, top: int = 8) -> Optional[Dict[str, Any]]:
         """Render a 'current taste' card: the tracks most/least representative of the
         centroid of your recent-listening (or rotation) embeddings.
 
@@ -696,6 +732,9 @@ class PlaylistCLI:
         sonic one. Rows are ranked by closeness to the centroid; we deliberately show
         RANKING, not raw cosine %, since normalized text-embedding cosines sit in a
         compressed band where absolute percentages mislead.
+
+        Returns the underlying data as a dict (also used for `--json`); None only
+        on error or too-sparse data.
         """
         try:
             conn = self.repos.conn
@@ -706,7 +745,7 @@ class PlaylistCLI:
                     f"Not enough embedded tracks ({len(seed)}) to profile your taste yet — "
                     "try /ingest or /search to add more."
                 )
-                return
+                return None
 
             centroid = taste_centroid(vec for _, vec in seed)
             cnorm = vector_norm(centroid) or 1.0
@@ -735,9 +774,11 @@ class PlaylistCLI:
                 ]
             )
 
+            most = ranked[:top]
             subsection("Most representative")
-            table(["#", "Track", "Artist"], self._taste_display_rows(ranked[:top]))
+            table(["#", "Track", "Artist"], self._taste_display_rows(most))
 
+            widest: list = []
             if len(ranked) > top:
                 widest = list(reversed(ranked[top:]))[:top]  # lowest-cosine tracks first
                 subsection("Widest-ranging")
@@ -750,8 +791,19 @@ class PlaylistCLI:
                 "profile (titles + artists) — run /enrich to make it reflect mood, genre, and sound."
             )
             info(hint)
+
+            return {
+                "source": source,
+                "signal": signal,
+                "enriched": enriched,
+                "built_from": len(seed),
+                "distinct_artists": n_artists,
+                "most_representative": self._taste_rows(most),
+                "widest_ranging": self._taste_rows(widest),
+            }
         except Exception as e:
             logger.error(f"Error showing taste: {str(e)}")
+            return None
 
     def show_stats(self, playlist_name: Optional[str] = None):
         """Show database and playlist statistics"""
@@ -2622,12 +2674,26 @@ def _handle_stats(cli: "PlaylistCLI", args: Any) -> int:
 
 
 def _handle_profile(cli: "PlaylistCLI", args: Any) -> int:
-    cli.show_profile(args.top)
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    try:
+        payload = cli.show_profile(args.top)
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
     return 0
 
 
 def _handle_taste(cli: "PlaylistCLI", args: Any) -> int:
-    cli.show_taste(args.top)
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    try:
+        payload = cli.show_taste(args.top)
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
     return 0
 
 
@@ -2669,25 +2735,39 @@ def _handle_clean(cli: "PlaylistCLI", args: Any) -> int:
 
 
 def _handle_search(cli: "PlaylistCLI", args: Any) -> int:
-    cli.search_songs(args.query)
-    track_ids = cli.last_search_track_ids or []
-    if not track_ids:
-        return 0
-    handled = False
-    if getattr(args, "save", False):
-        cli.mark_search_tracks(track_ids, status="accepted")
-        info(f"Marked {len(track_ids)} result(s) as accepted.")
-        handled = True
-    to_playlist = getattr(args, "to_playlist", None)
-    if to_playlist:
-        limit = getattr(args, "limit", None)
-        chosen = track_ids[:limit] if limit else track_ids
-        cli.add_search_to_playlist(to_playlist, chosen, replace=getattr(args, "replace", False))
-        handled = True
-    # Tell the interactive UI the results are already dealt with, so it doesn't
-    # also pop the yes/no -> db/playlist -> name follow-up prompts.
-    if handled:
-        cli.last_search_handled = True
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    try:
+        cli.search_songs(args.query)
+        track_ids = cli.last_search_track_ids or []
+        handled = False
+        if track_ids:
+            if getattr(args, "save", False):
+                cli.mark_search_tracks(track_ids, status="accepted")
+                info(f"Marked {len(track_ids)} result(s) as accepted.")
+                handled = True
+            to_playlist = getattr(args, "to_playlist", None)
+            if to_playlist:
+                limit = getattr(args, "limit", None)
+                chosen = track_ids[:limit] if limit else track_ids
+                cli.add_search_to_playlist(
+                    to_playlist, chosen, replace=getattr(args, "replace", False)
+                )
+                handled = True
+            # Tell the interactive UI the results are already dealt with, so it
+            # doesn't also pop the yes/no -> db/playlist -> name follow-up prompts.
+            if handled:
+                cli.last_search_handled = True
+    finally:
+        if json_mode:
+            emit_json(
+                {
+                    "query": cli.last_search_query,
+                    "count": len(cli.last_search_results or []),
+                    "results": cli.last_search_results or [],
+                }
+            )
+        set_json_mode(False)
     return 0
 
 
