@@ -513,12 +513,14 @@ class TestEnrichCommand:
         assert args.command == "enrich"
         assert args.limit == 25
         assert args.dry_run is False
+        assert args.concurrency == 8
 
     def test_parse_enrich_flags(self):
         parser = setup_parsers()
-        args = parser.parse_args(["enrich", "--limit", "100", "--dry-run"])
+        args = parser.parse_args(["enrich", "--limit", "100", "--dry-run", "--concurrency", "16"])
         assert args.limit == 100
         assert args.dry_run is True
+        assert args.concurrency == 16
 
 
 class TestIngestCommand:
