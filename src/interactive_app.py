@@ -54,6 +54,7 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "taste",
     "plan",
     "search",
+    "find",
     "enrich",
     "interactive",
 }
@@ -80,7 +81,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "restore-previous-rotation",
         ],
     ),
-    ("Discover", ["search"]),
+    ("Discover", ["find", "search"]),
     ("Insight", ["stats", "profile", "taste", "list-rotations", "list-backups"]),
 ]
 HELP_LEGACY = {"import"}

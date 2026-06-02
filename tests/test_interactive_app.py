@@ -94,6 +94,8 @@ class TestHelpCommand:
         assert "/undo" in text
         # /enrich is surfaced under Set up.
         assert "/enrich" in text
+        # /find (the flagship) is surfaced under Discover.
+        assert "/find" in text
 
     def test_help_hides_legacy_by_default(self, monkeypatch):
         app = _make_app(monkeypatch)
@@ -403,7 +405,7 @@ class TestSetupModeGating:
                 app._handle_command(f'/{cmd} "Test"')
             elif cmd in ("restore",):
                 app._handle_command(f"/{cmd} backup_name")
-            elif cmd in ("search",):
+            elif cmd in ("search", "find"):
                 app._handle_command(f"/{cmd} jazz")
             elif cmd in ("plan",):
                 app._handle_command(f'/{cmd} "Test"')

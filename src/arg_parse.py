@@ -218,6 +218,42 @@ def setup_parsers(
         help="Emit the ranked results as machine-readable JSON (suppresses tables)",
     )
 
+    # Find command (flagship: deep search re-ranked by your taste)
+    find_parser = subparsers.add_parser(
+        "find", help="Deep search re-ranked by your taste; optionally add to a playlist"
+    )
+    find_parser.add_argument("query", nargs="+", help="Search criteria (freeform)")
+    find_parser.add_argument(
+        "--taste-weight",
+        dest="taste_weight",
+        type=float,
+        default=0.5,
+        metavar="W",
+        help="Blend 0..1: 1=pure taste, 0=pure relevance (default 0.5)",
+    )
+    find_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        default=None,
+        help="Add the ranked results to playlist NAME (otherwise preview only)",
+    )
+    find_parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="With --to: swap the playlist's contents (keeps the playlist/ID); default is append",
+    )
+    find_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --to: only add the top N ranked results (default: all)",
+    )
+    find_parser.add_argument(
+        "--json", action="store_true", help="Emit the ranked results as machine-readable JSON"
+    )
+
     # Undo command (reverts the last playlist write this session)
     subparsers.add_parser("undo", help="Undo the last playlist change made this session")
 

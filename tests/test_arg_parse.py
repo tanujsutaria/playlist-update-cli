@@ -41,6 +41,7 @@ class TestSetupParsers:
             "auth-status",
             "auth-refresh",
             "search",
+            "find",
             "undo",
             "enrich",
             "debug",
@@ -452,6 +453,46 @@ class TestSearchCommand:
         parser = setup_parsers()
         assert parser.parse_args(["search", "jazz"]).json is False
         assert parser.parse_args(["search", "jazz", "--json"]).json is True
+
+
+class TestFindCommand:
+    """/find: deep search re-ranked by taste, with optional write flags."""
+
+    def test_parse_find_defaults(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["find", "late", "night", "jazz"])
+        assert args.command == "find"
+        assert args.query == ["late", "night", "jazz"]
+        assert args.taste_weight == 0.5
+        assert args.to_playlist is None
+        assert args.replace is False
+        assert args.limit is None
+        assert args.json is False
+
+    def test_parse_find_all_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(
+            [
+                "find",
+                "jazz",
+                "--taste-weight",
+                "0.8",
+                "--to",
+                "My Mix",
+                "--replace",
+                "--limit",
+                "10",
+            ]
+        )
+        assert args.taste_weight == 0.8
+        assert args.to_playlist == "My Mix"
+        assert args.replace is True
+        assert args.limit == 10
+
+    def test_parse_find_requires_query(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["find"])
 
 
 class TestUndoCommand:
