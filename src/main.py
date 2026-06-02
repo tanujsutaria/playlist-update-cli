@@ -805,6 +805,79 @@ class PlaylistCLI:
             logger.error(f"Error showing taste: {str(e)}")
             return None
 
+    def taste_rank_last_search(self, taste_weight: float = 0.5) -> Tuple[List[Dict[str, Any]], str]:
+        """Re-rank the last search's results by a blend of search-relevance and
+        closeness to the user's taste centroid.
+
+        Both signals are min-max normalized *within this result set* before
+        blending (`blended = w*taste + (1-w)*relevance`) — raw cosine values sit
+        in a compressed band and aren't comparable to relevance scores. When
+        there's no usable taste signal (too few embedded seed tracks, or no result
+        carries an embedding), the blend collapses to pure relevance and the
+        returned signal string says so. Returns (ranked_rows, signal).
+        """
+        results = self.last_search_results or []
+        if not results:
+            return [], "no results"
+
+        seed_rows, source = self._taste_seed()
+        seed = [(r["track_id"], decode_vector(r["embedding_blob"])) for r in seed_rows]
+        enriched = bool(self.repos.conn.execute("SELECT 1 FROM track_context LIMIT 1").fetchone())
+        base = "enriched (mood/genre/era)" if enriched else "text-based (titles + artists)"
+        have_taste = len(seed) >= 3
+        centroid = taste_centroid(vec for _, vec in seed) if have_taste else []
+        cnorm = (vector_norm(centroid) or 1.0) if have_taste else 1.0
+
+        rows: List[Dict[str, Any]] = []
+        for item in results:
+            track_id = item.get("track_id")
+            taste_sim: Optional[float] = None
+            if have_taste and track_id:
+                emb = self.repos.embeddings.get(track_id)
+                if emb and emb.get("embedding_blob") is not None:
+                    vec = decode_vector(emb["embedding_blob"])
+                    denom = vector_norm(vec) * cnorm
+                    taste_sim = sum(a * b for a, b in zip(vec, centroid)) / denom if denom else 0.0
+            rows.append(
+                {
+                    "song": item.get("song"),
+                    "artist": item.get("artist"),
+                    "year": item.get("year"),
+                    "track_id": track_id,
+                    "relevance": float(item.get("score") or 0.0),
+                    "taste_sim": taste_sim,
+                }
+            )
+
+        def _minmax(values: List[float]) -> Callable[[float], float]:
+            lo, hi = min(values), max(values)
+            span = hi - lo
+            if span == 0:
+                return lambda _v: 1.0  # all tied on this axis -> let the other axis decide
+            return lambda v: (v - lo) / span
+
+        rel_norm = _minmax([r["relevance"] for r in rows])
+        taste_present = have_taste and any(r["taste_sim"] is not None for r in rows)
+        if taste_present:
+            taste_norm = _minmax([r["taste_sim"] for r in rows if r["taste_sim"] is not None])
+            weight = max(0.0, min(1.0, taste_weight))
+            signal = f"{source} · {base}"
+        else:
+            weight = 0.0
+            signal = f"no taste signal yet — ranking on relevance only ({base})"
+
+        for row in rows:
+            row["rel_norm"] = rel_norm(row["relevance"])
+            row["taste_norm"] = (
+                taste_norm(row["taste_sim"])
+                if (taste_present and row["taste_sim"] is not None)
+                else 0.0
+            )
+            row["blended"] = weight * row["taste_norm"] + (1 - weight) * row["rel_norm"]
+
+        rows.sort(key=lambda r: r["blended"], reverse=True)
+        return rows, signal
+
     def show_stats(self, playlist_name: Optional[str] = None):
         """Show database and playlist statistics"""
         try:
@@ -2771,6 +2844,82 @@ def _handle_search(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_find(cli: "PlaylistCLI", args: Any) -> int:
+    """Flagship: deep search, re-ranked by taste, optionally written to a playlist.
+
+    Composes search_songs (#search) -> taste_rank_last_search (taste centroid) ->
+    add_search_to_playlist (guarded, undoable). The intermediate search rendering
+    is suppressed so /find shows only the re-ranked view.
+    """
+    want_json = getattr(args, "json", False)
+    weight = max(0.0, min(1.0, getattr(args, "taste_weight", 0.5)))
+    to_playlist = getattr(args, "to_playlist", None)
+    limit = getattr(args, "limit", None)
+    replace = getattr(args, "replace", False)
+
+    # Run the search quietly — /find presents the re-ranked list, not the raw search.
+    set_json_mode(True)
+    ranked: List[Dict[str, Any]] = []
+    signal = ""
+    try:
+        cli.search_songs(args.query)
+        ranked, signal = cli.taste_rank_last_search(taste_weight=weight)
+    finally:
+        if not want_json:
+            set_json_mode(False)
+
+    def _chosen_ids() -> List[str]:
+        ids = [r["track_id"] for r in ranked if r.get("track_id")]
+        return ids[:limit] if limit else ids
+
+    if want_json:
+        wrote = None
+        if to_playlist and ranked:
+            chosen = _chosen_ids()
+            ok = cli.add_search_to_playlist(to_playlist, chosen, replace=replace)
+            cli.last_search_handled = True
+            wrote = {"playlist": to_playlist, "requested": len(chosen), "ok": bool(ok)}
+        emit_json(
+            {
+                "query": cli.last_search_query,
+                "taste_weight": weight,
+                "signal": signal,
+                "count": len(ranked),
+                "results": ranked,
+                "wrote": wrote,
+            }
+        )
+        set_json_mode(False)
+        return 0
+
+    if not ranked:
+        info("No results to rank.")
+        return 0
+    section("Find", cli.last_search_query)
+    info(f"Blend: {round(weight * 100)}% taste · {round((1 - weight) * 100)}% relevance — {signal}")
+    table(
+        ["#", "Song", "Artist", "Year", "Rel", "Taste", "Blend"],
+        [
+            [
+                i,
+                r["song"],
+                r["artist"],
+                r["year"] or "-",
+                f"{r['rel_norm']:.2f}",
+                f"{r['taste_norm']:.2f}",
+                f"{r['blended']:.2f}",
+            ]
+            for i, r in enumerate(ranked, 1)
+        ],
+    )
+    if to_playlist:
+        cli.add_search_to_playlist(to_playlist, _chosen_ids(), replace=replace)
+        cli.last_search_handled = True
+    else:
+        info("Preview only. Re-run with --to NAME to add these to a playlist.")
+    return 0
+
+
 def _handle_undo(cli: "PlaylistCLI", args: Any) -> int:
     cli.undo_last_write()
     return 0
@@ -2994,6 +3143,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "diff": _handle_diff,
     "clean": _handle_clean,
     "search": _handle_search,
+    "find": _handle_find,
     "undo": _handle_undo,
     "enrich": _handle_enrich,
     "debug": _handle_debug,
