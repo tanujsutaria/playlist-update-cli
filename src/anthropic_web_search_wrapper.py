@@ -27,6 +27,23 @@ DEFAULT_INSTRUCTIONS = (
     "'spotify_url'."
 )
 
+# The pipeline's structured-JSON answers (a `results` list with per-track context)
+# are long. A small cap silently truncates the response mid-object, so it fails to
+# parse and the wrapper returns ZERO results — which then trips the broken
+# `claude --json` CLI fallback. 4096 leaves room for a full results list.
+DEFAULT_WEB_SEARCH_MAX_TOKENS = 4096
+
+
+def _resolve_max_tokens(env: Optional[dict] = None) -> int:
+    """Resolve ANTHROPIC_WEB_SEARCH_MAX_TOKENS, defaulting to 4096 (not 1024)."""
+    source = env if env is not None else os.environ
+    try:
+        return int(
+            source.get("ANTHROPIC_WEB_SEARCH_MAX_TOKENS", str(DEFAULT_WEB_SEARCH_MAX_TOKENS))
+        )
+    except (ValueError, TypeError):
+        return DEFAULT_WEB_SEARCH_MAX_TOKENS
+
 
 def main() -> int:
     raw = sys.stdin.read()
@@ -52,10 +69,7 @@ def main() -> int:
         max_uses = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_USES", "5"))
     except ValueError:
         max_uses = 5
-    try:
-        max_tokens = int(os.getenv("ANTHROPIC_WEB_SEARCH_MAX_TOKENS", "1024"))
-    except ValueError:
-        max_tokens = 1024
+    max_tokens = _resolve_max_tokens()
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:

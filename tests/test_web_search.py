@@ -200,6 +200,41 @@ def test_claude_wrapper_fallbacks_to_cli(monkeypatch):
     assert len(results) == 1
 
 
+def test_claude_wrapper_no_cli_fallback_by_default(monkeypatch):
+    """With WEB_SEARCH_CLAUDE_FALLBACK_CLI unset, an empty wrapper result must NOT
+    retry the broken `claude --json` CLI — the fallback now defaults off."""
+    if shutil.which("claude") is None:
+        return
+
+    empty_wrapper_output = '{"summary":"","results":[]}'
+
+    class DummyResult:
+        def __init__(self, stdout: str):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    calls = {"count": 0}
+
+    def fake_run(args, input=None, text=None, capture_output=None, timeout=None, env=None):
+        calls["count"] += 1
+        return DummyResult(empty_wrapper_output)
+
+    monkeypatch.setattr("web_search.subprocess.run", fake_run)
+    monkeypatch.delenv("WEB_SEARCH_CLAUDE_FALLBACK_CLI", raising=False)
+    monkeypatch.setattr("web_search._is_anthropic_wrapper_command", lambda command: True)
+
+    results, summary = _run_command(
+        "claude",
+        "python -m src.anthropic_web_search_wrapper",
+        {"query": "x"},
+        10,
+    )
+
+    assert results == []
+    assert calls["count"] == 1  # only the wrapper ran; no CLI fallback
+
+
 def test_run_command_nonexistent_executable_fails_gracefully(monkeypatch):
     # A command whose executable does not resolve must fail gracefully (return
     # the empty result, not raise) and must never spawn a subprocess.

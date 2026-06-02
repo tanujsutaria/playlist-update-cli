@@ -500,7 +500,7 @@ def _run_command_argv(
         and _is_anthropic_wrapper_argv(args)
         and not results
         and _command_exists("claude")
-        and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=True)
+        and _env_truthy("WEB_SEARCH_CLAUDE_FALLBACK_CLI", default=False)
     ):
         if summary:
             logger.info(
