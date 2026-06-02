@@ -11,14 +11,19 @@ available (Spotify audio-features is dead for this app).
 The one piece the search pipeline never needed is a *known-track → context*
 bridge: the providers are freeform-query shaped and return a list of discoveries,
 so enriching one known track means synthesising a query, then matching a returned
-candidate back to the target by canonical id. Matching is exact (precision over
-recall) — a track we can't confidently identify is left unenriched rather than
-mislabelled with another song's context.
+candidate back to the target. Matching is high-confidence and tiered (exact id →
+normalized artist+title → fuzzy gated at MATCH_THRESHOLD), absorbing cross-source
+spelling variance (feat./&/diacritics/remaster suffixes) while still leaving a
+track we can't confidently identify unenriched rather than mislabelled.
 """
 
 from __future__ import annotations
 
+import difflib
+import re
+import unicodedata
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from storage.repos import Repositories
 from storage.vectors import encode_vector, vector_norm
@@ -35,6 +40,72 @@ from .providers import run_providers
 
 def _now() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+# A returned candidate is accepted only at HIGH confidence. Cross-source spelling
+# variance (feat./&/diacritics/punctuation/remaster+version suffixes) is normalized
+# away; a residual near-miss is accepted only if BOTH artist AND title clear this bar.
+MATCH_THRESHOLD = 0.9
+
+_FEAT_RE = re.compile(r"\b(feat|ft|featuring)\b.*", re.IGNORECASE)
+_BRACKET_RE = re.compile(r"[(\[][^)\]]*[)\]]")
+_SUFFIX_RE = re.compile(
+    r"\s*-\s*.*\b(remaster|remastered|radio edit|mono|stereo|version|mix|edit|live|acoustic)\b.*",
+    re.IGNORECASE,
+)
+
+
+def _normalize(text: str) -> str:
+    """Normalize a song/artist string so cross-source spellings compare equal."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))  # strip diacritics
+    text = text.lower()
+    text = _BRACKET_RE.sub(" ", text)  # drop "(feat. X)", "[Remaster]"
+    text = _SUFFIX_RE.sub(" ", text)  # drop "- 2011 Remaster", "- Radio Edit"
+    text = _FEAT_RE.sub(" ", text)  # drop trailing "feat. X"
+    text = text.replace("&", " and ")
+    text = text.replace("'", "").replace("’", "")  # drop apostrophes (don't split contractions)
+    text = re.sub(r"[^\w\s]", " ", text)  # remaining punctuation -> separators
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _match_target(items: List[Dict[str, Any]], artist: str, name: str) -> Optional[Dict[str, Any]]:
+    """Pick the candidate that IS the target track, at high confidence.
+
+    Tier 1: exact canonical id. Tier 2: normalized artist+title equality (absorbs
+    feat./&/diacritics/punctuation/remaster noise). Tier 3: fuzzy, accepted only if
+    BOTH normalized artist and title are >= MATCH_THRESHOLD similar. Returns None
+    rather than a low-confidence guess — precision over recall, so a track we can't
+    confidently identify is left unenriched, never mislabelled.
+    """
+    target = canonical_track_id(artist, name)
+    for item in items:
+        if item.get("track_id") == target:
+            return item
+
+    na, nt = _normalize(artist), _normalize(name)
+    if na and nt:
+        for item in items:
+            if (
+                _normalize(item.get("artist") or "") == na
+                and _normalize(item.get("song") or "") == nt
+            ):
+                return item
+
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for item in items:
+        score = min(
+            _ratio(_normalize(item.get("artist") or ""), na),
+            _ratio(_normalize(item.get("song") or ""), nt),
+        )
+        if score > best_score:
+            best_score, best = score, item
+    return best if best_score >= MATCH_THRESHOLD else None
 
 
 def enrich_track(
@@ -60,8 +131,7 @@ def enrich_track(
     """
     run = run_providers(query=f"{name} by {artist}")
     items = canonicalize_results(run.results)
-    target = canonical_track_id(artist, name)
-    match = next((item for item in items if item.get("track_id") == target), None)
+    match = _match_target(items, artist, name)
     if match is None:
         return False
 

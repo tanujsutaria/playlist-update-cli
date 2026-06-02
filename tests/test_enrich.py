@@ -15,7 +15,8 @@ import pytest
 import ui
 from main import PlaylistCLI
 from nextgen import enrich as enrich_mod
-from nextgen.enrich import enrich_track
+from nextgen.canonicalize import canonical_track_id
+from nextgen.enrich import _match_target, _normalize, enrich_track
 from nextgen.providers import ProviderRun
 from storage.db import Database
 from storage.migrations import ensure_schema
@@ -210,3 +211,75 @@ class TestEnrichLibrary:
         cli = self._cli(repos)
         # One raises (counted as failed), Two still enriches — the loop survives.
         assert cli.enrich_library(limit=10) == 1
+
+
+def _it(song, artist):
+    """A canonicalized provider result item (track_id mirrors what canonicalize sets)."""
+    return {"song": song, "artist": artist, "track_id": canonical_track_id(artist, song)}
+
+
+class TestMatchTarget:
+    """High-confidence matcher: absorbs cross-source spelling variance, but never
+    binds a low-confidence guess (precision over recall)."""
+
+    def test_exact(self):
+        items = [_it("Vices", "5ilas & Shimmer Johnson")]
+        assert _match_target(items, "5ilas & Shimmer Johnson", "Vices") is items[0]
+
+    def test_apostrophe(self):
+        items = [_it("Aint", "Some Artist")]
+        assert _match_target(items, "Some Artist", "Ain't") is items[0]
+
+    def test_curly_apostrophe(self):  # the real DB data uses U+2019
+        items = [_it("Aint", "Some Artist")]
+        assert _match_target(items, "Some Artist", "Ain’t") is items[0]
+
+    def test_ampersand_vs_and(self):
+        items = [_it("Salt and Pepper", "Duo")]
+        assert _match_target(items, "Duo", "Salt & Pepper") is items[0]
+
+    def test_feat_in_artist(self):
+        # Real case: DB artist "Amaarae"; source returns "Amaarae (feat. Moliy)".
+        items = [_it("Sad Girlz Luv Money", "Amaarae (feat. Moliy)")]
+        assert _match_target(items, "Amaarae", "Sad Girlz Luv Money") is items[0]
+
+    def test_remaster_suffix(self):
+        items = [_it("Heroes - 2017 Remaster", "David Bowie")]
+        assert _match_target(items, "David Bowie", "Heroes") is items[0]
+
+    def test_diacritics(self):
+        items = [_it("Crazy In Love", "Beyoncé")]
+        assert _match_target(items, "Beyonce", "Crazy In Love") is items[0]
+
+    def test_fuzzy_typo_within_threshold(self):
+        items = [_it("The Underside of Powers", "Algiers")]  # trailing-s typo
+        assert _match_target(items, "Algiers", "The Underside of Power") is items[0]
+
+    def test_distinct_song_not_matched(self):
+        items = [_it("Devices", "5ilas & Shimmer Johnson")]
+        assert _match_target(items, "5ilas & Shimmer Johnson", "Vices") is None
+
+    def test_wrong_artist_not_matched(self):
+        items = [_it("Vices", "Totally Different Band")]
+        assert _match_target(items, "5ilas & Shimmer Johnson", "Vices") is None
+
+    def test_no_items(self):
+        assert _match_target([], "X", "Y") is None
+
+    def test_picks_correct_among_several(self):
+        items = [
+            _it("Some Other Song", "Another Artist"),
+            _it("Vices", "5ilas & Shimmer Johnson"),
+            _it("Devices", "5ilas & Shimmer Johnson"),
+        ]
+        assert _match_target(items, "5ilas & Shimmer Johnson", "Vices")["song"] == "Vices"
+
+
+class TestNormalize:
+    def test_examples(self):
+        assert _normalize("Beyoncé") == "beyonce"
+        assert _normalize("Salt & Pepper") == "salt and pepper"
+        assert _normalize("Ain't") == "aint"
+        assert _normalize("Ain’t") == "aint"
+        assert _normalize("Heroes - 2017 Remaster") == "heroes"
+        assert _normalize("Song (feat. X)") == "song"
