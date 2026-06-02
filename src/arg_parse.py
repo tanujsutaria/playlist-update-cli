@@ -273,6 +273,13 @@ def setup_parsers(
         action="store_true",
         help="List the tracks that would be enriched without calling out or writing",
     )
+    enrich_parser.add_argument(
+        "--concurrency",
+        type=_positive_int,
+        default=8,
+        metavar="N",
+        help="Parallel deep-search workers (default 8); writes stay serialized",
+    )
 
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")

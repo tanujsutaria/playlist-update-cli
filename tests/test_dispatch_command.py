@@ -337,16 +337,16 @@ class TestDispatchUndo:
 class TestDispatchEnrich:
     def test_enrich_routes_correctly(self, cli):
         cli.enrich_library = MagicMock()
-        args = _make_args(limit=25, dry_run=False)
+        args = _make_args(limit=25, dry_run=False, concurrency=8)
         rc = dispatch_command(cli, "enrich", args)
         assert rc == 0
-        cli.enrich_library.assert_called_once_with(limit=25, dry_run=False)
+        cli.enrich_library.assert_called_once_with(limit=25, dry_run=False, concurrency=8)
 
     def test_enrich_passes_flags(self, cli):
         cli.enrich_library = MagicMock()
-        args = _make_args(limit=100, dry_run=True)
+        args = _make_args(limit=100, dry_run=True, concurrency=16)
         dispatch_command(cli, "enrich", args)
-        cli.enrich_library.assert_called_once_with(limit=100, dry_run=True)
+        cli.enrich_library.assert_called_once_with(limit=100, dry_run=True, concurrency=16)
 
 
 # ---- backup ----

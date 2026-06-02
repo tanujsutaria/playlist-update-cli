@@ -283,3 +283,89 @@ class TestNormalize:
         assert _normalize("Ain’t") == "aint"
         assert _normalize("Heroes - 2017 Remaster") == "heroes"
         assert _normalize("Song (feat. X)") == "song"
+
+
+class TestEnrichTracks:
+    """Parallel batch API: fan out the fetch, serialize the writes."""
+
+    def test_parallel_enriches_all(self, tmp_path, monkeypatch):
+        tracks = [(f"a|||{i}", f"Song{i}", "a", "A") for i in range(6)]
+        repos = _repos(tmp_path, tracks)
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        statuses = []
+        counts = enrich_mod.enrich_tracks(
+            repos,
+            [(f"a|||{i}", f"Song{i}", "A") for i in range(6)],
+            model_name="all-mpnet-base-v2",
+            strict_threshold=0.6,
+            lenient_threshold=0.75,
+            concurrency=4,
+            on_result=lambda status, name, artist: statuses.append(status),
+        )
+        assert counts == {"enriched": 6, "skipped": 0, "failed": 0}
+        # All writes landed despite parallel fetch (serialized, single connection).
+        assert repos.conn.execute("SELECT COUNT(*) FROM track_context").fetchone()[0] == 6
+        assert repos.conn.execute("SELECT COUNT(*) FROM track_embeddings").fetchone()[0] == 6
+        assert statuses.count("enriched") == 6  # on_result fired per track
+
+    def test_mixed_outcomes_counted(self, tmp_path, monkeypatch):
+        repos = _repos(
+            tmp_path,
+            [("a|||one", "One", "a", "A"), ("a|||two", "Two", "a", "A"), ("a|||x", "X", "a", "A")],
+        )
+
+        def _provider(query, **kw):
+            song, _, artist = query.partition(" by ")
+            if song == "One":
+                raise RuntimeError("fetch boom")  # fetch failure -> failed
+            if song == "Two":
+                return _provider_run([_item("Totally Different", "Nobody")])  # no match -> skipped
+            return _provider_run([_item(song, artist)])  # match -> enriched
+
+        monkeypatch.setattr(enrich_mod, "run_providers", _provider)
+        counts = enrich_mod.enrich_tracks(
+            repos,
+            [("a|||one", "One", "A"), ("a|||two", "Two", "A"), ("a|||x", "X", "A")],
+            model_name="all-mpnet-base-v2",
+            strict_threshold=0.6,
+            lenient_threshold=0.75,
+            concurrency=3,
+        )
+        assert counts == {"enriched": 1, "skipped": 1, "failed": 1}
+        assert repos.conn.execute("SELECT COUNT(*) FROM track_context").fetchone()[0] == 1
+
+    def test_empty_is_noop(self, tmp_path):
+        repos = _repos(tmp_path, [("a|||one", "One", "a", "A")])
+        counts = enrich_mod.enrich_tracks(
+            repos, [], model_name="m", strict_threshold=0.6, lenient_threshold=0.75
+        )
+        assert counts == {"enriched": 0, "skipped": 0, "failed": 0}
+
+    def test_failed_apply_does_not_leak_context(self, tmp_path, monkeypatch):
+        """Regression: a track whose embed/apply fails must NOT leave a staged
+        context row that a later track's commit flushes (the half-write leak)."""
+        repos = _repos(tmp_path, [("a|||boom", "Boom", "a", "A"), ("a|||good", "Good", "a", "A")])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+
+        class _Embedder:
+            def __init__(self, model_name):
+                self.model_name = model_name
+
+            def embed(self, texts):
+                if any("Boom" in t for t in texts):
+                    raise RuntimeError("embed boom")
+                return [[0.1, 0.2] for _ in texts]
+
+        monkeypatch.setattr(enrich_mod, "EmbeddingModel", _Embedder)
+        counts = enrich_mod.enrich_tracks(
+            repos,
+            [("a|||boom", "Boom", "A"), ("a|||good", "Good", "A")],
+            model_name="all-mpnet-base-v2",
+            strict_threshold=0.6,
+            lenient_threshold=0.75,
+            concurrency=2,
+        )
+        assert counts == {"enriched": 1, "skipped": 0, "failed": 1}
+        rows = [r[0] for r in repos.conn.execute("SELECT track_id FROM track_context").fetchall()]
+        assert rows == ["a|||good"]  # the failed track left nothing behind
+        assert repos.conn.execute("SELECT COUNT(*) FROM track_embeddings").fetchone()[0] == 1
