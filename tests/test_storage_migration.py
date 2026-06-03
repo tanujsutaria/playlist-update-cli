@@ -46,11 +46,12 @@ def test_schema_v4_tables_and_version(tmp_path: Path) -> None:
     assert "playlists" in names
     assert "rotation_generations" in names
     assert "generation_tracks" in names
-    assert _schema_version(conn) == 4
+    assert "track_sonic" in names  # v5
+    assert _schema_version(conn) == 5
 
-    # Idempotent: re-running on a v4 db is a no-op.
+    # Idempotent: re-running on a fully-migrated db is a no-op.
     ensure_schema(conn)
-    assert _schema_version(conn) == 4
+    assert _schema_version(conn) == 5
 
 
 def _write_legacy_fixtures(data_dir: Path) -> None:

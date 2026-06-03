@@ -202,6 +202,44 @@ class TrackEmbeddingsRepo:
 
 
 @dataclass
+class TrackSonicRepo:
+    conn: sqlite3.Connection
+
+    def upsert(self, payload: Dict[str, Any]) -> None:
+        columns = [
+            "track_id",
+            "mbid",
+            "sonic_blob",
+            "sonic_dim",
+            "features_json",
+            "source",
+            "created_at",
+        ]
+        values = [payload.get(col) for col in columns]
+        self.conn.execute(
+            f"""
+            INSERT INTO track_sonic ({", ".join(columns)})
+            VALUES ({", ".join(["?"] * len(columns))})
+            ON CONFLICT(track_id) DO UPDATE SET
+              mbid=excluded.mbid,
+              sonic_blob=excluded.sonic_blob,
+              sonic_dim=excluded.sonic_dim,
+              features_json=excluded.features_json,
+              source=excluded.source,
+              created_at=excluded.created_at;
+            """,
+            values,
+        )
+
+    def get(self, track_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM track_sonic WHERE track_id = ?;",
+            (track_id,),
+        ).fetchone()
+        return _row_dict(row)
+
+
+@dataclass
 class QueriesRepo:
     conn: sqlite3.Connection
 
@@ -533,6 +571,10 @@ class Repositories:
     @property
     def embeddings(self) -> TrackEmbeddingsRepo:
         return TrackEmbeddingsRepo(self.conn)
+
+    @property
+    def sonic(self) -> TrackSonicRepo:
+        return TrackSonicRepo(self.conn)
 
     @property
     def queries(self) -> QueriesRepo:
