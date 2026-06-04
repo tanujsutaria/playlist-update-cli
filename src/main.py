@@ -16,6 +16,7 @@ from rich.logging import RichHandler
 
 from config import AppConfig, env_flag, env_int
 from models import Song, track_id_for
+from nextgen.acoustic import backfill_sonic
 from nextgen.embeddings import EmbeddingModel
 from nextgen.enrich import enrich_tracks
 from nextgen.pipeline import SearchPipeline, SearchResult
@@ -2458,6 +2459,69 @@ class PlaylistCLI:
         )
         return counts["enriched"]
 
+    def sonic_backfill(self, limit: int = 50, dry_run: bool = False) -> int:
+        """Backfill acoustic features from AcousticBrainz for tracks that lack them.
+
+        Resolves each track to a MusicBrainz MBID and stores its precomputed
+        AcousticBrainz sonic vector — no audio downloaded. SERIAL + rate-limited
+        (MusicBrainz ~1 req/sec), so a full library is ~minutes, not parallelizable.
+        Returns the number of tracks for which sonic features were stored.
+        """
+        section("Sonic Backfill")
+        info("Acoustic features from AcousticBrainz (MBID-keyed; no audio downloaded).")
+        rows = self.repos.conn.execute(
+            """
+            SELECT t.track_id, t.name, a.name AS artist
+            FROM tracks t
+            LEFT JOIN track_sonic s ON s.track_id = t.track_id
+            LEFT JOIN artists a ON a.artist_id = t.artist_id
+            WHERE s.track_id IS NULL
+            ORDER BY t.track_id
+            LIMIT ?
+            """,
+            (max(0, limit),),
+        ).fetchall()
+        if not rows:
+            info("Nothing to backfill — every track already has sonic features.")
+            return 0
+
+        def _name_artist(row: Any) -> Tuple[str, str]:
+            return (row["name"] or "", row["artist"] or "")
+
+        total = len(rows)
+        info(f"{total} track(s) without sonic features (limit {limit}).")
+        if dry_run:
+            for row in rows:
+                name, artist = _name_artist(row)
+                info(f"  would resolve: {name} — {artist}")
+            info(f"Dry run: {total} track(s) would be looked up. Re-run without --dry-run.")
+            return 0
+
+        info("Resolving via MusicBrainz (~1 req/sec — rate-limited, not parallelizable).")
+
+        def _on_result(status: str, name: str, artist: str) -> None:
+            if status == "stored":
+                info(f"  stored: {name} — {artist}")
+            elif status == "failed":
+                warning(f"  failed: {name} — {artist}")
+            else:  # no_mbid / no_data
+                info(f"  {status.replace('_', ' ')}: {name} — {artist}")
+
+        counts = backfill_sonic(
+            self.repos,
+            [(row["track_id"], *_name_artist(row)) for row in rows],
+            on_result=_on_result,
+        )
+        key_value_table(
+            [
+                ["Stored sonic", counts["stored"]],
+                ["No MBID match", counts["no_mbid"]],
+                ["No AcousticBrainz data", counts["no_data"]],
+                ["Failed", counts["failed"]],
+            ]
+        )
+        return counts["stored"]
+
     def debug_last_search(self) -> Optional[Dict[str, object]]:
         """Return debug payload for the last search run."""
         run_id = self.last_search_run_id
@@ -2932,6 +2996,11 @@ def _handle_enrich(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_sonic(cli: "PlaylistCLI", args: Any) -> int:
+    cli.sonic_backfill(limit=getattr(args, "limit", 50), dry_run=getattr(args, "dry_run", False))
+    return 0
+
+
 def _present_debug_track(payload: dict) -> None:
     """Render the `debug track` payload as tables (output unchanged)."""
     track = payload.get("track") or {}
@@ -3148,6 +3217,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "find": _handle_find,
     "undo": _handle_undo,
     "enrich": _handle_enrich,
+    "sonic": _handle_sonic,
     "debug": _handle_debug,
     "ingest": _handle_ingest,
     "listen-sync": _handle_listen_sync,

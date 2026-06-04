@@ -281,6 +281,23 @@ def setup_parsers(
         help="Parallel deep-search workers (default 8); writes stay serialized",
     )
 
+    # Sonic command (acoustic feature backfill from AcousticBrainz)
+    sonic_parser = subparsers.add_parser(
+        "sonic", help="Backfill acoustic features from AcousticBrainz (no audio; MBID-keyed)"
+    )
+    sonic_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=50,
+        metavar="N",
+        help="Max tracks to look up (default 50; MusicBrainz is rate-limited to ~1/sec)",
+    )
+    sonic_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the tracks that would be looked up without calling out or writing",
+    )
+
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")
     debug_parser.add_argument(

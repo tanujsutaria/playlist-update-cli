@@ -56,6 +56,7 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "search",
     "find",
     "enrich",
+    "sonic",
     "interactive",
 }
 
@@ -63,7 +64,7 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
 # an "Other" bucket; legacy commands are hidden unless `/help all` is used. The
 # descriptions still come from argparse, so this map only controls ORDER/grouping.
 HELP_GROUPS: "list[tuple[str, list[str]]]" = [
-    ("Set up", ["auth-status", "auth-refresh", "ingest", "listen-sync", "enrich"]),
+    ("Set up", ["auth-status", "auth-refresh", "ingest", "listen-sync", "enrich", "sonic"]),
     (
         "Playlists",
         [
