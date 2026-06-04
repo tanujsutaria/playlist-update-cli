@@ -17,7 +17,7 @@ No audio is fetched or stored — only AcousticBrainz's precomputed features.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 # (high-level classifier name, label counted as the 1.0 end of the axis).
 _HL_POSITIVE = [
@@ -89,3 +89,17 @@ def build_sonic_vector(highlevel: Dict[str, Any], lowlevel: Dict[str, Any]) -> L
     vector.append(_clamp01(_scalar(low.get("dissonance"))))
     vector.append(_clamp01(_scalar(tonal.get("key_strength"))))
     return vector
+
+
+def describe_sonic(vector: Sequence[float]) -> Dict[str, float]:
+    """Map a sonic vector (e.g. a centroid) back to named features for display.
+
+    Returns {feature_name: value} with ``bpm_norm`` denormalized to an approximate
+    BPM. Feature names mirror SONIC_FEATURES (mood_*, danceability, timbre, …).
+    """
+    profile: Dict[str, float] = {
+        name: float(vector[i]) for i, name in enumerate(SONIC_FEATURES) if i < len(vector)
+    }
+    if "bpm_norm" in profile:
+        profile["bpm"] = round(profile.pop("bpm_norm") * (_BPM_HI - _BPM_LO) + _BPM_LO)
+    return profile

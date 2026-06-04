@@ -33,7 +33,8 @@ from spotify_manager import (
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
-from storage.vectors import decode_vector, taste_centroid, vector_norm
+from storage.sonic import describe_sonic
+from storage.vectors import decode_vector, mean_vector, taste_centroid, vector_norm
 from ui import (
     bar_chart,
     clear_preview,
@@ -724,6 +725,16 @@ class PlaylistCLI:
             [i, row["name"], row["artist"]] for i, row in enumerate(self._taste_rows(items), start)
         ]
 
+    def _sonic_vectors_for(self, track_ids: list) -> Dict[str, list]:
+        """Load stored AcousticBrainz sonic vectors for the given track_ids (only
+        those that have been /sonic-backfilled appear in the result)."""
+        out: Dict[str, list] = {}
+        for track_id in track_ids:
+            row = self.repos.sonic.get(track_id)
+            if row and row.get("sonic_blob") is not None:
+                out[track_id] = decode_vector(row["sonic_blob"])
+        return out
+
     def show_taste(self, top: int = 8) -> Optional[Dict[str, Any]]:
         """Render a 'current taste' card: the tracks most/least representative of the
         centroid of your recent-listening (or rotation) embeddings.
@@ -755,7 +766,45 @@ class PlaylistCLI:
                 denom = vector_norm(vec) * cnorm
                 return sum(a * b for a, b in zip(vec, centroid)) / denom if denom else 0.0
 
-            ranked = sorted(seed, key=lambda tv: cos_to_centroid(tv[1]), reverse=True)
+            # Sonic channel: where tracks have AcousticBrainz vectors, blend a sonic
+            # similarity into the ranking — coverage-aware, so tracks WITHOUT sonic data
+            # are scored on text alone and never penalized for missing it.
+            sonic_vecs = self._sonic_vectors_for([tid for tid, _ in seed])
+            sonic_centroid = taste_centroid(sonic_vecs.values()) if len(sonic_vecs) >= 3 else []
+            scnorm = vector_norm(sonic_centroid) or 1.0
+
+            def _sonic_sim(track_id: str) -> Optional[float]:
+                vec = sonic_vecs.get(track_id)
+                if not (sonic_centroid and vec):
+                    return None
+                denom = vector_norm(vec) * scnorm
+                return sum(a * b for a, b in zip(vec, sonic_centroid)) / denom if denom else 0.0
+
+            def _minmax_fn(values: list) -> Callable[[float], float]:
+                vals = list(values)
+                if not vals:
+                    return lambda _v: 0.0
+                lo, hi = min(vals), max(vals)
+                span = hi - lo
+                if span == 0:
+                    return lambda _v: 1.0
+                return lambda v: (v - lo) / span
+
+            text_sims = {tid: cos_to_centroid(vec) for tid, vec in seed}
+            sonic_sims = {tid: _sonic_sim(tid) for tid, _ in seed}
+            text_norm = _minmax_fn(list(text_sims.values()))
+            present = [v for v in sonic_sims.values() if v is not None]
+            sonic_norm = _minmax_fn(present) if present else None
+            sonic_weight = 0.5
+
+            def _representativeness(track_id: str) -> float:
+                base = text_norm(text_sims[track_id])
+                value = sonic_sims[track_id]
+                if sonic_norm is not None and value is not None:
+                    return sonic_weight * sonic_norm(value) + (1 - sonic_weight) * base
+                return base
+
+            ranked = sorted(seed, key=lambda tv: _representativeness(tv[0]), reverse=True)
             # Distinct artists are free: track_id is "artist|||name".
             n_artists = len({track_id.split("|||")[0] for track_id, _ in seed})
 
@@ -785,6 +834,25 @@ class PlaylistCLI:
                 subsection("Widest-ranging")
                 table(["#", "Track", "Artist"], self._taste_display_rows(widest))
 
+            # "Your sound": the average acoustic profile, where AcousticBrainz data
+            # exists (plain mean, so the 0–1 feature values stay interpretable).
+            sonic_profile: Optional[Dict[str, float]] = None
+            if len(sonic_vecs) >= 3:
+                sonic_profile = describe_sonic(mean_vector(sonic_vecs.values()))
+                feel = {k: v for k, v in sonic_profile.items() if k != "bpm"}
+                top_feel = sorted(feel.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                subsection("Your sound")
+                bar_chart(
+                    [k.replace("mood_", "").replace("_", " ") for k, _ in top_feel],
+                    [v for _, v in top_feel],
+                    value_fmt=lambda v: f"{v:.2f}",
+                )
+                info(
+                    f"~{sonic_profile.get('bpm', '?')} BPM avg · acoustic features on "
+                    f"{len(sonic_vecs)}/{len(seed)} tracks (AcousticBrainz). "
+                    "The ranking above blends this with the text taste where present."
+                )
+
             hint = (
                 "Ranked by closeness to your taste centroid."
                 if enriched
@@ -799,6 +867,8 @@ class PlaylistCLI:
                 "enriched": enriched,
                 "built_from": len(seed),
                 "distinct_artists": n_artists,
+                "sonic_coverage": len(sonic_vecs),
+                "sonic_profile": sonic_profile,
                 "most_representative": self._taste_rows(most),
                 "widest_ranging": self._taste_rows(widest),
             }
