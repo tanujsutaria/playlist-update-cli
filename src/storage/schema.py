@@ -188,3 +188,20 @@ def schema_v4() -> list[str]:
         ),
         "CREATE INDEX IF NOT EXISTS idx_generation_tracks_track ON generation_tracks(track_id);",
     ]
+
+
+def schema_v5() -> list[str]:
+    return [
+        """
+        CREATE TABLE IF NOT EXISTS track_sonic (
+          track_id TEXT PRIMARY KEY,
+          mbid TEXT,
+          sonic_blob BLOB NOT NULL,
+          sonic_dim INTEGER NOT NULL,
+          features_json TEXT,
+          source TEXT,
+          created_at TEXT,
+          FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+        );
+        """,
+    ]
