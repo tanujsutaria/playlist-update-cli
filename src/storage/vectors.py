@@ -55,3 +55,27 @@ def taste_centroid(vectors: Iterable[Sequence[float]]) -> List[float]:
         return []
     mean = [value / count for value in total]
     return normalize_vector(mean)
+
+
+def mean_vector(vectors: Iterable[Sequence[float]]) -> List[float]:
+    """Plain element-wise mean (NOT unit-normalized).
+
+    Unlike `taste_centroid`, this preserves the original scale — for 0–1 feature
+    vectors (e.g. sonic features) the mean stays interpretable as "average
+    danceability/loudness/…". Returns [] for no input; raises on dim mismatch.
+    """
+    total: List[float] = []
+    count = 0
+    for vec in vectors:
+        if not total:
+            total = [0.0] * len(vec)
+        elif len(vec) != len(total):
+            raise ValueError(
+                f"mean_vector: inconsistent vector dimensions ({len(vec)} != {len(total)})"
+            )
+        for index, value in enumerate(vec):
+            total[index] += float(value)
+        count += 1
+    if count == 0:
+        return []
+    return [value / count for value in total]

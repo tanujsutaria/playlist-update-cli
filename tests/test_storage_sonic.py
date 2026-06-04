@@ -114,3 +114,17 @@ class TestSonicSchemaAndRepo:
         assert got["source"] == "acousticbrainz"
         assert decode_vector(got["sonic_blob"]) == pytest.approx(vec)
         assert repos.sonic.get("nope|||nope") is None
+
+
+class TestDescribeSonic:
+    def test_decodes_named_features_and_bpm(self):
+        from storage.sonic import describe_sonic
+
+        vec = build_sonic_vector(HL, LL)
+        prof = describe_sonic(vec)
+        # named features map straight through...
+        assert prof["mood_relaxed"] == pytest.approx(0.809)
+        assert prof["mood_electronic"] == pytest.approx(0.979)
+        # ...and bpm_norm is denormalized to an approximate BPM (104 in the sample).
+        assert "bpm_norm" not in prof
+        assert prof["bpm"] == 104

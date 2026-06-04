@@ -98,3 +98,24 @@ class TestTasteCentroid:
     def test_accepts_generator_of_vectors(self):
         centroid = taste_centroid(vec for vec in ([3.0, 4.0],))
         assert centroid == pytest.approx([0.6, 0.8])
+
+
+class TestMeanVector:
+    def test_plain_mean_not_normalized(self):
+        from storage.vectors import mean_vector
+
+        # mean of [0,1] and [1,0] is [0.5,0.5] — NOT renormalized to unit length.
+        assert mean_vector([[0.0, 1.0], [1.0, 0.0]]) == [0.5, 0.5]
+
+    def test_empty(self):
+        from storage.vectors import mean_vector
+
+        assert mean_vector([]) == []
+
+    def test_dim_mismatch_raises(self):
+        import pytest
+
+        from storage.vectors import mean_vector
+
+        with pytest.raises(ValueError):
+            mean_vector([[0.0], [0.0, 1.0]])
