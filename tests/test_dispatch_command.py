@@ -349,6 +349,16 @@ class TestDispatchEnrich:
         cli.enrich_library.assert_called_once_with(limit=100, dry_run=True, concurrency=16)
 
 
+# ---- sonic ----
+class TestDispatchSonic:
+    def test_sonic_routes_correctly(self, cli):
+        cli.sonic_backfill = MagicMock()
+        args = _make_args(limit=50, dry_run=False)
+        rc = dispatch_command(cli, "sonic", args)
+        assert rc == 0
+        cli.sonic_backfill.assert_called_once_with(limit=50, dry_run=False)
+
+
 # ---- backup ----
 class TestDispatchBackup:
     def test_backup_routes_correctly(self, cli):

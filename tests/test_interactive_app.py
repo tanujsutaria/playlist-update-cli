@@ -92,8 +92,9 @@ class TestHelpCommand:
         assert "/profile" in text
         # /undo is surfaced under Playlists.
         assert "/undo" in text
-        # /enrich is surfaced under Set up.
+        # /enrich and /sonic are surfaced under Set up.
         assert "/enrich" in text
+        assert "/sonic" in text
         # /find (the flagship) is surfaced under Discover.
         assert "/find" in text
 

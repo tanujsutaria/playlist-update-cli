@@ -44,6 +44,7 @@ class TestSetupParsers:
             "find",
             "undo",
             "enrich",
+            "sonic",
             "debug",
             "interactive",
             "ingest",
@@ -521,6 +522,23 @@ class TestEnrichCommand:
         assert args.limit == 100
         assert args.dry_run is True
         assert args.concurrency == 16
+
+
+class TestSonicCommand:
+    """/sonic backfills acoustic features; bounded by --limit, with --dry-run."""
+
+    def test_parse_sonic_defaults(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["sonic"])
+        assert args.command == "sonic"
+        assert args.limit == 50
+        assert args.dry_run is False
+
+    def test_parse_sonic_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["sonic", "--limit", "200", "--dry-run"])
+        assert args.limit == 200
+        assert args.dry_run is True
 
 
 class TestIngestCommand:
