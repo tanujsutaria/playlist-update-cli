@@ -3,9 +3,16 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable
 
-from .schema import initial_schema, schema_v2, schema_v3, schema_v4, schema_v5
+from .schema import (
+    initial_schema,
+    schema_v2,
+    schema_v3,
+    schema_v4,
+    schema_v5,
+    schema_v6,
+)
 
-LATEST_VERSION = 5
+LATEST_VERSION = 6
 
 
 def _get_version(conn: sqlite3.Connection) -> int:
@@ -64,5 +71,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if version == 4:
         _apply_statements(conn, schema_v5())
         version = 5
+
+    if version == 5:
+        _apply_statements(conn, schema_v6())
+        version = 6
 
     _set_version(conn, LATEST_VERSION)

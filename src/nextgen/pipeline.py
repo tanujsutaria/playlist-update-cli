@@ -5,14 +5,15 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from storage.cache import compute_query_hash
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.vectors import decode_vector, encode_vector, vector_norm
+from web_search import extract_constraints, extract_requested_metrics
 
 from .canonicalize import canonicalize_results
 from .context import build_context_card
@@ -64,6 +65,10 @@ class SearchResult:
     strict_ratio: float
     sources: List[str]
     providers: List[str]
+    # Per-track metrics surfaced by the provider (e.g. monthly_listeners,
+    # similarity). Carried so the display-path constraint filter can act on them.
+    # Defaulted + last so positional/kwargs constructors that omit it stay valid.
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 ResultCallback = Callable[[SearchResult, int, int], None]
@@ -85,9 +90,32 @@ class SearchPipeline:
         self.score_config = score_config or SearchScoreConfig()
         self.last_cached = False
         self.last_score_config: Optional[SearchScoreConfig] = None
+        # Run-level scalars from the provider, surfaced on the instance (mirroring
+        # `last_cached`) rather than widening run()'s 2-tuple return — so existing
+        # callers/tests that unpack `(results, run_id)` stay untouched. search_songs
+        # reads these via getattr() with defaults.
+        self.last_summary: Optional[str] = None
+        self.last_constraints: Dict[str, Any] = {}
+        self.last_requested_metrics: List[str] = []
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
+
+    def _requested_metrics_for_query(self, query: str) -> List[str]:
+        """Reconstruct run_deep_search's requested_metrics from the query text.
+
+        Used only on cache hits (where the provider isn't re-invoked). Mirrors the
+        derivation in web_search.run_deep_search so fresh and cached runs agree.
+        """
+        metrics = list(extract_requested_metrics(query))
+        constraints = extract_constraints(query)
+        if (
+            constraints.get("max_monthly_listeners") or constraints.get("min_monthly_listeners")
+        ) and "monthly_listeners" not in metrics:
+            metrics.append("monthly_listeners")
+        if constraints.get("similarity_requested") and "similarity" not in metrics:
+            metrics.append("similarity")
+        return metrics
 
     def _score_config_payload(self, score_config: SearchScoreConfig) -> Dict[str, object]:
         return {
@@ -165,6 +193,7 @@ class SearchPipeline:
         rows = self.repos.conn.execute(
             """
             SELECT sc.track_id, sc.score_final, sc.strict_ratio,
+                   sc.metrics_json,
                    t.name, t.artist_id, t.release_date,
                    a.name AS artist_name,
                    tc.sources_json
@@ -181,7 +210,17 @@ class SearchPipeline:
         results: List[SearchResult] = []
         for row in rows:
             sources_json = row["sources_json"] if "sources_json" in row.keys() else None
-            sources = json.loads(sources_json) if sources_json else []
+            metrics_json = row["metrics_json"] if "metrics_json" in row.keys() else None
+            # Guard against corrupt/garbage JSON in the DB so a single bad row can't
+            # crash the whole cached search; degrade to empty (lenient).
+            try:
+                sources = json.loads(sources_json) if sources_json else []
+            except (TypeError, ValueError):
+                sources = []
+            try:
+                metrics = json.loads(metrics_json) if metrics_json else {}
+            except (TypeError, ValueError):
+                metrics = {}
             results.append(
                 SearchResult(
                     track_id=row["track_id"],
@@ -192,6 +231,7 @@ class SearchPipeline:
                     strict_ratio=row["strict_ratio"] or 0.0,
                     sources=sources,
                     providers=[],
+                    metrics=metrics,
                 )
             )
         return results
@@ -370,6 +410,23 @@ class SearchPipeline:
             cached_results = self._load_cached_results(cached_run_id)
             if cached_results:
                 self.last_cached = True
+                # Rehydrate the run-level scalars so a cache hit is as informative
+                # as a fresh run: summary from the persisted column, constraints
+                # from the stored query row, requested_metrics recomputed from text.
+                self.last_summary = (run_row.get("summary") if run_row else None) or None
+                query_row = self.repos.queries.get(query_hash) or {}
+                try:
+                    loaded = json.loads(query_row.get("constraints_json") or "{}")
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Cached run %s has unparseable constraints_json; "
+                        "constraints not applied on this cache hit.",
+                        cached_run_id,
+                    )
+                    loaded = {}
+                loaded.pop("expanded", None)  # parity with the fresh path (which omits it)
+                self.last_constraints = loaded
+                self.last_requested_metrics = self._requested_metrics_for_query(query)
                 return cached_results, cached_run_id
         self.last_cached = False
 
@@ -378,6 +435,12 @@ class SearchPipeline:
 
         # Placeholder for eventual provider-specific progress updates.
         provider_run = run_providers(query=query, expanded=expanded)
+        # Surface the run-level scalars now, before the `if not track_ids: return`
+        # early-out at the end of extraction, so they're populated even when the
+        # provider yields nothing usable.
+        self.last_summary = provider_run.summary or None
+        self.last_constraints = dict(provider_run.constraints or {})
+        self.last_requested_metrics = list(provider_run.requested_metrics or [])
 
         run_id = str(uuid.uuid4())
         now = self._now()
@@ -410,6 +473,7 @@ class SearchPipeline:
                 "finished_at": now,
                 "score_config_hash": score_config_hash,
                 "results_count": len(provider_run.results),
+                "summary": provider_run.summary,
             }
         )
         self.repos.conn.commit()
@@ -608,6 +672,7 @@ class SearchPipeline:
             sources = item.get("sources") or []
             providers = item.get("providers") or provider_run.providers or []
 
+            metrics = item.get("metrics") or {}
             self.repos.candidates.upsert(
                 {
                     "run_id": run_id,
@@ -619,6 +684,7 @@ class SearchPipeline:
                     "strict_ratio": strict_ratios[idx],
                     "lenient_ratio": 1.0 - strict_ratios[idx],
                     "sources_count": len(sources),
+                    "metrics_json": json.dumps(metrics),
                 }
             )
 
@@ -632,6 +698,7 @@ class SearchPipeline:
                     strict_ratio=strict_ratios[idx],
                     sources=sources,
                     providers=providers,
+                    metrics=metrics,
                 )
             )
 

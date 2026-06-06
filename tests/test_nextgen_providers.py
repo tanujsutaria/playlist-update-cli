@@ -13,7 +13,13 @@ from nextgen.providers import ProviderRun, run_providers
 
 
 def _canned(
-    results=None, providers_list=None, error=None, summary="ok", constraints=None, policy=None
+    results=None,
+    providers_list=None,
+    error=None,
+    summary="ok",
+    constraints=None,
+    policy=None,
+    requested_metrics=None,
 ):
     """Build the 8-tuple shape run_deep_search returns."""
     return (
@@ -21,7 +27,7 @@ def _canned(
         {},  # per-provider results (ignored by run_providers)
         providers_list if providers_list is not None else ["openai"],
         error,
-        [],  # warnings/extra (ignored)
+        requested_metrics if requested_metrics is not None else [],  # index 4 = requested_metrics
         summary,
         constraints if constraints is not None else {"limit": 10},
         policy if policy is not None else {"expanded": False},
@@ -41,6 +47,7 @@ class TestRunProviders:
                 summary="found 1",
                 constraints={"limit": 5},
                 policy={"expanded": True},
+                requested_metrics=["similarity", "monthly_listeners"],
             )
 
         monkeypatch.setattr(providers, "run_deep_search", fake_run_deep_search)
@@ -53,6 +60,8 @@ class TestRunProviders:
         assert run.summary == "found 1"
         assert run.constraints == {"limit": 5}
         assert run.policy == {"expanded": True}
+        # Index 4 of the 8-tuple is now threaded through, not discarded.
+        assert run.requested_metrics == ["similarity", "monthly_listeners"]
         # Arguments were forwarded.
         assert captured["query"] == "indie rock 2020"
         assert captured["expanded"] is True

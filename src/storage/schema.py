@@ -205,3 +205,14 @@ def schema_v5() -> list[str]:
         );
         """,
     ]
+
+
+def schema_v6() -> list[str]:
+    # Additive, nullable columns (same shape as the schema_v3 ALTER precedent) so
+    # deep-search can persist the synthesized summary per run and the per-track
+    # metrics per candidate — letting cache hits re-surface the summary and the
+    # constraint filter act on cached runs.
+    return [
+        "ALTER TABLE search_runs ADD COLUMN summary TEXT;",
+        "ALTER TABLE search_candidates ADD COLUMN metrics_json TEXT;",
+    ]
