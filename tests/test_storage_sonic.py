@@ -84,7 +84,8 @@ class TestSonicSchemaAndRepo:
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         assert "track_sonic" in names
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        # track_sonic lands in v5; ensure_schema migrates fully to the latest version.
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
 
     def test_upsert_get_roundtrip(self, tmp_path):
         conn = self._conn(tmp_path)

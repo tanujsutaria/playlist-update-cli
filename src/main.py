@@ -48,6 +48,7 @@ from ui import (
     set_json_mode,
     sparkline,
     subsection,
+    summary_panel,
     table,
     warning,
 )
@@ -1540,6 +1541,29 @@ class PlaylistCLI:
 
         if not results:
             info("No results returned.")
+            # Surface the synthesis even when the provider yielded nothing, so this
+            # early-out is as informative as the constrained-out path below.
+            summary = getattr(self.search_pipeline, "last_summary", None)
+            if summary:
+                summary_panel(str(summary), title="Search Summary")
+            clear_preview()
+            self._reset_search_state()
+            return
+
+        # Apply the parsed query constraints (e.g. "< 10k monthly listeners") on the
+        # display path. Lenient: rows whose metric is absent are KEPT (counted
+        # "unverified") so a sparse provider response is never trimmed to empty; only
+        # rows that positively violate a bound are dropped. The strict, Spotify-
+        # validated obscurity check stays on the add-to-playlist path. Reassigning
+        # `results` threads the filtered set into the table, last_search_results, and
+        # last_search_track_ids (and thus the add path) automatically.
+        constraints = getattr(self.search_pipeline, "last_constraints", {}) or {}
+        results, constraint_stats = self._apply_metric_constraints(results, constraints)
+        summary = getattr(self.search_pipeline, "last_summary", None)
+        if not results:
+            info("No results matched the requested constraints.")
+            if summary:
+                summary_panel(str(summary), title="Search Summary")
             clear_preview()
             self._reset_search_state()
             return
@@ -1602,6 +1626,19 @@ class PlaylistCLI:
                 table(headers, rows)
             info(f"Live results complete: {len(results)} candidates.")
 
+        # The synthesized "why these fit" panel + a note on what the constraint
+        # filter did. Both were computed/dropped before this fix; this is the
+        # "synthesis" the user reported missing.
+        if summary:
+            summary_panel(str(summary), title="Search Summary")
+        if constraint_stats.get("dropped") or constraint_stats.get("unverified"):
+            parts = []
+            if constraint_stats.get("dropped"):
+                parts.append(f"dropped {constraint_stats['dropped']} not matching constraints")
+            if constraint_stats.get("unverified"):
+                parts.append(f"{constraint_stats['unverified']} kept without a metric to verify")
+            info("Constraints applied: " + "; ".join(parts) + ".")
+
         self.last_search_results = [
             {
                 "song": item.song,
@@ -1612,13 +1649,14 @@ class PlaylistCLI:
                 "providers": item.providers,
                 "sources": item.sources,
                 "track_id": item.track_id,
+                "metrics": getattr(item, "metrics", None) or {},
             }
             for item in results
         ]
         self.last_search_query = query_text
-        self.last_search_summary = None
-        self.last_search_metrics = []
-        self.last_search_constraints = {}
+        self.last_search_summary = getattr(self.search_pipeline, "last_summary", None)
+        self.last_search_metrics = getattr(self.search_pipeline, "last_requested_metrics", []) or []
+        self.last_search_constraints = getattr(self.search_pipeline, "last_constraints", {}) or {}
         self.last_search_expanded = expanded
         self.last_search_policy = {"path": "nextgen", "expanded": expanded}
         self.last_search_run_id = run_id
@@ -2158,6 +2196,66 @@ class PlaylistCLI:
             seed_text="; ".join([f"{s.name} by {s.artist}" for s in seeds[:10]]),
         )
         return provider.score_candidates(candidates, profile)
+
+    def _apply_metric_constraints(
+        self, results: List[SearchResult], constraints: Dict[str, Any]
+    ) -> Tuple[List[SearchResult], Dict[str, int]]:
+        """Lenient, offline metric filter for the /search display path.
+
+        Drops rows that POSITIVELY violate a monthly-listener bound or fall below
+        the requested similarity floor; KEEPS rows whose metric is absent (counted
+        "unverified") so a sparse provider response is never trimmed to empty.
+        Pure — no Spotify, no network. The strict, Spotify-validated obscurity
+        check stays on the add-to-playlist path (`_resolve_search_results`).
+        """
+        stats = {"kept": 0, "dropped": 0, "unverified": 0}
+        if not constraints:
+            return results, stats
+        # `is not None` (not truthiness) so a legitimate 0 bound is honoured.
+        max_listeners = constraints.get("max_monthly_listeners")
+        min_listeners = constraints.get("min_monthly_listeners")
+        similarity_required = bool(constraints.get("similarity_requested"))
+        similarity_min = self._similarity_min() if similarity_required else None
+        if max_listeners is None and min_listeners is None and not similarity_required:
+            return results, stats
+
+        kept: List[SearchResult] = []
+        for item in results:
+            metrics = getattr(item, "metrics", None) or {}
+            drop = False
+            # "unverified" = a KEPT row that lacked a requested metric. Tracked per
+            # row and only counted once the row survives, so a row dropped on a
+            # later check is never also counted unverified (no double counting).
+            missing_metric = False
+
+            if max_listeners is not None or min_listeners is not None:
+                ml = self._parse_metric_number(metrics.get("monthly_listeners"))
+                if ml is not None:
+                    if max_listeners is not None and ml > max_listeners:
+                        drop = True
+                    elif min_listeners is not None and ml < min_listeners:
+                        drop = True
+                else:
+                    missing_metric = True
+
+            if not drop and similarity_required:
+                sim = self._parse_metric_number(metrics.get("similarity"))
+                if sim is not None:
+                    if 1 < sim <= 100:
+                        sim = sim / 100.0
+                    if similarity_min is not None and sim < similarity_min:
+                        drop = True
+                else:
+                    missing_metric = True
+
+            if drop:
+                stats["dropped"] += 1
+                continue
+            kept.append(item)
+            stats["kept"] += 1
+            if missing_metric:
+                stats["unverified"] += 1
+        return kept, stats
 
     def _resolve_search_results(self, results: List[Dict]) -> Tuple[List[Song], Dict[str, int]]:
         """Resolve search results into Spotify-validated Song objects."""

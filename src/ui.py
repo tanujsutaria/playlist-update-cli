@@ -126,6 +126,18 @@ def warning(message: str) -> None:
     _emit(Text(message, style="yellow"))
 
 
+def summary_panel(text: str, title: str = "Summary") -> None:
+    """Render a synthesized prose summary in a bordered panel.
+
+    Routes through `_emit`, so it honours json-mode (silenced) and the Textual
+    output-sink (RichLog) exactly like every other helper. A falsy/blank text is
+    a no-op so callers can pass an optional summary unguarded.
+    """
+    if not text:
+        return
+    _emit(Panel(Text(text), title=title, border_style="green"))
+
+
 def json_output(payload: object) -> None:
     rendered = Syntax(json.dumps(payload, indent=2), "json", theme="ansi_dark", word_wrap=True)
     _emit(rendered)

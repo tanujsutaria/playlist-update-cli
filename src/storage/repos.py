@@ -295,6 +295,7 @@ class SearchRunsRepo:
             "finished_at",
             "score_config_hash",
             "results_count",
+            "summary",
         ]
         values = [payload.get(col) for col in columns]
         self.conn.execute(
@@ -338,6 +339,11 @@ class SearchCandidatesRepo:
             "strict_ratio",
             "lenient_ratio",
             "sources_count",
+            # INSERT-only: deliberately absent from the DO UPDATE SET clause below
+            # so _rescore_cached_run (which re-upserts the same run without a
+            # metrics payload) preserves the originally persisted metrics_json
+            # instead of nulling it.
+            "metrics_json",
         ]
         values = [payload.get(col) for col in columns]
         self.conn.execute(
