@@ -5,6 +5,18 @@ from typing import Any, Dict, List
 
 from web_search import run_deep_search
 
+# The exact sentinel run_deep_search returns when detect_search_commands()
+# finds no provider at all (no API keys, no WEB_SEARCH_* overrides).
+_NO_PROVIDERS_ERROR = "No search providers configured."
+
+
+class ProviderConfigError(RuntimeError):
+    """No search provider is configured (vs. a provider that ran and failed).
+
+    Subclasses RuntimeError so existing `except RuntimeError` callers keep
+    working; the UI catches this subtype to render an actionable fix.
+    """
+
 
 @dataclass
 class ProviderRun:
@@ -26,6 +38,8 @@ def run_providers(query: str, expanded: bool = False) -> ProviderRun:
         expanded=expanded,
     )
     if error:
+        if error == _NO_PROVIDERS_ERROR:
+            raise ProviderConfigError(error)
         raise RuntimeError(error)
     return ProviderRun(
         results=results,

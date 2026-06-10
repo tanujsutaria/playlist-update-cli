@@ -8,6 +8,8 @@ through the output/preview sinks to capture renderables directly.
 from __future__ import annotations
 
 import pytest
+from rich.panel import Panel
+from rich.text import Text
 
 import ui
 
@@ -66,6 +68,105 @@ class TestStdoutRendering:
         out = capsys.readouterr().out
         assert "key" in out
         assert "value" in out
+
+
+class TestError:
+    def test_error_emits_red_panel_to_sink(self, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.error("it broke", title="Search unavailable")
+        assert len(captured) == 1
+        panel = captured[0]
+        assert isinstance(panel, Panel)
+        assert panel.border_style == "red"
+        assert panel.title == "Search unavailable"
+        assert isinstance(panel.renderable, Text)
+        assert panel.renderable.plain == "it broke"
+        assert panel.renderable.style == "red"
+
+    def test_error_default_title(self, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.error("boom")
+        assert captured[0].title == "Error"
+
+    def test_error_prints_to_console_without_sink(self, capsys, reset_sinks):
+        ui.error("plain failure")
+        assert "plain failure" in capsys.readouterr().out
+
+    def test_error_json_mode_goes_to_stderr_keeping_stdout_pure(self, capsys, reset_sinks):
+        ui.set_json_mode(True)
+        try:
+            ui.error("fatal but json")
+        finally:
+            ui.set_json_mode(False)
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "fatal but json" in err
+
+    def test_error_json_mode_prefers_installed_sink(self, capsys, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.set_json_mode(True)
+        try:
+            ui.error("sink wins")
+        finally:
+            ui.set_json_mode(False)
+        out, err = capsys.readouterr()
+        assert out == "" and err == ""
+        assert len(captured) == 1
+        assert captured[0].renderable.plain == "sink wins"
+
+
+class TestNotice:
+    def test_notice_is_dim_text_via_emit(self, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.notice("nothing to do")
+        assert len(captured) == 1
+        assert isinstance(captured[0], Text)
+        assert captured[0].plain == "nothing to do"
+        assert captured[0].style == "dim"
+
+    def test_notice_prints_without_sink(self, capsys, reset_sinks):
+        ui.notice("empty library")
+        assert "empty library" in capsys.readouterr().out
+
+    def test_notice_silenced_in_json_mode(self, capsys, reset_sinks):
+        ui.set_json_mode(True)
+        try:
+            ui.notice("quiet")
+        finally:
+            ui.set_json_mode(False)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+
+class TestTextCellPassthrough:
+    def test_table_text_cell_content_reaches_stdout(self, capsys, reset_sinks):
+        ui.table(["Listeners"], [[Text("8.2k", style="green")]])
+        assert "8.2k" in capsys.readouterr().out
+
+    def test_table_text_cell_preserved_with_style_via_sink(self, reset_sinks):
+        captured = []
+        ui.set_output_sink(captured.append)
+        cell = Text("8.2k", style="green")
+        ui.table(["Listeners"], [[cell, 42]])
+        tbl = captured[0]
+        first_col_cells = list(tbl.columns[0].cells)
+        # The very same Text object lands in the table: styling intact.
+        assert first_col_cells[0] is cell
+        # Non-Text cells are still coerced with str().
+        assert list(tbl.columns[1].cells) == ["42"]
+
+    def test_preview_table_text_cell_preserved(self, reset_sinks):
+        captured = []
+        ui.set_preview_sink(captured.append)
+        cell = Text("0.85", style="green")
+        ui.preview_table(["Sim"], [[cell]])
+        tbl = captured[0]
+        assert list(tbl.columns[0].cells)[0] is cell
 
 
 class TestOutputSink:

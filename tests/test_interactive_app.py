@@ -4,6 +4,8 @@ Tests all interactive-only commands, aliases, shlex error handling,
 setup mode gating, and worker error display.
 """
 
+import pytest
+
 from arg_parse import setup_parsers
 from interactive_app import (
     COMMANDS_ALLOWED_WITHOUT_SPOTIFY,
@@ -11,6 +13,13 @@ from interactive_app import (
     PlaylistInteractiveApp,
 )
 from main import PlaylistCLI
+
+
+@pytest.fixture(autouse=True)
+def _isolated_history(monkeypatch, tmp_path):
+    """Every app __init__ resolves the history path; keep tests off real data/."""
+    monkeypatch.setenv("TUNR_HISTORY_PATH", str(tmp_path / "tunr_history"))
+    return tmp_path / "tunr_history"
 
 
 class DummyApp(PlaylistInteractiveApp):
@@ -47,6 +56,40 @@ def _make_app(monkeypatch, with_spotify=True):
     app = DummyApp(cli=PlaylistCLI(), parser=setup_parsers())
     app._refresh_env_status()
     return app
+
+
+# ============================================================================
+# Compose: output log configuration
+# ============================================================================
+
+
+def _compose_widgets(app):
+    """Iterate app.compose() without a running app (offline pattern).
+
+    Bare list(app.compose()) raises NoActiveAppError because of the
+    `with Container(...)` block, so temporarily install the app as the
+    active app and give it a compose stack.
+    """
+    import textual._context as _ctx
+
+    token = _ctx.active_app.set(app)
+    app._compose_stacks.append([])
+    app._composed.append([])
+    try:
+        return list(app.compose())
+    finally:
+        app._compose_stacks.pop()
+        app._composed.pop()
+        _ctx.active_app.reset(token)
+
+
+class TestComposeOutputLog:
+    def test_output_richlog_wraps_long_lines(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        widgets = _compose_widgets(app)
+        output = next(w for w in widgets if getattr(w, "id", None) == "output")
+        assert output.wrap is True
+        assert output.min_width == 20
 
 
 # ============================================================================
@@ -112,6 +155,77 @@ class TestHelpCommand:
         assert "Legacy" in text
         assert "/import" in text
         assert app.commands == []  # still not dispatched to argparse
+
+
+class TestCommandHelp:
+    def test_help_subcommand_shows_cyan_panel_with_flags(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch)
+        app._handle_command("/help update")
+        assert app.commands == []
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "/update"
+        assert panel.border_style == "cyan"
+        assert "--count" in _logged_text(app)
+
+    def test_help_subcommand_accepts_slash_prefix(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help /update")
+        assert "--count" in _logged_text(app)
+
+    def test_update_help_flag_renders_help_not_error(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch)
+        app._handle_command("/update --help")
+        assert app.commands == []
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "Help"
+        assert panel.border_style == "cyan"
+        assert "--count" in _logged_text(app)
+
+    def test_missing_arg_error_carries_usage(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch)
+        app._handle_command("/update")
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "Error"
+        text = _logged_text(app)
+        assert "usage:" in text
+        assert "playlist" in text
+
+    def test_typo_gets_did_you_mean(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/serch indie")
+        assert app.commands == []
+        text = _logged_text(app)
+        assert "/search" in text
+        assert "Did you mean" in text
+
+    def test_help_debug_shows_meta_usage(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help debug")
+        assert "Usage: /debug [errors|last|track <id>]" in _logged_text(app)
+
+    def test_help_meta_command(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._handle_command("/help clear")
+        assert "Clear the output pane" in _logged_text(app)
+
+    def test_help_unknown_name_gets_did_you_mean(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch)
+        app._handle_command("/help serch")
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "Error"
+        assert "/search" in _logged_text(app)
 
 
 class TestSetupCommand:
@@ -466,6 +580,295 @@ class TestParseErrorDisplay:
 # ============================================================================
 
 
+# ============================================================================
+# Thread-safe UI marshalling, rc surfacing, toasts, preview dismissal
+# ============================================================================
+
+
+class WorkerApp(DummyApp):
+    """DummyApp variant for exercising _execute_command off the worker seam.
+
+    call_from_thread invokes directly (tests are single-threaded) and notify
+    captures toasts instead of needing a running app.
+    """
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.notifications = []
+        self.marshalled = []
+
+    def call_from_thread(self, fn, *args, **kwargs):
+        self.marshalled.append(fn)
+        return fn(*args, **kwargs)
+
+    def notify(self, message, *, title="", severity="information", timeout=None, markup=True):
+        self.notifications.append((message, severity))
+
+
+class TestDispatchUI:
+    def test_direct_call_on_app_thread(self, monkeypatch):
+        """When already on the app thread, _dispatch_ui must NOT marshal."""
+        import threading
+
+        app = _make_app(monkeypatch)
+        app._app_thread_id = threading.get_ident()
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("call_from_thread used from the app thread")
+
+        app.call_from_thread = _boom
+        calls = []
+        app._dispatch_ui(calls.append, "rendered")
+        assert calls == ["rendered"]
+
+    def test_marshals_from_other_thread(self, monkeypatch):
+        import threading
+
+        app = _make_app(monkeypatch)
+        app._app_thread_id = threading.get_ident() + 1  # pretend we're a worker
+        marshalled = []
+        app.call_from_thread = lambda fn, *args: marshalled.append((fn, args))
+        calls = []
+        app._dispatch_ui(calls.append, "rendered")
+        assert calls == []
+        assert marshalled == [(calls.append, ("rendered",))]
+
+    def test_direct_call_before_mount(self, monkeypatch):
+        """Unmounted apps (no captured thread id) fall back to a direct call."""
+        app = _make_app(monkeypatch)
+        assert app._app_thread_id is None
+        calls = []
+        app._dispatch_ui(calls.append, "rendered")
+        assert calls == ["rendered"]
+
+    def test_emit_renderable_uses_dispatch_ui(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._emit_renderable("hello")  # _app_thread_id None -> direct append_log
+        assert "hello" in app.logged
+
+
+class TestUILogHandlerDispatch:
+    def test_ui_thread_record_is_not_dropped(self, monkeypatch):
+        """Log records emitted from the app thread must reach the log."""
+        import logging as _logging
+        import threading
+
+        from interactive_app import UILogHandler
+
+        app = _make_app(monkeypatch)
+        app._app_thread_id = threading.get_ident()
+        app.call_from_thread = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("from app thread")
+        )
+        handler = UILogHandler(app)
+        record = _logging.LogRecord("test", _logging.WARNING, __file__, 1, "boom", None, None)
+        handler.emit(record)
+        assert any("boom" in str(entry) for entry in app.logged)
+        assert any("boom" in entry for entry in app._error_log)
+
+
+class TestRcSurfacing:
+    def _worker_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = WorkerApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.cli.last_search_results = None
+        return app
+
+    def test_nonzero_rc_logs_red_line_and_error_toast(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+        monkeypatch.setattr(ia, "dispatch_command", lambda cli, cmd, args: 1)
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert "/stats exited with errors" in text
+        assert "/debug errors" in text
+        assert ("/stats exited with errors", "error") in app.notifications
+        assert len(app.notifications) == 1
+
+    def test_exception_logs_panel_and_error_toast(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _raise(cli, cmd, args):
+            raise RuntimeError("kaput")
+
+        monkeypatch.setattr(ia, "dispatch_command", _raise)
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert "Command /stats failed: kaput" in text
+        assert ("/stats exited with errors", "error") in app.notifications
+        assert len(app.notifications) == 1
+
+    def test_zero_rc_fast_no_toast_no_red_line(self, monkeypatch):
+        import time as _time
+
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+        monkeypatch.setattr(ia, "dispatch_command", lambda cli, cmd, args: 0)
+        app._run_started = _time.monotonic()
+        app._execute_command("stats", object())
+        assert app.notifications == []
+        assert "exited with errors" not in _logged_text(app)
+
+    def test_zero_rc_slow_information_toast(self, monkeypatch):
+        import time as _time
+
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+        monkeypatch.setattr(ia, "dispatch_command", lambda cli, cmd, args: 0)
+        app._run_started = _time.monotonic() - 11
+        app._execute_command("stats", object())
+        assert app.notifications == [("/stats finished in 11s", "information")]
+
+
+class TestPostCommandPreviewDismissal:
+    def test_post_command_clears_preview(self, monkeypatch):
+        import ui
+
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        captured = []
+        ui.set_preview_sink(captured.append)
+        try:
+            app._post_command("search")
+        finally:
+            ui.set_preview_sink(None)
+        assert captured == [None]
+
+
+# ============================================================================
+# Busy status truthfulness: spinner gate, elapsed formatting, last-run note
+# ============================================================================
+
+
+class SpinnerRecordingApp(DummyApp):
+    """DummyApp that records spinner start/stop instead of touching timers."""
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.spinner_calls = []
+
+    def _start_spinner(self) -> None:
+        self.spinner_calls.append("start")
+
+    def _stop_spinner(self) -> None:
+        self.spinner_calls.append("stop")
+
+
+class TestFormatElapsed:
+    def test_seconds(self):
+        assert PlaylistInteractiveApp._format_elapsed(4.7) == "4s"
+
+    def test_zero_and_negative_clamped(self):
+        assert PlaylistInteractiveApp._format_elapsed(0) == "0s"
+        assert PlaylistInteractiveApp._format_elapsed(-3) == "0s"
+
+    def test_minutes(self):
+        assert PlaylistInteractiveApp._format_elapsed(125) == "2m05s"
+
+    def test_hours(self):
+        assert PlaylistInteractiveApp._format_elapsed(3720) == "1h02m"
+
+
+class TestSpinnerGate:
+    def _spinner_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = SpinnerRecordingApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_applying_search_results_animates(self, monkeypatch):
+        """Non-'Running …' busy statuses must still animate the spinner."""
+        app = self._spinner_app(monkeypatch)
+        app.spinner_calls.clear()
+        app.status = "Applying search results"
+        assert app.spinner_calls == ["start"]
+
+    def test_idle_stops_spinner(self, monkeypatch):
+        app = self._spinner_app(monkeypatch)
+        app.status = "Running /stats"
+        app.spinner_calls.clear()
+        app.status = "Idle"
+        assert app.spinner_calls == ["stop"]
+
+    def test_setup_required_does_not_animate(self, monkeypatch):
+        app = self._spinner_app(monkeypatch)
+        app.spinner_calls.clear()
+        app.status = "Setup Required"
+        assert "start" not in app.spinner_calls
+
+
+class TestCommandDuration:
+    def test_post_command_logs_finished_line_and_sets_note(self, monkeypatch):
+        import time as _time
+
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app._run_started = _time.monotonic() - 4.2
+        app._post_command("stats")
+        text = _logged_text(app)
+        assert "/stats finished in 4s" in text
+        assert app._last_run_note == "last: /stats 4s"
+        assert app._run_started is None  # cleared by _set_idle
+
+    def test_post_command_without_start_logs_nothing(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app._run_started = None
+        app._post_command("stats")
+        assert "finished in" not in _logged_text(app)
+        assert app._last_run_note == ""
+
+
+class _SubmitEvent:
+    """Stub for Input.Submitted: .value plus an .input with a settable .value."""
+
+    def __init__(self, value):
+        from types import SimpleNamespace
+
+        self.value = value
+        self.input = SimpleNamespace(value=value)
+
+
+class TestWizardSlashDismissal:
+    def _armed_app(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_track_ids = ["artist|||song"]
+        app.cli.last_search_query = "indie"
+        app._prompt_search_followup()
+        assert app._pending_action == "search_confirm"
+        return app
+
+    def test_slash_command_dismisses_pending_wizard(self, monkeypatch):
+        app = self._armed_app(monkeypatch)
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        assert app._pending_action is None
+        assert "stats" in app.commands
+        assert "Search follow-up dismissed." in _logged_text(app)
+
+    def test_text_after_slash_dismissal_not_consumed_as_wizard_answer(self, monkeypatch):
+        app = self._armed_app(monkeypatch)
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        app.logged.clear()
+        app.on_input_submitted(_SubmitEvent("yes"))
+        # "yes" is treated as a normal (invalid) command, not a wizard answer.
+        assert app._pending_action is None
+        assert "Choose: db, playlist" not in _logged_text(app)
+
+    def test_non_slash_text_still_routes_to_wizard(self, monkeypatch):
+        app = self._armed_app(monkeypatch)
+        app.on_input_submitted(_SubmitEvent("yes"))
+        assert app._pending_action == "search_action"
+        assert "Choose: db, playlist" in _logged_text(app)
+
+
 class TestSearchFollowupSuppression:
     def test_wizard_fires_for_plain_search(self, monkeypatch):
         app = _make_app(monkeypatch)
@@ -487,3 +890,224 @@ class TestSearchFollowupSuppression:
         app.cli.last_search_handled = False
         app._post_command("search")
         assert app._pending_action is None
+
+
+# ============================================================================
+# Command history: persistence, dedupe, prefix-filtered recall
+# ============================================================================
+
+
+class HistoryApp(DummyApp):
+    """DummyApp with the two thin Input seams overridden for history tests."""
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.input_value = ""
+
+    def _write_input(self, value: str) -> None:
+        self.input_value = value
+
+    def _get_input_value(self) -> str:
+        return self.input_value
+
+
+def _make_history_app(monkeypatch, entries=()):
+    for key in SPOTIFY_REQUIRED_KEYS:
+        monkeypatch.setenv(key, "test_value")
+    app = HistoryApp(cli=PlaylistCLI(), parser=setup_parsers())
+    app._refresh_env_status()
+    app._history = list(entries)
+    return app
+
+
+class TestHistoryWraparound:
+    """Pin the pre-existing navigation semantics (untested before)."""
+
+    def test_prev_at_oldest_stays(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["a", "b"])
+        app._history_prev()
+        assert (app._history_index, app.input_value) == (1, "b")
+        app._history_prev()
+        assert (app._history_index, app.input_value) == (0, "a")
+        app._history_prev()  # already at the oldest entry: stays put
+        assert (app._history_index, app.input_value) == (0, "a")
+
+    def test_next_past_end_clears(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["a", "b"])
+        app._history_prev()
+        app._history_next()
+        assert app._history_index is None
+        assert app.input_value == ""
+
+    def test_next_without_navigation_is_noop(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["a"])
+        app._history_next()
+        assert app._history_index is None
+        assert app.input_value == ""
+
+    def test_prev_with_empty_history_is_noop(self, monkeypatch):
+        app = _make_history_app(monkeypatch, [])
+        app._history_prev()
+        assert app._history_index is None
+
+
+class TestHistoryPersistence:
+    def test_round_trip_across_sessions(self, monkeypatch, _isolated_history):
+        app = _make_app(monkeypatch)
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        app.on_input_submitted(_SubmitEvent("/env"))
+        assert _isolated_history.read_text(encoding="utf-8") == "/stats\n/env\n"
+        reborn = _make_app(monkeypatch)
+        assert reborn._history == ["/stats", "/env"]
+
+    def test_missing_file_starts_empty(self, monkeypatch, _isolated_history):
+        assert not _isolated_history.exists()
+        app = _make_app(monkeypatch)
+        assert app._history == []
+
+    def test_corrupt_file_tolerated(self, monkeypatch, _isolated_history):
+        _isolated_history.write_bytes(b"\xff\xfe\x80 not utf8 \x00garbage")
+        app = _make_app(monkeypatch)
+        assert app._history == []
+
+    def test_load_caps_and_truncates_file(self, monkeypatch, _isolated_history):
+        from interactive_app import HISTORY_MAX_LINES
+
+        lines = [f"/cmd{i}" for i in range(HISTORY_MAX_LINES + 100)]
+        _isolated_history.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        app = _make_app(monkeypatch)
+        assert len(app._history) == HISTORY_MAX_LINES
+        assert app._history[0] == "/cmd100"
+        assert app._history[-1] == f"/cmd{HISTORY_MAX_LINES + 99}"
+        on_disk = _isolated_history.read_text(encoding="utf-8").splitlines()
+        assert len(on_disk) == HISTORY_MAX_LINES
+
+    def test_consecutive_duplicates_skipped(self, monkeypatch, _isolated_history):
+        app = _make_app(monkeypatch)
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        app.on_input_submitted(_SubmitEvent("/env"))
+        app.on_input_submitted(_SubmitEvent("/stats"))  # non-consecutive dup kept
+        assert app._history == ["/stats", "/env", "/stats"]
+        assert _isolated_history.read_text(encoding="utf-8") == "/stats\n/env\n/stats\n"
+
+    def test_wizard_answers_not_persisted(self, monkeypatch, _isolated_history):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_track_ids = ["artist|||song"]
+        app.cli.last_search_query = "indie"
+        app._prompt_search_followup()
+        app.on_input_submitted(_SubmitEvent("no"))
+        assert app._history == []
+        assert not _isolated_history.exists()
+
+
+class TestHistoryPrefixRecall:
+    ENTRIES = ["/search indie", "/stats", "/search jazz", "/env"]
+
+    def test_prefix_walk_backward_and_forward(self, monkeypatch):
+        app = _make_history_app(monkeypatch, self.ENTRIES)
+        app.input_value = "/se"
+        app._history_prev()
+        assert app.input_value == "/search jazz"
+        app._history_prev()
+        assert app.input_value == "/search indie"
+        app._history_prev()  # oldest match: stays
+        assert app.input_value == "/search indie"
+        app._history_next()
+        assert app.input_value == "/search jazz"
+        app._history_next()  # no newer match -> exits navigation
+        assert app._history_index is None
+        assert app.input_value == ""
+
+    def test_empty_input_recalls_newest(self, monkeypatch):
+        app = _make_history_app(monkeypatch, self.ENTRIES)
+        app.input_value = ""
+        app._history_prev()
+        assert app.input_value == "/env"
+
+    def test_prefix_resets_after_navigation_exits(self, monkeypatch):
+        app = _make_history_app(monkeypatch, self.ENTRIES)
+        app.input_value = "/se"
+        app._history_prev()
+        app._history_next()  # exits navigation, resets the prefix
+        app._history_prev()  # fresh start from the (nav-placed) empty input
+        assert app.input_value == "/env"
+
+    def test_nav_placed_value_is_not_a_prefix(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["/search a", "/env"])
+        app._navigating = True
+        app._nav_placed_value = "/env"
+        app.input_value = "/env"
+        app._history_prev()
+        assert app.input_value == "/env"
+        app._history_prev()  # an "/env" prefix would stick; nav-placed must not
+        assert app.input_value == "/search a"
+
+    def test_no_match_leaves_input_untouched(self, monkeypatch):
+        app = _make_history_app(monkeypatch, self.ENTRIES)
+        app.input_value = "/zzz"
+        app._history_prev()
+        assert app._history_index is None
+        assert app.input_value == "/zzz"
+
+
+# ============================================================================
+# Integrator regression tests (post-review fixes)
+# ============================================================================
+
+
+class TestPostCommandPreviewPersist:
+    def test_preview_kept_when_search_flagged_persist(self, monkeypatch):
+        """SEARCH_FINAL_TABLE_MODE=none leaves the preview as the ONLY copy of
+        the results; _post_command must not dismiss it."""
+        import ui
+
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app.cli.last_search_preview_persist = True
+        captured = []
+        ui.set_preview_sink(captured.append)
+        try:
+            app._post_command("search")
+        finally:
+            ui.set_preview_sink(None)
+        assert captured == []  # no clear_preview(None) emission
+
+
+class TestHistoryNavResetOnSubmit:
+    def test_submit_ends_navigation_session(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["/search indie", "/stats"])
+        app._history_prev()  # places "/stats"
+        assert app._navigating is True
+        app.on_input_submitted(_SubmitEvent(app.input_value))
+        assert app._navigating is False
+        assert app._nav_placed_value is None
+        assert app._history_prefix == ""
+
+    def test_typed_text_equal_to_old_nav_value_still_prefix_filters(self, monkeypatch):
+        """Regression: recall "/env" via Up and submit it; later TYPE "/env"
+        manually and press Up twice. The stale nav marker used to disable the
+        prefix filter, so the second Up fell through to "/search jazz"."""
+        app = _make_history_app(monkeypatch, ["/search jazz", "/env"])
+        app._history_prev()  # places "/env" (nav markers set)
+        app.on_input_submitted(_SubmitEvent("/env"))
+        app.input_value = "/env"  # typed manually this time
+        app._history_prev()
+        app._history_prev()  # must stay on /env-prefixed entries
+        assert app.input_value == "/env"
+
+
+class TestQuitExcludedFromHistory:
+    """Persisting /quit makes the next session's first up-arrow recall it."""
+
+    def test_quit_and_exit_not_recorded(self, monkeypatch):
+        app = _make_history_app(monkeypatch, [])
+        for raw in ("/quit", "/exit", "quit"):
+            app._append_history(raw)
+        assert app._history == []
+        assert not app._history_path.exists() or app._history_path.read_text() == ""
+
+    def test_other_commands_still_recorded(self, monkeypatch):
+        app = _make_history_app(monkeypatch, [])
+        app._append_history("/stats")
+        assert app._history == ["/stats"]

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import inspect
-from typing import Any, Optional, Tuple, Type
+from typing import IO, Any, Optional, Sequence, Tuple, Type
 
 
 def _positive_int(value: str) -> int:
@@ -19,16 +20,61 @@ def _non_negative_int(value: str) -> int:
     return ivalue
 
 
+class HelpText(str):
+    """Marker type: a parse_tokens "error" that is really help output.
+
+    The interactive UI renders HelpText as a Help panel instead of an Error
+    panel; it stays a plain str for every other caller.
+    """
+
+
+class _HelpRequested(Exception):
+    """Internal: raised by _NoExitArgumentParser when --help/-h is parsed."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.text = text
+
+
+# Subcommands kept out of did-you-mean suggestions: /interactive is a no-op
+# inside the UI, /debug is intercepted by the meta router, /rotate-played is a
+# deprecated alias.
+_UNSUGGESTED_COMMANDS = {"interactive", "debug", "rotate-played"}
+
+
+def unknown_command_message(name: str, candidates: Sequence[str]) -> str:
+    """Build the "Unknown command" error, with a did-you-mean suggestion."""
+    candidate_list = list(candidates)
+    if name in candidate_list:
+        # The command exists but reached the parser with arguments it doesn't
+        # take (meta commands like /clear are exact-match routed) — suggesting
+        # "did you mean /<itself>?" would be absurd.
+        return f"/{name} doesn't take those arguments. Try /help {name}."
+    message = f"Unknown command /{name}."
+    matches = difflib.get_close_matches(name, candidate_list, n=1, cutoff=0.6)
+    if matches:
+        message += f" Did you mean /{matches[0]}?"
+    message += " Type /help for the list."
+    return message
+
+
 class _NoExitArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that raises instead of exiting (for interactive UI)."""
 
     def error(self, message: str) -> None:
-        raise argparse.ArgumentError(None, message)
+        # Carry the usage signature so missing-arg errors are actionable.
+        raise argparse.ArgumentError(None, f"{message}\n{self.format_usage()}")
 
     def exit(self, status: int = 0, message: Optional[str] = None) -> None:
         if message:
             raise argparse.ArgumentError(None, message)
         raise argparse.ArgumentError(None, "Invalid command.")
+
+    def print_help(self, file: Optional[IO[str]] = None) -> None:
+        # Subparsers inherit this class via add_subparsers' parser_class
+        # default, so `/update --help` and `-h` raise instead of printing to
+        # stdout (which the TUI swallows) and then exiting.
+        raise _HelpRequested(self.format_help())
 
 
 def setup_parsers(
@@ -36,7 +82,9 @@ def setup_parsers(
     parser_class: Type[argparse.ArgumentParser] = argparse.ArgumentParser,
 ) -> argparse.ArgumentParser:
     """Create and configure argument parser"""
-    parser_kwargs = {"description": "Spotify Playlist Manager CLI"}
+    # prog: usage lines should read "tunr update ...", not the module name
+    # ("main.py update ...") that argparse infers from sys.argv inside the TUI.
+    parser_kwargs = {"prog": "tunr", "description": "Spotify Playlist Manager CLI"}
     if "exit_on_error" in inspect.signature(argparse.ArgumentParser).parameters:
         parser_kwargs["exit_on_error"] = exit_on_error
     parser = parser_class(**parser_kwargs)
@@ -428,13 +476,36 @@ def parse_args() -> Tuple[str, Any]:
     return args.command, args
 
 
-def parse_tokens(tokens: list[str]) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Parse tokens for interactive /command input."""
+def parse_tokens(
+    tokens: list[str],
+    *,
+    extra_commands: Sequence[str] = (),
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Parse tokens for interactive /command input.
+
+    Returns (command, args, error). ``error`` is a plain str for real errors
+    or a ``HelpText`` when the user asked for --help/-h. ``extra_commands``
+    extends the did-you-mean candidates (e.g. with the UI's meta commands).
+    """
     parser = setup_parsers(exit_on_error=False, parser_class=_NoExitArgumentParser)
     if not tokens:
         return None, None, "No command provided."
+
+    # Unknown-command detection BEFORE parse_args: never string-match argparse
+    # wording (it varies across the py3.9-3.12 matrix).
+    sub_action = next(
+        (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None
+    )
+    if sub_action is not None and not tokens[0].startswith("-"):
+        if tokens[0] not in sub_action.choices:
+            candidates = [c for c in sub_action.choices if c not in _UNSUGGESTED_COMMANDS]
+            candidates.extend(extra_commands)
+            return None, None, unknown_command_message(tokens[0], candidates)
+
     try:
         args = parser.parse_args(tokens)
+    except _HelpRequested as exc:
+        return None, None, HelpText(exc.text)
     except argparse.ArgumentError as exc:
         return None, None, str(exc)
 

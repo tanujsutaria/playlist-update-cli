@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from rich.logging import RichHandler
+from rich.text import Text
 
 from config import AppConfig, env_flag, env_int
 from models import Song, track_id_for
@@ -20,6 +22,7 @@ from nextgen.acoustic import backfill_sonic
 from nextgen.embeddings import EmbeddingModel
 from nextgen.enrich import enrich_tracks
 from nextgen.pipeline import SearchPipeline, SearchResult
+from nextgen.providers import ProviderConfigError
 from nextgen.scoring import SearchScoreConfig
 from rotation_manager import RotationManager
 from scoring import PlaylistScoreConfig
@@ -40,9 +43,11 @@ from ui import (
     clear_preview,
     console,
     emit_json,
+    error,
     info,
     json_output,
     key_value_table,
+    notice,
     preview_table,
     section,
     set_json_mode,
@@ -56,11 +61,40 @@ from ui import (
 logger = logging.getLogger(__name__)
 
 
+def format_count(value: float) -> str:
+    """Compact human count for table cells: 8200 -> '8.2k', 1500000 -> '1.5M'."""
+    number = float(value)
+    sign = "-" if number < 0 else ""
+    number = abs(number)
+    for bound, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")):
+        if number >= bound:
+            text = f"{number / bound:.1f}"
+            if text.endswith(".0"):
+                text = text[:-2]
+            return f"{sign}{text}{suffix}"
+    if number == int(number):
+        return f"{sign}{int(number)}"
+    return f"{sign}{number:g}"
+
+
+# Display labels for the metric columns appended when a query requests metrics.
+_METRIC_LABELS = {"monthly_listeners": "Listeners", "similarity": "Sim"}
+
+
+def _metric_label(name: str) -> str:
+    return _METRIC_LABELS.get(name, name.replace("_", " ").title())
+
+
 def configure_logging(handler: Optional[logging.Handler] = None) -> None:
     """Configure logging for CLI or interactive UI."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers = []
+    # The embedding model's cache validation (huggingface_hub via httpx) emits
+    # ~10 INFO "HTTP Request:" lines per load, burying the UI's own messages
+    # (e.g. the embedding-load announcement). Surface only their warnings.
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if handler is None:
         handler = RichHandler(
@@ -98,6 +132,9 @@ class PlaylistCLI:
         self.last_search_track_ids = None
         self.last_search_cached = False
         self.last_search_handled = False
+        # True only when SEARCH_FINAL_TABLE_MODE=none left the transient
+        # preview as the sole copy of the results; the TUI then keeps it.
+        self.last_search_preview_persist = False
         # Session-scoped undo: each entry snapshots a playlist's tracks just
         # before a write, so /undo can restore it. Cleared on restart.
         self._undo_stack: List[Dict[str, Any]] = []
@@ -178,6 +215,7 @@ class PlaylistCLI:
         # True once a /search invocation already handled its own follow-up
         # (via --to/--save), so the interactive UI skips the modal prompts.
         self.last_search_handled = False
+        self.last_search_preview_persist = False
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
         """Get or create a rotation manager for a playlist"""
@@ -588,7 +626,7 @@ class PlaylistCLI:
             conn = self.repos.conn
             total_tracks = conn.execute("SELECT COUNT(*) AS c FROM tracks").fetchone()["c"]
             if not total_tracks:
-                info("No tracks in your library yet. Try /ingest or /search to add some.")
+                notice("No tracks in your library yet. Try /ingest or /search to add some.")
                 return {
                     "tracks": 0,
                     "artists": 0,
@@ -1455,12 +1493,33 @@ class PlaylistCLI:
         stream_full = env_flag("SEARCH_STREAM_FULL", interactive)
         final_table_mode = os.getenv("SEARCH_FINAL_TABLE_MODE", "").strip().lower()
         if not final_table_mode:
-            final_table_mode = "none" if (interactive and stream_full) else "full"
+            # The TUI default used to be "none", which left the transient preview
+            # Static as the ONLY copy of the results — they vanished with the next
+            # command. Default to a compact final table so results persist in the
+            # scrollback; SEARCH_FINAL_TABLE_MODE=none remains the escape hatch.
+            final_table_mode = "compact" if (interactive and stream_full) else "full"
         if final_table_mode not in {"full", "compact", "none"}:
             final_table_mode = "full"
+        # With mode "none" while streaming, the preview pane is the ONLY copy
+        # of the results — tell the TUI's post-command cleanup to keep it.
+        self.last_search_preview_persist = (
+            final_table_mode == "none" and interactive and stream_full
+        )
+
+        def _requested_metrics() -> List[str]:
+            # Read lazily: the pipeline only populates this mid-run (cache
+            # rehydrate or provider parse), after these closures are built.
+            return list(getattr(self.search_pipeline, "last_requested_metrics", []) or [])
+
+        def _metric_cells(item: SearchResult) -> List[object]:
+            run_constraints = getattr(self.search_pipeline, "last_constraints", {}) or {}
+            metrics = getattr(item, "metrics", None) or {}
+            return [
+                self._metric_cell(metrics, name, run_constraints) for name in _requested_metrics()
+            ]
 
         if live_mode == "compact":
-            live_headers = ["#", "Song", "Artist", "Score", "Strict", "Sources"]
+            live_base_headers = ["#", "Song", "Artist", "Score", "Strict", "Sources"]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
                 return [
@@ -1470,10 +1529,10 @@ class PlaylistCLI:
                     f"{item.score:.3f}",
                     f"{item.strict_ratio:.2f}",
                     len(item.sources or []),
-                ]
+                ] + _metric_cells(item)
 
         else:
-            live_headers = [
+            live_base_headers = [
                 "#",
                 "Song",
                 "Artist",
@@ -1496,7 +1555,10 @@ class PlaylistCLI:
                     status_label,
                     len(item.providers or []),
                     len(item.sources or []),
-                ]
+                ] + _metric_cells(item)
+
+        def _live_headers() -> List[object]:
+            return list(live_base_headers) + [_metric_label(m) for m in _requested_metrics()]
 
         def _page_slice(rows: List[List[object]]) -> List[List[object]]:
             start = (live_page - 1) * live_page_size
@@ -1516,7 +1578,7 @@ class PlaylistCLI:
                             shown_start = (live_page - 1) * live_page_size + 1
                             shown_end = shown_start + len(paged_rows) - 1
                             preview_table(
-                                live_headers,
+                                _live_headers(),
                                 paged_rows,
                                 title=(
                                     f"Live Results • {status_label} "
@@ -1533,14 +1595,23 @@ class PlaylistCLI:
                 progress=_progress,
                 on_result=_on_result,
             )
+        except ProviderConfigError as exc:
+            error(
+                f"{exc}\nSet ANTHROPIC_API_KEY or OPENAI_API_KEY in config/.env, "
+                "then restart. Check /env to verify providers.",
+                title="Search unavailable",
+            )
+            clear_preview()
+            self._reset_search_state()
+            return
         except Exception as exc:
-            warning(str(exc))
+            error(str(exc))
             clear_preview()
             self._reset_search_state()
             return
 
         if not results:
-            info("No results returned.")
+            notice("No results returned.")
             # Surface the synthesis even when the provider yielded nothing, so this
             # early-out is as informative as the constrained-out path below.
             summary = getattr(self.search_pipeline, "last_summary", None)
@@ -1561,7 +1632,7 @@ class PlaylistCLI:
         results, constraint_stats = self._apply_metric_constraints(results, constraints)
         summary = getattr(self.search_pipeline, "last_summary", None)
         if not results:
-            info("No results matched the requested constraints.")
+            notice("No results matched the requested constraints.")
             if summary:
                 summary_panel(str(summary), title="Search Summary")
             clear_preview()
@@ -1570,6 +1641,12 @@ class PlaylistCLI:
 
         self.last_search_cached = getattr(self.search_pipeline, "last_cached", False)
         status_label = "cached" if self.last_search_cached else "fresh"
+        # Re-read after run(): the pipeline populated these mid-run. When the
+        # query asked for metrics (e.g. "<10k monthly listeners"), each table
+        # grows one column per requested metric — the values the constraint
+        # filter actually enforced, styled by _metric_cell.
+        requested_metrics = _requested_metrics()
+        metric_headers = [_metric_label(m) for m in requested_metrics]
         rows = []
         for idx, item in enumerate(results, 1):
             rows.append(
@@ -1584,6 +1661,10 @@ class PlaylistCLI:
                     len(item.providers or []),
                     len(item.sources or []),
                 ]
+                + [
+                    self._metric_cell(getattr(item, "metrics", None) or {}, name, constraints)
+                    for name in requested_metrics
+                ]
             )
 
         headers = [
@@ -1596,13 +1677,16 @@ class PlaylistCLI:
             "Status",
             "Providers",
             "Sources",
-        ]
+        ] + metric_headers
+        compact_headers = ["#", "Song", "Artist", "Score", "Strict", "Status"] + metric_headers
+
+        def _compact_rows() -> List[List[object]]:
+            # Base full-row layout is 9 cells; metric cells start at index 9.
+            return [[row[0], row[1], row[2], row[4], row[5], row[6], *row[9:]] for row in rows]
+
         if not (interactive and stream_full):
             if final_table_mode == "compact":
-                table(
-                    ["#", "Song", "Artist", "Score", "Strict", "Status"],
-                    [[row[0], row[1], row[2], row[4], row[5], row[6]] for row in rows],
-                )
+                table(compact_headers, _compact_rows())
             elif final_table_mode != "none":
                 table(headers, rows)
             clear_preview()
@@ -1613,15 +1697,12 @@ class PlaylistCLI:
                 shown_start = (live_page - 1) * live_page_size + 1
                 shown_end = shown_start + len(paged_rows) - 1
                 preview_table(
-                    live_headers,
+                    _live_headers(),
                     paged_rows,
                     title=f"Live Results • {status_label} (rows {shown_start}-{shown_end} of {len(results)})",
                 )
             if final_table_mode == "compact":
-                table(
-                    ["#", "Song", "Artist", "Score", "Strict", "Status"],
-                    [[row[0], row[1], row[2], row[4], row[5], row[6]] for row in rows],
-                )
+                table(compact_headers, _compact_rows())
             elif final_table_mode == "full":
                 table(headers, rows)
             info(f"Live results complete: {len(results)} candidates.")
@@ -2031,10 +2112,14 @@ class PlaylistCLI:
         return songs
 
     def _parse_metric_number(self, value: object) -> Optional[float]:
+        # Non-finite values (json.loads accepts a bare NaN/Infinity literal,
+        # float() parses "nan") are treated as missing: they would poison the
+        # constraint filter and crash format_count's int() conversion.
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return float(value)
+            number = float(value)
+            return number if math.isfinite(number) else None
         text = str(value).strip().lower().replace(",", "")
         multiplier = 1
         if text.endswith("k"):
@@ -2044,9 +2129,43 @@ class PlaylistCLI:
             multiplier = 1000000
             text = text[:-1]
         try:
-            return float(text) * multiplier
+            number = float(text) * multiplier
         except ValueError:
             return None
+        return number if math.isfinite(number) else None
+
+    def _metric_cell(self, metrics: Dict[str, Any], name: str, constraints: Dict[str, Any]) -> Text:
+        """One requested-metric table cell, styled to mirror what
+        `_apply_metric_constraints` enforced: dim em-dash when the metric is
+        missing/unparseable, green when the queried bound is satisfied, plain
+        when no bound applies or it is violated. Pure/offline — same parser and
+        the same 1<sim<=100 -> /100 normalization as the filter."""
+        constraints = constraints or {}
+        value = self._parse_metric_number((metrics or {}).get(name))
+        if value is None:
+            return Text("—", style="dim")
+        if name == "monthly_listeners":
+            text = format_count(value)
+            max_listeners = constraints.get("max_monthly_listeners")
+            min_listeners = constraints.get("min_monthly_listeners")
+            if max_listeners is None and min_listeners is None:
+                return Text(text)
+            # Mirror the filter: max bound checked first, then min.
+            if max_listeners is not None and value > max_listeners:
+                return Text(text)
+            if min_listeners is not None and value < min_listeners:
+                return Text(text)
+            return Text(text, style="green")
+        if name == "similarity":
+            if 1 < value <= 100:
+                value = value / 100.0
+            text = f"{value:.2f}"
+            if not constraints.get("similarity_requested"):
+                return Text(text)
+            if value < self._similarity_min():
+                return Text(text)
+            return Text(text, style="green")
+        return Text(format_count(value))
 
     def _attach_spotify_urls(self, results: List[Dict]) -> None:
         if not results:
@@ -3123,7 +3242,7 @@ def _handle_find(cli: "PlaylistCLI", args: Any) -> int:
         return 0
 
     if not ranked:
-        info("No results to rank.")
+        notice("No results to rank.")
         return 0
     section("Find", cli.last_search_query)
     info(f"Blend: {round(weight * 100)}% taste · {round((1 - weight) * 100)}% relevance — {signal}")
@@ -3411,7 +3530,11 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
             return 1
         return handler(cli, args)
     except Exception as e:
-        logger.error(f"Command failed: {str(e)}")
+        # exc_info=True threads the traceback to every handler: the TUI's
+        # UILogHandler formatter appends exc_text (so /debug errors and the
+        # RichLog show the real traceback) and the CLI RichHandler renders a
+        # rich traceback. The rc contract (return 1) is unchanged.
+        logger.error("Command failed: %s", e, exc_info=True)
         return 1
 
 

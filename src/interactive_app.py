@@ -5,7 +5,10 @@ import json
 import logging
 import os
 import shlex
-from typing import Iterable, List, Optional, Tuple
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from rich import box
 from rich.console import Group
@@ -17,9 +20,10 @@ from textual.containers import Container
 from textual.reactive import reactive
 from textual.widgets import Input, RichLog, Static
 
-from arg_parse import parse_tokens, setup_parsers
+from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
 from main import PlaylistCLI, configure_logging, dispatch_command
 from ui import (
+    clear_preview,
     info,
     json_output,
     key_value_table,
@@ -33,6 +37,10 @@ from ui import (
 from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
+
+# Persisted command history is capped to this many lines (enforced on load).
+HISTORY_MAX_LINES = 500
+
 SPOTIFY_REQUIRED_KEYS = [
     "SPOTIFY_CLIENT_ID",
     "SPOTIFY_CLIENT_SECRET",
@@ -87,6 +95,24 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
 ]
 HELP_LEGACY = {"import"}
 
+# One-line help for the TUI-only meta commands (mirrors the Session table in
+# _show_help). Used by `/help <name>` and as did-you-mean candidates.
+META_COMMAND_HELP = {
+    "help": "Show the command list (/help all includes legacy commands)",
+    "?": "Show the command list (/help all includes legacy commands)",
+    "setup": "Show first-time setup instructions",
+    "env": "Show detected environment keys",
+    "keys": "Show detected environment keys",
+    "debug": "Usage: /debug [errors|last|track <id>]",
+    "errors": "Show error log (alias for /debug errors)",
+    "expand": "Expand the last search",
+    "search-more": "Expand the last search",
+    "clear": "Clear the output pane",
+    "cls": "Clear the output pane",
+    "quit": "Exit the app",
+    "exit": "Exit the app",
+}
+
 
 class UILogHandler(logging.Handler):
     def __init__(self, app: "PlaylistInteractiveApp") -> None:
@@ -108,9 +134,9 @@ class UILogHandler(logging.Handler):
             elif record.levelno >= logging.DEBUG:
                 style = "dim"
             text = Text(message, style=style)
-            self.app.call_from_thread(self.app.append_log, text)
+            self.app._dispatch_ui(self.app.append_log, text)
             if record.levelno >= logging.WARNING:
-                self.app.call_from_thread(self.app.record_error, message)
+                self.app._dispatch_ui(self.app.record_error, message)
         except Exception:
             self.handleError(record)
 
@@ -165,8 +191,12 @@ class PlaylistInteractiveApp(App):
         super().__init__()
         self.cli = cli
         self.parser = parser
-        self._history: List[str] = []
+        self._history_path = self._resolve_history_path()
+        self._history: List[str] = self._load_history()
         self._history_index: Optional[int] = None
+        self._history_prefix: str = ""
+        self._navigating = False
+        self._nav_placed_value: Optional[str] = None
         self._pending_action: Optional[str] = None
         self._pending_payload: dict = {}
         self._missing_spotify_keys: List[str] = []
@@ -176,16 +206,20 @@ class PlaylistInteractiveApp(App):
         self._error_log: List[str] = []
         self._spinner_index = 0
         self._spinner_timer = None
+        self._run_started: Optional[float] = None
+        self._last_run_note: str = ""
+        self._app_thread_id: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
         with Container(id="body"):
             yield Static(id="search_preview")
-            yield RichLog(id="output", highlight=False, markup=False)
+            yield RichLog(id="output", highlight=False, markup=False, wrap=True, min_width=20)
             yield Static(id="setup_screen")
         yield Input(placeholder="Type /help for commands", id="command_input")
 
     def on_mount(self) -> None:
+        self._app_thread_id = threading.get_ident()
         self._mounted = True
         set_output_sink(self._emit_renderable)
         set_preview_sink(self._emit_preview)
@@ -235,7 +269,10 @@ class PlaylistInteractiveApp(App):
         preview.update(renderable)
 
     def watch_status(self, value: str) -> None:
-        if value.startswith("Running") and not self._setup_mode:
+        # Busy means "any non-idle work", not just statuses that happen to
+        # start with "Running" (e.g. "Applying search results").
+        busy = value not in {"Idle", "Setup Required"} and not self._setup_mode
+        if busy:
             self._start_spinner()
         else:
             self._stop_spinner()
@@ -261,8 +298,19 @@ class PlaylistInteractiveApp(App):
             self.append_log(Text(f"> {raw}", style="bold"))
             self._handle_pending_input(raw)
             return
-        self._history.append(raw)
+        if self._pending_action and raw.startswith("/"):
+            # A slash command cancels the armed wizard so stray text typed
+            # later is never silently consumed as a wizard answer.
+            self._clear_pending()
+            self.append_log(Text("Search follow-up dismissed.", style="dim"))
+        self._append_history(raw)
         self._history_index = None
+        # Submitting ends any history-navigation session: without this reset,
+        # a stale _nav_placed_value would later misclassify identical typed
+        # text as nav-placed and skip the prefix filter.
+        self._navigating = False
+        self._nav_placed_value = None
+        self._history_prefix = ""
         self.append_log(Text(f"> {raw}", style="bold"))
         self._handle_command(raw)
 
@@ -281,30 +329,118 @@ class PlaylistInteractiveApp(App):
         if len(self._error_log) > 200:
             self._error_log = self._error_log[-200:]
 
+    def _dispatch_ui(self, fn: Callable, *args: object) -> None:
+        """Run a UI mutation on the app thread regardless of the caller's thread.
+
+        ``call_from_thread`` raises RuntimeError when invoked *from* the app
+        thread (Textual 8.x), so UI-thread callers (e.g. /debug handlers that
+        emit through the ui sinks) must call directly instead.
+        """
+        if self._app_thread_id is None or threading.get_ident() == self._app_thread_id:
+            fn(*args)
+        else:
+            self.call_from_thread(fn, *args)
+
     def _emit_renderable(self, renderable) -> None:
-        self.call_from_thread(self.append_log, renderable)
+        self._dispatch_ui(self.append_log, renderable)
+
+    @staticmethod
+    def _resolve_history_path() -> Path:
+        env_path = os.getenv("TUNR_HISTORY_PATH")
+        if env_path:
+            return Path(env_path).expanduser()
+        project_root = Path(__file__).resolve().parent.parent
+        return project_root / "data" / ".tunr_history"
+
+    def _load_history(self) -> List[str]:
+        """Best-effort load of persisted history; missing/corrupt files -> []."""
+        try:
+            raw_lines = self._history_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError, ValueError):
+            return []
+        lines = [line for line in raw_lines if line.strip()]
+        if len(lines) > HISTORY_MAX_LINES:
+            lines = lines[-HISTORY_MAX_LINES:]
+            try:
+                self._history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                logger.debug("Could not truncate command history file", exc_info=True)
+        return lines
+
+    def _append_history(self, raw: str) -> None:
+        """Record a submitted command, skipping consecutive duplicates."""
+        # Exiting isn't worth recalling: persisting /quit makes the first
+        # up-arrow of the NEXT session recall it, which invites a misfire.
+        if raw.lstrip("/").strip().lower() in {"quit", "exit"}:
+            return
+        if self._history and self._history[-1] == raw:
+            return
+        self._history.append(raw)
+        if len(self._history) > HISTORY_MAX_LINES:
+            self._history = self._history[-HISTORY_MAX_LINES:]
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._history_path.open("a", encoding="utf-8") as handle:
+                handle.write(raw + "\n")
+        except OSError:
+            logger.debug("Could not persist command history", exc_info=True)
+
+    def _matching_history_index(self, start: int, step: int) -> Optional[int]:
+        """First history index from `start` (walking by `step`) matching the prefix."""
+        prefix = self._history_prefix
+        index = start
+        while 0 <= index < len(self._history):
+            if not prefix or self._history[index].startswith(prefix):
+                return index
+            index += step
+        return None
 
     def _history_prev(self) -> None:
         if not self._history:
             return
         if self._history_index is None:
-            self._history_index = len(self._history) - 1
-        elif self._history_index > 0:
-            self._history_index -= 1
+            # Starting navigation: typed text becomes a prefix filter. A value
+            # the navigation itself placed in the input is not a typed prefix.
+            current = self._get_input_value()
+            if self._navigating and current == self._nav_placed_value:
+                self._history_prefix = ""
+            else:
+                self._history_prefix = current
+            match = self._matching_history_index(len(self._history) - 1, -1)
+            if match is None:
+                return
+            self._history_index = match
+        else:
+            match = self._matching_history_index(self._history_index - 1, -1)
+            if match is not None:
+                self._history_index = match
+            # else: stay on the oldest matching entry (same as before).
         self._set_input_value(self._history[self._history_index])
 
     def _history_next(self) -> None:
         if self._history_index is None:
             return
-        if self._history_index < len(self._history) - 1:
-            self._history_index += 1
-            value = self._history[self._history_index]
+        match = self._matching_history_index(self._history_index + 1, 1)
+        if match is not None:
+            self._history_index = match
+            value = self._history[match]
         else:
             self._history_index = None
+            self._history_prefix = ""
             value = ""
         self._set_input_value(value)
 
     def _set_input_value(self, value: str) -> None:
+        self._navigating = True
+        self._nav_placed_value = value
+        self._write_input(value)
+
+    def _get_input_value(self) -> str:
+        """Read the input widget's value (thin Textual seam; tests override)."""
+        return self.query_one(Input).value
+
+    def _write_input(self, value: str) -> None:
+        """Write the input widget's value (thin Textual seam; tests override)."""
         command_input = self.query_one(Input)
         command_input.value = value
         if hasattr(command_input, "cursor_position"):
@@ -320,6 +456,9 @@ class PlaylistInteractiveApp(App):
 
         if text in ("help", "?") or text in ("help all", "help --all"):
             self._show_help(show_all=text in ("help all", "help --all"))
+            return
+        if text.startswith("help "):
+            self._show_command_help(text[len("help ") :])
             return
         if text in ("setup",):
             self._show_setup()
@@ -357,9 +496,12 @@ class PlaylistInteractiveApp(App):
                 )
             )
             return
-        command, args, error = parse_tokens(tokens)
+        command, args, error = parse_tokens(tokens, extra_commands=self._meta_command_names())
         if error:
-            self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
+            if isinstance(error, HelpText):
+                self.append_log(Panel(Text(str(error)), title="Help", border_style="cyan"))
+            else:
+                self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
             return
         if command == "interactive":
             self.append_log(Text("Already in interactive mode.", style="yellow"))
@@ -383,13 +525,25 @@ class PlaylistInteractiveApp(App):
         if self.status != "Idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
+        self._run_started = time.monotonic()
         self.status = f"Running /{command}"
         self.run_worker(lambda: self._execute_command(command, args), thread=True)
 
     def _execute_command(self, command: str, args: object) -> None:
+        failed = False
         try:
-            dispatch_command(self.cli, command, args)
+            rc = dispatch_command(self.cli, command, args)
+            if rc != 0:
+                failed = True
+                self.call_from_thread(
+                    self.append_log,
+                    Text(
+                        f"/{command} exited with errors — run /debug errors for details.",
+                        style="red",
+                    ),
+                )
         except Exception as exc:
+            failed = True
             logger.exception("Command failed: /%s", command)
             self.call_from_thread(
                 self.append_log,
@@ -400,9 +554,36 @@ class PlaylistInteractiveApp(App):
                 ),
             )
         finally:
+            self._notify_command_result(command, failed)
             self.call_from_thread(self._post_command, command)
 
+    def _notify_command_result(self, command: str, failed: bool) -> None:
+        """Emit at most one toast per command: error on failure, info when slow."""
+        elapsed = 0.0
+        if self._run_started is not None:
+            elapsed = time.monotonic() - self._run_started
+        try:
+            if failed:
+                self.notify(f"/{command} exited with errors", severity="error")
+            elif elapsed > 10:
+                self.notify(
+                    f"/{command} finished in {self._format_elapsed(elapsed)}",
+                    severity="information",
+                )
+        except Exception:
+            # Toasts are best-effort; never let them break command teardown.
+            logger.debug("Toast notification failed for /%s", command, exc_info=True)
+
     def _post_command(self, command: str) -> None:
+        # Dismiss the transient preview pane — unless the command flagged that
+        # the preview is the only copy of its results (SEARCH_FINAL_TABLE_MODE=none
+        # writes no scrollback table, so clearing would lose them).
+        if not getattr(self.cli, "last_search_preview_persist", False):
+            clear_preview()
+        if self._run_started is not None:
+            elapsed = self._format_elapsed(time.monotonic() - self._run_started)
+            self._last_run_note = f"last: /{command} {elapsed}"
+            self.append_log(Text(f"/{command} finished in {elapsed}", style="dim"))
         if (
             command == "search"
             and self.cli.last_search_results
@@ -412,7 +593,19 @@ class PlaylistInteractiveApp(App):
         self._set_idle()
 
     def _set_idle(self) -> None:
+        self._run_started = None
         self.status = "Idle"
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        if total < 60:
+            return f"{total}s"
+        minutes, secs = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m{secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h{minutes:02d}m"
 
     def _show_welcome(self) -> None:
         welcome = Text()
@@ -489,6 +682,34 @@ class PlaylistInteractiveApp(App):
                         continue
                     yield name, choice.help or ""
 
+    @staticmethod
+    def _meta_command_names() -> List[str]:
+        return [name for name in META_COMMAND_HELP if name != "?"]
+
+    def _find_subparser(self, name: str) -> Optional[argparse.ArgumentParser]:
+        for action in self.parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action.choices.get(name)
+        return None
+
+    def _show_command_help(self, raw_name: str) -> None:
+        name = raw_name.strip().lstrip("/").strip()
+        if not name:
+            self._show_help()
+            return
+        meta = META_COMMAND_HELP.get(name)
+        if meta is not None:
+            self.append_log(Panel(Text(meta), title=f"/{name}", border_style="cyan"))
+            return
+        sub = self._find_subparser(name)
+        if sub is not None:
+            self.append_log(Panel(Text(sub.format_help()), title=f"/{name}", border_style="cyan"))
+            return
+        candidates = [cmd for cmd, _ in self._command_summaries()]
+        candidates.extend(self._meta_command_names())
+        message = unknown_command_message(name, candidates)
+        self.append_log(Panel(Text(message, style="red"), title="Error", border_style="red"))
+
     def _update_top_bar(self) -> None:
         if not self._mounted:
             return
@@ -518,6 +739,11 @@ class PlaylistInteractiveApp(App):
         status_label = self.status
         if self._spinner_timer is not None:
             status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
+        if self.status != "Idle" and self._run_started is not None:
+            elapsed = self._format_elapsed(time.monotonic() - self._run_started)
+            status_label = f"{status_label} • {elapsed}"
+        elif self.status == "Idle" and self._last_run_note:
+            status_label = f"Idle · {self._last_run_note}"
         status_text = Text(status_label, style=status_style)
         status_text.truncate(max_status_width, overflow="ellipsis")
         table = Table.grid(expand=True)
@@ -986,6 +1212,7 @@ class PlaylistInteractiveApp(App):
             finally:
                 self.call_from_thread(self._set_idle)
 
+        self._run_started = time.monotonic()
         self.status = "Applying search results"
         self.run_worker(_worker, thread=True)
         self._clear_pending()
@@ -1003,6 +1230,7 @@ class PlaylistInteractiveApp(App):
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         self.append_log(Text(f"Expanding search: {self.cli.last_search_query}", style="bold"))
+        self._run_started = time.monotonic()
         self.status = "Running /expand"
         self.run_worker(lambda: self._execute_expand(), thread=True)
 

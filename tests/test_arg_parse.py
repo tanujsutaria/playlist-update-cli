@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from arg_parse import parse_args, parse_tokens, setup_parsers
+from arg_parse import HelpText, parse_args, parse_tokens, setup_parsers, unknown_command_message
 
 
 class TestSetupParsers:
@@ -739,6 +739,65 @@ class TestParseTokensFunction:
         assert command is None
         assert error is not None
 
+    def test_parse_tokens_subcommand_help_flag(self):
+        """`/update --help` yields HelpText carrying the subcommand's flags."""
+        command, args, error = parse_tokens(["update", "--help"])
+        assert command is None
+        assert args is None
+        assert isinstance(error, HelpText)
+        # Assert flag substrings, never the usage prefix (prog renders
+        # differently under `python -c`).
+        assert "--count" in error
+        assert "--fresh-days" in error
+
+    def test_parse_tokens_subcommand_short_help_flag(self):
+        command, args, error = parse_tokens(["update", "-h"])
+        assert isinstance(error, HelpText)
+        assert "--count" in error
+
+    def test_parse_tokens_top_level_help_flag(self):
+        command, args, error = parse_tokens(["--help"])
+        assert isinstance(error, HelpText)
+        assert "update" in error
+
+    def test_parse_tokens_missing_arg_error_carries_usage(self):
+        command, args, error = parse_tokens(["update"])
+        assert command is None
+        assert error is not None
+        assert not isinstance(error, HelpText)
+        assert "usage:" in error
+        assert "playlist" in error
+
+    def test_parse_tokens_did_you_mean_typo(self):
+        command, args, error = parse_tokens(["serch", "x"])
+        assert command is None
+        assert error is not None
+        assert not isinstance(error, HelpText)
+        assert "/search" in error
+        assert "/help" in error
+
+    def test_parse_tokens_unknown_without_close_match(self):
+        command, args, error = parse_tokens(["zzqqx"])
+        assert error is not None
+        assert "Unknown command /zzqqx." in error
+        assert "Did you mean" not in error
+        assert "/help" in error
+
+    def test_parse_tokens_extra_commands_extend_suggestions(self):
+        command, args, error = parse_tokens(["clera"], extra_commands=["clear", "cls"])
+        assert error is not None
+        assert "/clear" in error
+
+    def test_parse_tokens_does_not_suggest_hidden_commands(self):
+        """Deprecated/hidden subcommands never surface as suggestions."""
+        command, args, error = parse_tokens(["rotate-playd"])
+        assert error is not None
+        assert "rotate-played" not in error
+
+    def test_unknown_command_message_helper(self):
+        message = unknown_command_message("serch", ["search", "stats"])
+        assert message == "Unknown command /serch. Did you mean /search? Type /help for the list."
+
     def test_parse_tokens_all_commands(self):
         """Verify parse_tokens handles every registered command."""
         test_cases = [
@@ -760,3 +819,33 @@ class TestParseTokensFunction:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestUnknownCommandSelfReference:
+    """A meta command typed with arguments must not suggest itself."""
+
+    def test_meta_command_with_args_is_not_its_own_suggestion(self):
+        message = unknown_command_message("clear", ["clear", "search"])
+        assert message == "/clear doesn't take those arguments. Try /help clear."
+
+    def test_close_match_still_suggested(self):
+        message = unknown_command_message("serch", ["search", "clear"])
+        assert "Did you mean /search?" in message
+
+
+class TestProgName:
+    """Usage lines must read "tunr ...", not the module name argparse infers."""
+
+    def test_parser_prog_is_tunr(self):
+        parser = setup_parsers()
+        assert parser.prog == "tunr"
+
+    def test_subparser_usage_carries_tunr(self):
+        parser = setup_parsers(exit_on_error=False)
+        sub = None
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices and "update" in action.choices:
+                sub = action.choices["update"]
+                break
+        assert sub is not None
+        assert "tunr update" in sub.format_usage()
