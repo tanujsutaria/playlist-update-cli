@@ -99,6 +99,25 @@ class TestProfileJson:
         assert payload["artists"] == 1
         assert payload["coverage_growth"] == []  # no rotation generations seeded
         assert {a["name"] for a in payload["top_artists"]} == {"Wild Nothing"}
+        # Liner-notes keys are additive (3 embedded tracks, nothing else seeded).
+        assert payload["coverage"] == {
+            "embeddings": {"have": 3, "total": 3},
+            "context": {"have": 0, "total": 3},
+            "sonic": {"have": 0, "total": 3},
+            "spotify_id": {"have": 0, "total": 3},
+        }
+        assert payload["backfill"] == {
+            "missing_embeddings": 0,
+            "missing_context": 3,
+            "missing_sonic": 3,
+            "missing_spotify_id": 3,
+        }
+        assert payload["concentration"] == {
+            "buckets": [{"tracks_per_artist": 3, "artists": 1}],
+            "top10_track_share_pct": 100.0,
+        }
+        assert payload["one_track_artists"] == {"count": 0, "pct": 0.0}
+        assert payload["ingest_months"] == []
 
     def test_profile_without_json_renders_tables(self, tmp_path, capsys):
         cli = _seed_cli(tmp_path)
@@ -118,6 +137,19 @@ class TestTasteJson:
         assert payload["enriched"] is False  # no track_context -> text-based signal
         assert len(payload["most_representative"]) == 2
         assert "track_id" in payload["most_representative"][0]
+        # Liner-notes keys are additive; all gated off on this sparse fixture.
+        assert payload["taste_title"] is None
+        assert payload["context_coverage"] == {"with_context": 0, "seed": 3}
+        assert payload["facets"] is None  # no context in the seed
+        assert payload["decades"] is None
+        assert payload["bpm_spread"] is None
+        assert payload["superlatives"] is None
+        assert payload["core_vs_frontier"] is None
+        assert payload["insights"] == []
+        # List items gained sonic_informed/tags, key-additively.
+        for row in payload["most_representative"]:
+            assert row["sonic_informed"] is False
+            assert row["tags"] == []
 
 
 class TestSearchJson:

@@ -5,14 +5,17 @@ import math
 import os
 import re
 import shutil
+import statistics
 import sys
 import uuid
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
+from rich.console import Group
 from rich.logging import RichHandler
 from rich.text import Text
 
@@ -36,25 +39,51 @@ from spotify_manager import (
 from storage.db import Database
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
-from storage.sonic import describe_sonic
+from storage.sonic import SONIC_FEATURES, describe_sonic
 from storage.vectors import decode_vector, mean_vector, taste_centroid, vector_norm
+from taste_facets import (
+    decade_histogram,
+    decade_of,
+    display_name,
+    facet_track_counts,
+    fold_genre,
+    fold_instrument,
+    headline_case,
+    parse_fields,
+    taste_title,
+)
 from ui import (
+    FILL_STYLE,
+    MARKER_STYLE,
     bar_chart,
+    caption,
+    chart_panel,
+    chips,
     clear_preview,
     console,
+    coverage_panel,
     emit_json,
     error,
+    facet_columns,
+    heat_strip,
     info,
+    ink_panel,
+    insight,
     json_output,
     key_value_table,
+    lollipop,
     notice,
     preview_table,
     section,
     set_json_mode,
-    sparkline,
+    side_by_side,
+    sparkline_text,
+    stacked_bar,
+    stat_cards,
     subsection,
     summary_panel,
     table,
+    text_line,
     warning,
 )
 
@@ -83,6 +112,76 @@ _METRIC_LABELS = {"monthly_listeners": "Listeners", "similarity": "Sim"}
 
 def _metric_label(name: str) -> str:
     return _METRIC_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _coverage_and_backfill(conn: Any) -> Tuple[Dict[str, Dict[str, int]], Dict[str, int]]:
+    """JOIN-counted coverage + backfill gaps over the `tracks` table.
+
+    JOIN-counting (graft from the coverage doctrine) means an orphan side-table
+    row — a context/embedding row whose track was deleted — can never inflate
+    coverage. Each side table keys on `track_id` (its PK), so the gap is simply
+    `total - have` (identical to a LEFT-JOIN miss count, in one scan less).
+    """
+    total = conn.execute("SELECT COUNT(*) AS c FROM tracks").fetchone()["c"]
+
+    def _join_count(side_table: str) -> int:
+        return conn.execute(
+            f"SELECT COUNT(*) AS c FROM tracks t JOIN {side_table} x ON x.track_id = t.track_id"
+        ).fetchone()["c"]
+
+    have = {
+        "embeddings": _join_count("track_embeddings"),
+        "context": _join_count("track_context"),
+        "sonic": _join_count("track_sonic"),
+        "spotify_id": conn.execute(
+            "SELECT COUNT(*) AS c FROM tracks WHERE spotify_id IS NOT NULL AND spotify_id != ''"
+        ).fetchone()["c"],
+    }
+    coverage = {key: {"have": n, "total": total} for key, n in have.items()}
+    backfill = {f"missing_{key}": total - n for key, n in have.items()}
+    return coverage, backfill
+
+
+def _concentration_verdict(top10_share_pct: float) -> str:
+    """Verdict line for the artist-concentration histogram, from the share of
+    the library held by the top-10 artists. Hard thresholds, no adjectives
+    beyond them: <10% / <30% / the rest."""
+    if top10_share_pct < 10:
+        return "no artist dominates"
+    if top10_share_pct < 30:
+        return "a few favorites"
+    return "concentrated on favorites"
+
+
+def _identical_runs(overlaps: List[float]) -> List[Tuple[int, int]]:
+    """Maximal runs of consecutive Jaccard == 1.0 hand-offs, as 1-based
+    generation ranges. `overlaps[k]` compares generations k+1 and k+2, so a
+    run spanning indices a..b means generations a+1 through b+2 contain
+    identical track sets."""
+    runs: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for index, value in enumerate(overlaps):
+        if value >= 0.9999:
+            if start is None:
+                start = index
+        elif start is not None:
+            runs.append((start + 1, index + 1))
+            start = None
+    if start is not None:
+        runs.append((start + 1, len(overlaps) + 1))
+    return runs
+
+
+def _month_label(month: str) -> str:
+    """'2025-03' -> 'Mar 2025'; anything unparseable passes through as-is."""
+    try:
+        return datetime.strptime(month, "%Y-%m").strftime("%b %Y")
+    except ValueError:
+        return month
+
+
+# Spelled-out wave counts for the ingest-history line (only fires at <= 4 waves).
+_WAVE_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
 
 
 def configure_logging(handler: Optional[logging.Handler] = None) -> None:
@@ -613,11 +712,11 @@ class PlaylistCLI:
             logger.debug("Full error:", exc_info=True)
 
     def show_profile(self, top: int = 15) -> Optional[Dict[str, Any]]:
-        """Visualize the library: top artists by track count + rotation coverage.
+        """Visualize the library: the operations cockpit (/profile).
 
-        Built entirely on fully-populated columns (track/artist identity and
-        rotation history), so it is honest on the current corpus — unlike
-        mood/genre views, which depend on track enrichment that has not run yet.
+        Counts and rotation history come from fully-populated columns, so every
+        number is honest on the current corpus; coverage gaps (embeddings /
+        context / sonic / spotify ids) are named explicitly, never hidden.
 
         Returns the underlying data as a dict (also used for `--json`); None only
         on error.
@@ -635,6 +734,19 @@ class PlaylistCLI:
                     "generations": 0,
                     "top_artists": [],
                     "coverage_growth": [],
+                    "coverage": {
+                        key: {"have": 0, "total": 0}
+                        for key in ("embeddings", "context", "sonic", "spotify_id")
+                    },
+                    "backfill": {
+                        "missing_embeddings": 0,
+                        "missing_context": 0,
+                        "missing_sonic": 0,
+                        "missing_spotify_id": 0,
+                    },
+                    "concentration": {"buckets": [], "top10_track_share_pct": 0.0},
+                    "one_track_artists": {"count": 0, "pct": 0.0},
+                    "ingest_months": [],
                 }
 
             total_artists = conn.execute("SELECT COUNT(*) AS c FROM artists").fetchone()["c"]
@@ -659,10 +771,66 @@ class PlaylistCLI:
                     ["Rotation generations", generations],
                 ]
             )
+            # Rotation runway: played vs crate as one stacked bar — the grey
+            # remainder IS the never-rotated mass, drawn, never hidden.
+            # Sized to stay one line at an 80-col console (label 19 + bar 26 +
+            # detail ≤ 33 cells).
+            text_line(
+                Text("  rotation runway  ", style="dim"),
+                stacked_bar([(rotated / total_tracks, FILL_STYLE)], 26),
+                Text(f"  {rotated} played · {never} in the crate", style="dim"),
+            )
             if never:
                 info(
                     f"{never} of your {total_tracks} tracks have never been rotated "
                     f"— plenty of unused library to draw from."
+                )
+
+            # Artist concentration: how many artists contribute 1/2/3/4+ tracks,
+            # plus the top-10 artists' share of the whole library.
+            conc_buckets: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
+            for row in conn.execute(
+                "SELECT cnt, COUNT(*) AS n FROM ("
+                " SELECT artist_id, COUNT(*) AS cnt FROM tracks"
+                " WHERE artist_id IS NOT NULL GROUP BY artist_id"
+                ") GROUP BY cnt ORDER BY cnt"
+            ).fetchall():
+                conc_buckets[min(int(row["cnt"]), 4)] += row["n"]
+            artists_with_tracks = sum(conc_buckets.values())
+            top10_tracks = conn.execute(
+                "SELECT COALESCE(SUM(c), 0) AS s FROM ("
+                " SELECT COUNT(*) AS c FROM tracks WHERE artist_id IS NOT NULL"
+                " GROUP BY artist_id ORDER BY c DESC LIMIT 10"
+                ")"
+            ).fetchone()["s"]
+            top10_share_pct = top10_tracks / total_tracks * 100
+            if artists_with_tracks >= 5:
+                text_line(
+                    Text("Artist concentration", style="bold cyan"),
+                    Text(" · tracks per artist", style="dim"),
+                )
+                bucket_labels = {1: "1 track", 2: "2 tracks", 3: "3 tracks", 4: "4+ tracks"}
+                shown = [
+                    (bucket_labels[k], conc_buckets[k]) for k in (1, 2, 3, 4) if conc_buckets[k]
+                ]
+
+                def _artist_share(value: float) -> str:
+                    pct = value / artists_with_tracks * 100
+                    return "<1%" if 0 < pct < 1 else f"{pct:.0f}%"
+
+                # Fixed-width count + share so the right-justified value column
+                # stays internally aligned across rows ("955   87%" over
+                # " 20    2%", not ragged).
+                bar_chart(
+                    [label for label, _ in shown],
+                    [n for _, n in shown],
+                    width=24,
+                    value_fmt=lambda v: f"{int(v):>4} {_artist_share(v):>5}",
+                )
+                caption(
+                    f"your top 10 artists hold {top10_tracks} tracks — "
+                    f"{top10_share_pct:.1f}% of the library "
+                    f"· {_concentration_verdict(top10_share_pct)}"
                 )
 
             # Top artists by track count (drops tracks with no artist via the join).
@@ -679,7 +847,10 @@ class PlaylistCLI:
             ).fetchall()
             if artist_rows:
                 section("Top artists", f"by track count (top {len(artist_rows)})")
-                bar_chart([r["name"] for r in artist_rows], [r["c"] for r in artist_rows])
+                bar_chart(
+                    [display_name(r["name"]) for r in artist_rows],
+                    [r["c"] for r in artist_rows],
+                )
 
             # Cumulative distinct-track coverage across generations (a discovery curve).
             gen_rows = conn.execute(
@@ -697,11 +868,86 @@ class PlaylistCLI:
                         seen.add(row["track_id"])
                     growth.append(len(seen))
                 section("Rotation coverage growth", f"{len(gen_rows)} generations")
-                key_value_table(
-                    [
-                        ["Coverage curve", sparkline(growth)],
-                        ["First → latest", f"{growth[0]} → {growth[-1]} distinct tracks"],
-                    ]
+                text_line("  ", sparkline_text(growth))
+                notice(f"First → latest: {growth[0]} → {growth[-1]} distinct tracks rotated")
+                stamps = conn.execute(
+                    "SELECT COUNT(DISTINCT created_at) AS c FROM rotation_generations"
+                ).fetchone()["c"]
+                if stamps == 1:
+                    notice(
+                        "note: generation timestamps were backfilled in one batch — "
+                        "growth is shown by generation order, not by date"
+                    )
+
+            # Ingest history: tracks added per month (created_at), last 12 months.
+            month_rows = conn.execute(
+                "SELECT substr(created_at, 1, 7) AS month, COUNT(*) AS n FROM tracks "
+                "WHERE created_at IS NOT NULL AND length(created_at) >= 7 "
+                "GROUP BY month ORDER BY month DESC LIMIT 12"
+            ).fetchall()
+            months = [(r["month"], r["n"]) for r in reversed(month_rows)]
+            distinct_months = conn.execute(
+                "SELECT COUNT(DISTINCT substr(created_at, 1, 7)) AS c FROM tracks "
+                "WHERE created_at IS NOT NULL AND length(created_at) >= 7"
+            ).fetchone()["c"]
+            if months:
+                section("Ingest history")
+                bar_chart([m for m, _ in months], [n for _, n in months], width=24)
+                # "Waves" phrasing only while the history really is a handful of
+                # batches — beyond that, the chart speaks for itself.
+                if distinct_months == 1:
+                    notice(f"One ingest wave so far — {_month_label(months[0][0])}.")
+                elif distinct_months <= 4:
+                    notice(
+                        f"{_WAVE_WORDS[distinct_months]} ingest waves so far — "
+                        f"first ingest {_month_label(months[0][0])}, "
+                        f"latest {_month_label(months[-1][0])}."
+                    )
+
+            # Backfill runway: the same JOIN-counted gaps /stats reports. Sonic
+            # is deliberately excluded from any "complete" claim — AcousticBrainz
+            # coverage is partial by nature and never inferred.
+            coverage, backfill = _coverage_and_backfill(conn)
+            gap_parts: List[str] = []
+            if backfill["missing_embeddings"]:
+                gap_parts.append(f"{backfill['missing_embeddings']} tracks awaiting embeddings")
+            if backfill["missing_context"]:
+                gap_parts.append(f"{backfill['missing_context']} unenriched")
+            if backfill["missing_sonic"]:
+                gap_parts.append(f"{backfill['missing_sonic']} without sonic data")
+            if backfill["missing_spotify_id"]:
+                gap_parts.append(f"{backfill['missing_spotify_id']} missing spotify ids")
+            hard_gaps = (
+                backfill["missing_embeddings"]
+                or backfill["missing_context"]
+                or backfill["missing_spotify_id"]
+            )
+            if not hard_gaps:
+                if backfill["missing_sonic"]:
+                    notice(
+                        f"{backfill['missing_sonic']} tracks without sonic data — "
+                        "AcousticBrainz coverage is partial by nature."
+                    )
+                else:
+                    info("Backfill complete — every track has embeddings, context, and ids.")
+            else:
+                # Prescribe per-gap remedies: /enrich closes context+embedding
+                # gaps only; sonic comes from /sonic (AcousticBrainz, partial by
+                # nature); spotify ids resolve when tracks are re-matched, not
+                # via /enrich.
+                remedies: List[str] = []
+                if backfill["missing_context"] or backfill["missing_embeddings"]:
+                    remedies.append("/enrich backfills context + embeddings")
+                if backfill["missing_sonic"]:
+                    remedies.append("/sonic fetches AcousticBrainz features (partial by nature)")
+                if backfill["missing_spotify_id"]:
+                    remedies.append("spotify ids resolve on the next playlist match")
+                ink_panel(
+                    Group(
+                        Text(" · ".join(gap_parts)),
+                        Text(" · ".join(remedies), style="dim"),
+                    ),
+                    title="Backfill runway",
                 )
 
             return {
@@ -712,6 +958,25 @@ class PlaylistCLI:
                 "generations": generations,
                 "top_artists": [{"name": r["name"], "tracks": r["c"]} for r in artist_rows],
                 "coverage_growth": growth,
+                "coverage": coverage,
+                "backfill": backfill,
+                "concentration": {
+                    "buckets": [
+                        {"tracks_per_artist": k, "artists": conc_buckets[k]}
+                        for k in (1, 2, 3, 4)
+                        if conc_buckets[k]
+                    ],
+                    "top10_track_share_pct": round(top10_share_pct, 1),
+                },
+                "one_track_artists": {
+                    "count": conc_buckets[1],
+                    "pct": (
+                        round(conc_buckets[1] / artists_with_tracks * 100, 1)
+                        if artists_with_tracks
+                        else 0.0
+                    ),
+                },
+                "ingest_months": [{"month": m, "tracks": n} for m, n in months],
             }
         except Exception as e:
             logger.error(f"Error showing profile: {str(e)}")
@@ -743,35 +1008,28 @@ class PlaylistCLI:
         rows = conn.execute("SELECT track_id, embedding_blob FROM track_embeddings").fetchall()
         return rows, "your library"
 
-    def _taste_rows(self, items: list) -> list:
-        """Resolve a list of (track_id, vec) pairs to [{track_id, name, artist}]."""
-        rows = []
-        for track_id, _vec in items:
-            track = self.repos.tracks.get(track_id) or {}
-            artist = self.repos.artists.get(track.get("artist_id") or "") or {}
-            rows.append(
-                {
-                    "track_id": track_id,
-                    "name": track.get("name") or track_id,
-                    "artist": artist.get("name") or "?",
-                }
-            )
-        return rows
-
-    def _taste_display_rows(self, items: list, start: int = 1) -> list:
-        """Build [#, Track, Artist] table rows for a list of (track_id, vec) pairs."""
-        return [
-            [i, row["name"], row["artist"]] for i, row in enumerate(self._taste_rows(items), start)
-        ]
+    def _track_name_map(self) -> Dict[str, Tuple[str, str]]:
+        """Bulk-load {track_id: (track name, artist name)} in ONE JOIN query —
+        replaces the old two-SELECTs-per-row name resolution."""
+        out: Dict[str, Tuple[str, str]] = {}
+        for row in self.repos.conn.execute(
+            "SELECT t.track_id AS track_id, t.name AS name, a.name AS artist "
+            "FROM tracks t LEFT JOIN artists a ON a.artist_id = t.artist_id"
+        ).fetchall():
+            out[row["track_id"]] = (row["name"] or row["track_id"], row["artist"] or "?")
+        return out
 
     def _sonic_vectors_for(self, track_ids: list) -> Dict[str, list]:
         """Load stored AcousticBrainz sonic vectors for the given track_ids (only
-        those that have been /sonic-backfilled appear in the result)."""
+        those that have been /sonic-backfilled appear in the result). One bulk
+        scan Python-filtered by id — not a per-track SELECT loop."""
+        wanted = set(track_ids)
         out: Dict[str, list] = {}
-        for track_id in track_ids:
-            row = self.repos.sonic.get(track_id)
-            if row and row.get("sonic_blob") is not None:
-                out[track_id] = decode_vector(row["sonic_blob"])
+        for row in self.repos.conn.execute(
+            "SELECT track_id, sonic_blob FROM track_sonic"
+        ).fetchall():
+            if row["track_id"] in wanted and row["sonic_blob"] is not None:
+                out[row["track_id"]] = decode_vector(row["sonic_blob"])
         return out
 
     def show_taste(self, top: int = 8) -> Optional[Dict[str, Any]]:
@@ -845,52 +1103,525 @@ class PlaylistCLI:
 
             ranked = sorted(seed, key=lambda tv: _representativeness(tv[0]), reverse=True)
             # Distinct artists are free: track_id is "artist|||name".
-            n_artists = len({track_id.split("|||")[0] for track_id, _ in seed})
+            artist_seed_counts: Dict[str, int] = {}
+            for track_id, _vec in seed:
+                prefix = track_id.split("|||")[0]
+                artist_seed_counts[prefix] = artist_seed_counts.get(prefix, 0) + 1
+            n_artists = len(artist_seed_counts)
 
-            enriched = bool(conn.execute("SELECT 1 FROM track_context LIMIT 1").fetchone())
+            # Bulk scans (one query each, Python-filtered against the seed —
+            # works for every seed source and sidesteps SQLite IN-list limits).
+            seed_ids = {tid for tid, _ in seed}
+            name_map = self._track_name_map()
+            ctx_rows = conn.execute("SELECT track_id, fields_json FROM track_context").fetchall()
+            seed_ctx = [
+                (r["track_id"], r["fields_json"]) for r in ctx_rows if r["track_id"] in seed_ids
+            ]
+            parsed_ctx = {tid: parse_fields(fj or "") for tid, fj in seed_ctx}
+            with_context = len(parsed_ctx)
+
+            # "Enriched" is a claim about THIS seed's centroid, not the library:
+            # it holds only when a majority of the seed (and at least 3 tracks)
+            # carries enrichment context.
+            enriched = with_context >= 3 and with_context * 2 >= len(seed)
             signal = (
                 "enriched (mood/genre/era + titles)"
                 if enriched
                 else "text-based (titles + artists)"
             )
 
+            # Facet aggregations over the seed's enriched context (taste_facets
+            # owns all fields_json parsing/folding so every command agrees).
+            mood_counts = facet_track_counts(seed_ctx, "moods")
+            genre_counts = facet_track_counts(seed_ctx, "genres", fold=fold_genre)
+            theme_counts = facet_track_counts(seed_ctx, "themes")
+            instrument_counts = facet_track_counts(
+                seed_ctx, "instrumentation", fold=fold_instrument
+            )
+            comparison_counts = facet_track_counts(seed_ctx, "comparisons")
+            decade_buckets, datable, unbucketable = decade_histogram(seed_ctx)
+            post_2010 = sum(n for d, n in decade_buckets if int(d[:-1]) >= 2010)
+            post_2010_pct = post_2010 / datable * 100 if datable else 0.0
+
+            sonic_count = len(sonic_vecs)
+            blend_active = bool(sonic_centroid)
+            bpm_idx = SONIC_FEATURES.index("bpm_norm")
+            # bpm_norm == 0.0 means AcousticBrainz had no tempo for the track —
+            # excluded from every BPM stat rather than fabricating 40 BPM.
+            bpm_by_track = {
+                tid: vec[bpm_idx] * 180 + 40
+                for tid, vec in sonic_vecs.items()
+                if len(vec) > bpm_idx and vec[bpm_idx] > 0.0
+            }
+            bpm_values = sorted(bpm_by_track.values())
+
             section("Your Taste", f"{source} · {signal}")
-            key_value_table(
-                [
-                    ["Built from", f"{len(seed)} tracks"],
-                    ["Distinct artists", n_artists],
-                    ["Signal", signal],
+
+            # Masthead: a deterministic headline named from counted tags only.
+            taste_headline = taste_title(mood_counts, genre_counts)
+            if taste_headline is not None:
+                masthead_lines: List[Text] = [
+                    Text(headline_case(taste_headline), style="bold"),
+                    Text(""),
                 ]
+                evidence_pairs = sorted(
+                    mood_counts[:2] + genre_counts[:2], key=lambda kv: (-kv[1], kv[0])
+                )
+                evidence = " · ".join(f"{label} ×{n}" for label, n in evidence_pairs)
+                masthead_lines.append(Text(f"{evidence}   (tracks tagged)", style="dim"))
+                # The flavor line names the actual seed population (_taste_seed
+                # may return recent plays / rotation / library) and discloses
+                # its datable denominator.
+                source_title = source[:1].upper() + source[1:]
+                source_verb = "live" if source == "recent plays" else "lives"
+                flavor: List[str] = []
+                if datable >= 20 and post_2010_pct >= 80:
+                    flavor.append(
+                        f"{source_title} {source_verb} in the now: "
+                        f"{post_2010_pct:.0f}% post-2010 ({post_2010}/{datable} datable)."
+                    )
+                elif datable and decade_buckets and decade_buckets[0][1] / datable >= 0.6:
+                    home_pct = decade_buckets[0][1] / datable * 100
+                    flavor.append(
+                        f"Your taste has a home decade: {home_pct:.0f}% {decade_buckets[0][0]}."
+                    )
+                if n_artists == len(seed):
+                    flavor.append(
+                        f"{len(seed)} tracks from {n_artists} different artists "
+                        "— you never repeat a voice."
+                    )
+                else:
+                    anchor, anchor_n = max(
+                        artist_seed_counts.items(), key=lambda kv: (kv[1], kv[0])
+                    )
+                    if anchor_n >= 3:
+                        anchor_name = next(
+                            (
+                                name_map[tid][1]
+                                for tid, _ in seed
+                                if tid in name_map and tid.split("|||")[0] == anchor
+                            ),
+                            anchor,
+                        )
+                        flavor.append(
+                            f"{display_name(anchor_name)} is your anchor — "
+                            f"{anchor_n} seeds and counting."
+                        )
+                masthead_lines.extend(Text(line) for line in flavor)
+                ink_panel(
+                    Group(*masthead_lines),
+                    caption=(
+                        f"named from enriched tags on {with_context}/{len(seed)} tracks "
+                        "· semantic profile, not acoustic"
+                    ),
+                    border_style=MARKER_STYLE,
+                )
+            if with_context < 5:
+                notice(
+                    f"Enriched views unlock after /enrich — {with_context}/{len(seed)} "
+                    "seed tracks have context."
+                )
+
+            stat_cards(
+                [
+                    ("Built from", f"{len(seed)} tracks", source),
+                    (
+                        "Distinct artists",
+                        str(n_artists),
+                        "one per track" if n_artists == len(seed) else None,
+                    ),
+                    (
+                        "Signal",
+                        "enriched" if enriched else "text-based",
+                        "mood·genre·era" if enriched else "titles + artists",
+                    ),
+                    (
+                        "Sonic data",
+                        f"{sonic_count}/{len(seed)}",
+                        "AcousticBrainz" if sonic_count else "none yet",
+                    ),
+                ],
+                width=22,
             )
 
-            most = ranked[:top]
-            subsection("Most representative")
-            table(["#", "Track", "Artist"], self._taste_display_rows(most))
+            # Mood / genre facet panels (each needs >= 5 contributing tracks).
+            facet_blocks: List[Tuple[str, List[Tuple[str, int]], Optional[str]]] = []
+            if sum(1 for f in parsed_ctx.values() if f.get("moods")) >= 5:
+                facet_blocks.append(
+                    (
+                        "Moods you keep returning to",
+                        mood_counts[:6],
+                        "tracks tagged · a track names several",
+                    )
+                )
+            if sum(1 for f in parsed_ctx.values() if f.get("genres")) >= 5:
+                facet_blocks.append(
+                    (
+                        "Genres in heavy rotation",
+                        genre_counts[:6],
+                        f"tracks tagged · {len(genre_counts)} distinct labels",
+                    )
+                )
+            if facet_blocks:
+                facet_columns(facet_blocks)
 
-            widest: list = []
+            if datable >= 5:
+                era_caption = f"{datable} of {len(seed)} datable from enriched era tags"
+                if unbucketable:
+                    era_caption += f" · {unbucketable} defied parsing"
+                chart_panel("Era fingerprint", decade_buckets, caption=era_caption)
+
+            # Ranked tables. The ● column marks tracks whose sonic vector took
+            # part in the blend — and is omitted entirely when the blend is
+            # inactive (fewer than 3 sonic tracks), so the caption never claims
+            # a blend that didn't happen.
+            show_sonic_col = blend_active
+
+            def _payload_rows(items: list) -> List[Dict[str, Any]]:
+                payload_rows: List[Dict[str, Any]] = []
+                for track_id, _vec in items:
+                    name, artist = name_map.get(track_id, (track_id, "?"))
+                    payload_rows.append(
+                        {
+                            "track_id": track_id,
+                            "name": name,
+                            "artist": artist,
+                            "tags": parsed_ctx.get(track_id, {}).get("genres", [])[:2],
+                            "sonic_informed": blend_active and track_id in sonic_vecs,
+                        }
+                    )
+                return payload_rows
+
+            def _display_rows(payload_rows: List[Dict[str, Any]]) -> list:
+                display_rows = []
+                for i, row in enumerate(payload_rows, 1):
+                    cells: list = [
+                        i,
+                        display_name(row["name"]),
+                        display_name(row["artist"]),
+                        chips(row["tags"], max_items=2),
+                    ]
+                    if show_sonic_col:
+                        cells.append(
+                            Text("●", style=MARKER_STYLE)
+                            if row["sonic_informed"]
+                            else Text("─", style="grey35")
+                        )
+                    display_rows.append(cells)
+                return display_rows
+
+            headers = ["#", "Track", "Artist", "Tags"] + (["●"] if show_sonic_col else [])
+            ranking_caption = "ranked by closeness to your taste centroid · "
+            if show_sonic_col:
+                ranking_caption += f"● sonic-informed ({sonic_count}/{len(seed)}) · "
+            ranking_caption += "a ranking, not a match %"
+
+            most = ranked[:top]
+            most_rows = _payload_rows(most)
+            subsection("Most representative")
+            table(headers, _display_rows(most_rows))
+            caption(ranking_caption)
+
+            widest_rows: List[Dict[str, Any]] = []
             if len(ranked) > top:
                 widest = list(reversed(ranked[top:]))[:top]  # lowest-cosine tracks first
+                widest_rows = _payload_rows(widest)
                 subsection("Widest-ranging")
-                table(["#", "Track", "Artist"], self._taste_display_rows(widest))
+                table(headers, _display_rows(widest_rows))
+                caption(
+                    "the far edge of your orbit — the seeds least like your centroid, "
+                    "furthest first"
+                )
 
             # "Your sound": the average acoustic profile, where AcousticBrainz data
             # exists (plain mean, so the 0–1 feature values stay interpretable).
+            # Lollipops, not bars: these are measured classifier probabilities.
             sonic_profile: Optional[Dict[str, float]] = None
+            bpm_spread: Optional[Dict[str, int]] = None
             if len(sonic_vecs) >= 3:
                 sonic_profile = describe_sonic(mean_vector(sonic_vecs.values()))
-                feel = {k: v for k, v in sonic_profile.items() if k != "bpm"}
-                top_feel = sorted(feel.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                curated = [
+                    "danceability",
+                    "mood_electronic",
+                    "mood_relaxed",
+                    "mood_party",
+                    "mood_happy",
+                    "mood_aggressive",
+                    "mood_acoustic",
+                    "mood_sad",
+                ]
+                top_feel = sorted(
+                    ((name, sonic_profile.get(name, 0.0)) for name in curated),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )[:6]
+                feel_rows = [
+                    (name.replace("mood_", "").replace("_", " "), value) for name, value in top_feel
+                ]
+                footer_rows: List[Tuple[str, Union[str, Text], Union[str, Text]]] = []
+                chart_width = 28
+                if bpm_values:
+                    median_bpm = statistics.median(bpm_values)
+                    # The axis ("60 " + track + " 190 BPM") must total exactly
+                    # chart_width cells or it widens the grid column past the
+                    # lollipops, leaving a dead gap before the value column.
+                    axis = Text("60 ", style="dim")
+                    axis.append_text(
+                        lollipop(
+                            (median_bpm - 60) / 130, chart_width - len("60 ") - len(" 190 BPM")
+                        )
+                    )
+                    axis.append(" 190 BPM", style="dim")
+                    footer_rows.append(("tempo", axis, ""))
+                    if len(bpm_values) >= 10:
+                        p25, p50, p75 = statistics.quantiles(bpm_values, n=4, method="inclusive")
+                        bpm_spread = {
+                            "p25": round(p25),
+                            "median": round(p50),
+                            "p75": round(p75),
+                        }
+                        footer_rows.append(
+                            (
+                                "",
+                                Text(
+                                    f"p25 {round(p25)} · median {round(p50)} · p75 {round(p75)}",
+                                    style="dim",
+                                ),
+                                "",
+                            )
+                        )
                 subsection("Your sound")
-                bar_chart(
-                    [k.replace("mood_", "").replace("_", " ") for k, _ in top_feel],
-                    [v for _, v in top_feel],
+                chart_panel(
+                    f"Acoustic profile · {sonic_count}/{len(seed)} seed tracks (AcousticBrainz)",
+                    feel_rows,
+                    kind="lollipop",
+                    width=chart_width,
+                    max_value=1.0,
+                    tick=0.5,
                     value_fmt=lambda v: f"{v:.2f}",
+                    caption="● classifier probability (0–1) · ┊ 0.5 = classifier-neutral",
+                    footer_rows=footer_rows or None,
+                )
+                # The displayed BPM average uses only tracks with a known tempo
+                # (bpm_values already excludes bpm_norm == 0.0) — never the mean
+                # sonic vector, which would count missing tempos as 40 BPM.
+                # The payload's sonic_profile["bpm"] follows the same rule.
+                sonic_profile["bpm"] = round(statistics.mean(bpm_values)) if bpm_values else None
+                bpm_phrase = (
+                    f"~{sonic_profile['bpm']} BPM avg ({len(bpm_values)} with tempo) · "
+                    if bpm_values
+                    else ""
                 )
                 info(
-                    f"~{sonic_profile.get('bpm', '?')} BPM avg · acoustic features on "
+                    f"{bpm_phrase}acoustic features on "
                     f"{len(sonic_vecs)}/{len(seed)} tracks (AcousticBrainz). "
                     "The ranking above blends this with the text taste where present."
                 )
+
+            # Crowns: classifier calls, not editorial ones. p-gate at 0.60 also
+            # bars the exact-0.0 missing-field degradation from ever winning;
+            # an already-crowned track is skipped so the runner-up takes it.
+            superlatives: Optional[Dict[str, Any]] = None
+            if sonic_count >= 10:
+                superlatives = {}
+                crowned: set = set()
+                crown_cards: List[Tuple[str, Union[str, Text], Optional[str]]] = []
+                for key, card_title, feature in (
+                    ("happiest", "HAPPIEST", "mood_happy"),
+                    ("saddest", "SADDEST", "mood_sad"),
+                    ("most_danceable", "MOST DANCEABLE", "danceability"),
+                    ("most_acoustic", "MOST ACOUSTIC", "mood_acoustic"),
+                ):
+                    idx = SONIC_FEATURES.index(feature)
+                    candidates = sorted(
+                        ((tid, vec[idx]) for tid, vec in sonic_vecs.items() if len(vec) > idx),
+                        key=lambda tv: (-tv[1], tv[0]),
+                    )
+                    winner = next(
+                        (tv for tv in candidates if tv[0] not in crowned and tv[1] >= 0.60),
+                        None,
+                    )
+                    if winner is None:
+                        superlatives[key] = None
+                        continue
+                    tid, value = winner
+                    crowned.add(tid)
+                    name, artist = name_map.get(tid, (tid, "?"))
+                    superlatives[key] = {
+                        "track_id": tid,
+                        "name": name,
+                        "artist": artist,
+                        "value": value,
+                    }
+                    crown_cards.append(
+                        (
+                            card_title,
+                            display_name(name),
+                            f"{display_name(artist)} · p={value:.2f}",
+                        )
+                    )
+                superlatives["fastest"] = None
+                superlatives["slowest"] = None
+                tempo_line: Optional[str] = None
+                if bpm_by_track:
+                    fast_tid = max(bpm_by_track.items(), key=lambda kv: (kv[1], kv[0]))[0]
+                    slow_tid = min(bpm_by_track.items(), key=lambda kv: (kv[1], kv[0]))[0]
+                    for slot, tid in (("fastest", fast_tid), ("slowest", slow_tid)):
+                        name, artist = name_map.get(tid, (tid, "?"))
+                        superlatives[slot] = {
+                            "track_id": tid,
+                            "name": name,
+                            "artist": artist,
+                            "bpm": round(bpm_by_track[tid]),
+                        }
+                    fast, slow = superlatives["fastest"], superlatives["slowest"]
+                    tempo_line = (
+                        f"tempo extremes: {display_name(fast['name'])} "
+                        f"({display_name(fast['artist'])}) at {fast['bpm']} BPM · "
+                        f"{display_name(slow['name'])} ({display_name(slow['artist'])}) "
+                        f"at {slow['bpm']} BPM"
+                    )
+                if crown_cards or tempo_line:
+                    subsection("Crowns · taste extremes")
+                    if crown_cards[:2]:
+                        stat_cards(crown_cards[:2], width=30)
+                    if crown_cards[2:]:
+                        stat_cards(crown_cards[2:], width=30)
+                    if tempo_line:
+                        notice(tempo_line)
+                    caption(
+                        f"among the {sonic_count} seed tracks ({source}) with "
+                        "AcousticBrainz data — classifier calls, not editorial ones"
+                    )
+
+            # Core vs frontier: contrast the top and bottom quartiles of the
+            # ranking. When the data says they're the same, the panels say so.
+            core_vs_frontier: Optional[Dict[str, Any]] = None
+            quartile = len(ranked) // 4
+            if len(ranked) >= 16:
+                core_ids = {tid for tid, _ in ranked[:quartile]}
+                frontier_ids = {tid for tid, _ in ranked[-quartile:]}
+                core_ctx = sum(1 for tid in core_ids if tid in parsed_ctx)
+                frontier_ctx = sum(1 for tid in frontier_ids if tid in parsed_ctx)
+                if core_ctx >= 5 and frontier_ctx >= 5:
+
+                    def _quartile_facts(ids: set) -> Dict[str, Any]:
+                        genres = facet_track_counts(
+                            seed_ctx, "genres", track_ids=ids, fold=fold_genre
+                        )
+                        moods = facet_track_counts(seed_ctx, "moods", track_ids=ids)
+                        buckets, _d, _u = decade_histogram(seed_ctx, track_ids=ids)
+                        bpms = sorted(bpm_by_track[tid] for tid in ids if tid in bpm_by_track)
+                        return {
+                            "genre": genres[0][0] if genres else None,
+                            "mood": moods[0][0] if moods else None,
+                            "decade": buckets[0][0] if buckets else None,
+                            "bpm_median": (
+                                round(statistics.median(bpms)) if len(bpms) >= 3 else None
+                            ),
+                            "sonic_tracks": len(bpms),
+                        }
+
+                    core_facts = _quartile_facts(core_ids)
+                    frontier_facts = _quartile_facts(frontier_ids)
+                    core_vs_frontier = {"core": core_facts, "frontier": frontier_facts}
+
+                    def _quartile_panel(facts: Dict[str, Any], title: str, sub: str):
+                        parts = [p for p in (facts["genre"], facts["mood"], facts["decade"]) if p]
+                        body = [Text(" · ".join(parts) if parts else "—")]
+                        if facts["bpm_median"] is not None:
+                            body.append(
+                                Text(
+                                    f"median {facts['bpm_median']} BPM "
+                                    f"({facts['sonic_tracks']} sonic tracks)",
+                                    style="dim",
+                                )
+                            )
+                        return ink_panel(
+                            Group(*body), title=title, caption=sub, width=44, emit=False
+                        )
+
+                    side_by_side(
+                        _quartile_panel(
+                            core_facts, "The core", f"top quartile of your ranking ({quartile})"
+                        ),
+                        _quartile_panel(
+                            frontier_facts, "The frontier", f"bottom quartile ({quartile})"
+                        ),
+                    )
+
+            if sum(1 for f in parsed_ctx.values() if f.get("comparisons")) >= 5:
+                chart_panel(
+                    "Compared-to constellation",
+                    [(display_name(label), n) for label, n in comparison_counts[:7]],
+                    caption="names your tracks get likened to in enrichment",
+                )
+
+            # Insights: deterministic templates with hard guards — silence over
+            # stretch. At most three fire, in priority order I1 > I2 > I3 > I4.
+            insights: List[str] = []
+            if core_vs_frontier is not None:
+                cf, ff = core_vs_frontier["core"], core_vs_frontier["frontier"]
+                same_axes = (
+                    cf["genre"] is not None
+                    and cf["mood"] is not None
+                    and cf["genre"] == ff["genre"]
+                    and cf["mood"] == ff["mood"]
+                )
+                medians_exist = cf["bpm_median"] is not None and ff["bpm_median"] is not None
+                if same_axes and medians_exist and abs(cf["bpm_median"] - ff["bpm_median"]) >= 10:
+                    insights.append(
+                        "Your frontier isn't another genre — it's the same sound at the "
+                        f"edges (median {cf['bpm_median']} vs {ff['bpm_median']} BPM)."
+                    )
+                elif None not in (cf["genre"], cf["mood"], ff["genre"], ff["mood"]) and (
+                    cf["genre"] != ff["genre"] or cf["mood"] != ff["mood"]
+                ):
+                    insights.append(
+                        f"Your core leans {cf['genre']} / {cf['mood']}; the frontier "
+                        f"drifts toward {ff['genre']} / {ff['mood']}."
+                    )
+            if datable and len(decade_buckets) >= 2:
+                share_1 = decade_buckets[0][1] / datable * 100
+                share_2 = decade_buckets[1][1] / datable * 100
+                if share_1 >= 25 and share_2 >= 25:
+                    # source may itself start with "your " ("your rotation") —
+                    # strip it so the sentence never reads "your your".
+                    source_short = source[5:] if source.startswith("your ") else source
+                    insights.append(
+                        f"Split identity: {share_1:.0f}% of your {source_short} lives in the "
+                        f"{decade_buckets[0][0]}, {share_2:.0f}% in the {decade_buckets[1][0]}."
+                    )
+            top8_moods = dict(mood_counts[:8])
+            low_mood = next(
+                (
+                    label
+                    for label, _ in mood_counts[:8]
+                    if label in ("melancholic", "sad", "dark", "somber")
+                ),
+                None,
+            )
+            high_mood = next(
+                (
+                    label
+                    for label, _ in mood_counts[:8]
+                    if label in ("energetic", "uplifting", "anthemic", "euphoric")
+                ),
+                None,
+            )
+            if low_mood and high_mood:
+                insights.append(
+                    f"You keep {low_mood} ({top8_moods[low_mood]} tracks) and "
+                    f"{high_mood} ({top8_moods[high_mood]}) side by side."
+                )
+            if sonic_count >= 30 and bpm_values:
+                insights.append(
+                    f"Tempo spans {round(bpm_values[0])}–{round(bpm_values[-1])} BPM "
+                    f"around a median of {round(statistics.median(bpm_values))}."
+                )
+            insights = insights[:3]
+            for line in insights:
+                insight(line)
 
             hint = (
                 "Ranked by closeness to your taste centroid."
@@ -900,16 +1631,46 @@ class PlaylistCLI:
             )
             info(hint)
 
+            facets_payload: Optional[Dict[str, Any]] = None
+            if seed_ctx:
+                facets_payload = {
+                    "moods": [{"label": label, "tracks": n} for label, n in mood_counts[:8]],
+                    "genres": [{"label": label, "tracks": n} for label, n in genre_counts[:8]],
+                    "themes": [{"label": label, "tracks": n} for label, n in theme_counts[:6]],
+                    "instrumentation": [
+                        {"label": label, "tracks": n} for label, n in instrument_counts[:6]
+                    ],
+                    "comparisons": [
+                        {"label": label, "tracks": n} for label, n in comparison_counts[:7]
+                    ],
+                }
+            decades_payload: Optional[Dict[str, Any]] = None
+            if datable:
+                decades_payload = {
+                    "buckets": [{"decade": d, "tracks": n} for d, n in decade_buckets],
+                    "datable": datable,
+                    "unbucketable": unbucketable,
+                    "post_2010_pct": round(post_2010_pct, 1),
+                }
+
             return {
                 "source": source,
                 "signal": signal,
                 "enriched": enriched,
                 "built_from": len(seed),
                 "distinct_artists": n_artists,
-                "sonic_coverage": len(sonic_vecs),
+                "sonic_coverage": sonic_count,
                 "sonic_profile": sonic_profile,
-                "most_representative": self._taste_rows(most),
-                "widest_ranging": self._taste_rows(widest),
+                "most_representative": most_rows,
+                "widest_ranging": widest_rows,
+                "taste_title": taste_headline,
+                "context_coverage": {"with_context": with_context, "seed": len(seed)},
+                "facets": facets_payload,
+                "decades": decades_payload,
+                "bpm_spread": bpm_spread,
+                "superlatives": superlatives,
+                "core_vs_frontier": core_vs_frontier,
+                "insights": insights,
             }
         except Exception as e:
             logger.error(f"Error showing taste: {str(e)}")
@@ -988,8 +1749,17 @@ class PlaylistCLI:
         rows.sort(key=lambda r: r["blended"], reverse=True)
         return rows, signal
 
-    def show_stats(self, playlist_name: Optional[str] = None):
-        """Show database and playlist statistics"""
+    def show_stats(self, playlist_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Show database and playlist statistics (the library dashboard).
+
+        The classic "Database Stats" table and the playlist branch keep their
+        exact shapes; the dashboard sections between them (coverage, backfill
+        queue, Library DNA, eras, the measured sound) degrade to nothing when
+        the repository layer isn't available (e.g. unit tests that mock `_db`).
+
+        Returns the underlying data as a dict (also used for `--json`); None
+        only on error.
+        """
         try:
             # Database stats
             db_stats = self.db.get_stats()
@@ -1001,6 +1771,9 @@ class PlaylistCLI:
                     ["Storage size (MB)", f"{db_stats['storage_size_mb']:.2f}"],
                 ]
             )
+
+            payload: Dict[str, Any] = {"database": db_stats, "playlist": None}
+            payload.update(self._render_library_extras())
 
             # Playlist stats if specified
             if playlist_name:
@@ -1018,22 +1791,391 @@ class PlaylistCLI:
                     ]
                 )
 
-                # Show recent generations
+                playlist_payload: Dict[str, Any] = {
+                    "name": playlist_name,
+                    "total_songs": stats.total_songs,
+                    "unique_songs_used": stats.unique_songs_used,
+                    "songs_never_used": stats.songs_never_used,
+                    "generations_count": stats.generations_count,
+                    "complete_rotation_achieved": stats.complete_rotation_achieved,
+                    "current_strategy": stats.current_strategy,
+                }
+
+                # Generation hand-off: Jaccard overlap between consecutive
+                # generation track sets. ABSOLUTE values (never rescaled) — a
+                # strip of zeros honestly reads "every hand-off was a full
+                # refresh"; 1.0 exposes duplicated generations.
+                try:
+                    gen_lists = [list(g) for g in rm.history.generations]
+                except Exception:  # mocked managers in tests carry no history
+                    gen_lists = []
+                gen_sets = [set(g) for g in gen_lists]
+                overlaps: List[float] = []
+                for current, following in zip(gen_sets, gen_sets[1:]):
+                    union = current | following
+                    overlaps.append(len(current & following) / len(union) if union else 0.0)
+                distinct_rotated = len(set().union(*gen_sets)) if gen_sets else 0
+                slots = sum(len(g) for g in gen_lists)
+                batch_timestamps = False
+                if len(gen_lists) >= 2:
+                    try:
+                        stamps = self.repos.conn.execute(
+                            "SELECT COUNT(DISTINCT created_at) AS c FROM rotation_generations"
+                        ).fetchone()["c"]
+                        batch_timestamps = stamps == 1
+                    except Exception:
+                        batch_timestamps = False
+                    text_line(
+                        Text("Generation hand-off", style="bold cyan"),
+                        Text(
+                            " · tracks shared between consecutive generations "
+                            f"(1→{len(gen_lists)})",
+                            style="dim",
+                        ),
+                    )
+                    # The strip is windowed to the console (2 lead cells +
+                    # 2 cells per hand-off) so it can never wrap mid-heatmap,
+                    # and the legend gets its own line — at 80 cols a 20-
+                    # generation strip plus an inline legend already wrapped.
+                    strip_window = max(1, (console.options.max_width - 4) // 2)
+                    shown_overlaps = overlaps[-strip_window:]
+                    text_line("  ", heat_strip(shown_overlaps))
+                    legend = "cold = 0 shared · bright = identical sets"
+                    if len(shown_overlaps) < len(overlaps):
+                        legend = (
+                            f"last {len(shown_overlaps)} hand-offs "
+                            f"({len(gen_lists) - len(shown_overlaps)}→{len(gen_lists)}) · " + legend
+                        )
+                    text_line("  ", Text(legend, style="dim"))
+                    findings: List[str] = []
+                    runs = _identical_runs(overlaps)
+                    for run_start, run_end in runs:
+                        finding = f"generations {run_start}–{run_end} contain identical track sets"
+                        if batch_timestamps:
+                            finding += " (migration artifact)"
+                        findings.append(finding)
+                    if runs and all(v == 0.0 for v in overlaps if v < 0.9999):
+                        findings.append("every other hand-off is a full refresh")
+                    findings.append(f"{distinct_rotated} distinct tracks filled {slots} slots")
+                    notice(" · ".join(findings))
+                    if batch_timestamps:
+                        notice(
+                            "generation timestamps were backfilled in one batch — "
+                            "order shown is generation index"
+                        )
+                playlist_payload["consecutive_overlap"] = [round(v, 4) for v in overlaps]
+                playlist_payload["distinct_rotated"] = distinct_rotated
+
+                # Show recent generations (newest first), each with its size and
+                # how many tracks are new versus the previous generation —
+                # computed from the already-loaded id lists, zero extra queries.
                 recent_gens = rm.get_recent_generations(count=5)
+                recent_payload: List[Dict[str, Any]] = []
                 if recent_gens:
                     section("Recent Generations")
-                    for i, gen_songs in enumerate(recent_gens, 1):
-                        gen_index = stats.generations_count - len(recent_gens) + i
-                        subsection(f"Generation {gen_index}")
+                    for offset in range(len(recent_gens) - 1, -1, -1):
+                        gen_songs = recent_gens[offset]
+                        gen_index = stats.generations_count - len(recent_gens) + offset + 1
+                        list_idx = gen_index - 1
+                        new_count: Optional[int] = None
+                        if 1 <= list_idx < len(gen_lists):
+                            new_count = len(set(gen_lists[list_idx]) - set(gen_lists[list_idx - 1]))
+                        size = len(gen_songs)
+                        detail = f" · {size} track{'s' if size != 1 else ''}"
+                        if new_count is not None:
+                            detail += f" · {new_count} new vs previous"
+                        text_line(
+                            Text(f"Generation {gen_index}", style="bold cyan"),
+                            Text(detail, style="dim"),
+                        )
                         table_data = []
                         for j, song in enumerate(gen_songs, 1):
                             table_data.append([j, song.name, song.artist])
                         table(["#", "Song", "Artist"], table_data)
+                        recent_payload.append(
+                            {
+                                "index": gen_index,
+                                "size": len(gen_songs),
+                                "new_vs_previous": new_count,
+                            }
+                        )
                 else:
                     info("No generation history found.")
+                playlist_payload["recent_generations"] = recent_payload
+                payload["playlist"] = playlist_payload
 
+            return payload
         except Exception as e:
             logger.error(f"Error showing stats: {str(e)}")
+            return None
+
+    def _render_library_extras(self) -> Dict[str, Any]:
+        """The /stats dashboard sections beyond the classic table: coverage,
+        backfill queue, Library DNA (enriched facets), era histogram, and the
+        measured sound. Returns the payload fragment for `stats --json`.
+
+        Degrades to `{}` — today's classic output — when the repository layer
+        is unavailable (unit tests inject a mocked `_db` only; lazily opening a
+        database here would be a side effect, so we only use repos that real
+        flows have already constructed via `self.db`).
+        """
+        try:
+            if getattr(self, "_repos", None) is None:
+                return {}
+            conn = self.repos.conn
+            coverage, backfill = _coverage_and_backfill(conn)
+        except Exception:
+            logger.debug("Library extras unavailable; rendering classic stats only.")
+            return {}
+
+        payload: Dict[str, Any] = {
+            "coverage": coverage,
+            "backfill": backfill,
+            "facets": None,
+            "decades": None,
+            "sonic": None,
+        }
+        total = coverage["embeddings"]["total"]
+        if total == 0:
+            notice("Library is empty — /ingest or /search to begin.")
+            return payload
+
+        # Data coverage: the grey segment IS the missing data.
+        section("Data Coverage")
+        coverage_panel(
+            None,
+            [
+                ("embeddings", coverage["embeddings"]["have"], total),
+                ("spotify id", coverage["spotify_id"]["have"], total),
+                ("context", coverage["context"]["have"], total),
+                ("sonic", coverage["sonic"]["have"], total),
+            ],
+            caption="grey = not there yet · sonic comes from AcousticBrainz lookups",
+        )
+
+        # Backfill queue: descriptive, not prescriptive. Sonic is excluded from
+        # any "no gaps" claim — AcousticBrainz coverage is partial by nature.
+        hard_gaps = (
+            backfill["missing_embeddings"]
+            or backfill["missing_context"]
+            or backfill["missing_spotify_id"]
+        )
+        if not hard_gaps:
+            if backfill["missing_sonic"]:
+                notice(
+                    f"{backfill['missing_sonic']} tracks without sonic data — "
+                    "AcousticBrainz coverage is partial by nature."
+                )
+            else:
+                info("No backfill gaps — every track has context, an embedding, and a Spotify id.")
+        else:
+            queue_rows = [
+                row
+                for row in [
+                    [
+                        "embeddings missing",
+                        backfill["missing_embeddings"],
+                        "recent ingests awaiting embedding backfill",
+                    ],
+                    [
+                        "context missing",
+                        backfill["missing_context"],
+                        "legacy tracks — their embeddings are titles+artists only",
+                    ],
+                    [
+                        "sonic missing",
+                        backfill["missing_sonic"],
+                        "no AcousticBrainz match; never inferred",
+                    ],
+                    [
+                        "spotify id missing",
+                        backfill["missing_spotify_id"],
+                        "recent ingests not yet resolved",
+                    ],
+                ]
+                if row[1]
+            ]
+            subsection("Backfill queue")
+            table(["gap", "tracks", "note"], queue_rows)
+
+        # Library DNA: enriched-facet aggregations over every context row.
+        # JOIN-scoped to live tracks — the same doctrine as the coverage
+        # counts above: an orphan context row (track deleted) must not
+        # inflate a facet count or the era histogram.
+        ctx_pairs = [
+            (r["track_id"], r["fields_json"] or "")
+            for r in conn.execute(
+                "SELECT tc.track_id AS track_id, tc.fields_json AS fields_json "
+                "FROM track_context tc JOIN tracks t ON t.track_id = tc.track_id"
+            ).fetchall()
+        ]
+        if not ctx_pairs:
+            notice("No enriched context yet — run /enrich to unlock Library DNA.")
+        else:
+            parsed = {tid: parse_fields(fj) for tid, fj in ctx_pairs}
+
+            def _contributing(facet: str) -> int:
+                return sum(1 for fields in parsed.values() if fields.get(facet))
+
+            genre_counts = facet_track_counts(ctx_pairs, "genres", fold=fold_genre)
+            mood_counts = facet_track_counts(ctx_pairs, "moods")
+            theme_counts = facet_track_counts(ctx_pairs, "themes")
+            instrument_counts = facet_track_counts(
+                ctx_pairs, "instrumentation", fold=fold_instrument
+            )
+            decade_buckets, datable, unbucketable = decade_histogram(ctx_pairs)
+            post_2010 = sum(n for d, n in decade_buckets if int(d[:-1]) >= 2010)
+            post_2010_pct = post_2010 / datable * 100 if datable else 0.0
+
+            dna_blocks: List[Tuple[str, List[Tuple[str, int]], Optional[str]]] = []
+            if _contributing("genres") >= 5:
+                dna_blocks.append(
+                    ("Genres", genre_counts[:8], f"tracks tagged · {len(genre_counts)} labels")
+                )
+            if _contributing("moods") >= 5:
+                dna_blocks.append(
+                    ("Moods", mood_counts[:8], f"tracks tagged · {len(mood_counts)} distinct")
+                )
+            extra_blocks: List[Tuple[str, List[Tuple[str, int]], Optional[str]]] = []
+            if _contributing("themes") >= 5:
+                extra_blocks.append(
+                    (
+                        "Recurring themes",
+                        theme_counts[:8],
+                        f"tracks tagged · {len(theme_counts)} distinct",
+                    )
+                )
+            if _contributing("instrumentation") >= 5:
+                extra_blocks.append(
+                    ("Built with", instrument_counts[:8], "synonyms folded (guitars→guitar)")
+                )
+
+            if dna_blocks or extra_blocks or datable >= 5:
+                # Provenance up front: these tags are /enrich web context,
+                # not Spotify metadata and not audio analysis.
+                section("Library DNA", "tags from /enrich web context — semantic, not acoustic")
+            if dna_blocks:
+                facet_columns(dna_blocks)
+                caption(
+                    "a track names several · plural/singular & hyphen variants merged "
+                    "before counting"
+                )
+
+            if datable >= 5:
+                era_caption = f"{datable}/{len(ctx_pairs)} enriched tracks datable"
+                if unbucketable:
+                    examples = sorted(
+                        {
+                            values[0]
+                            for fields in parsed.values()
+                            for values in [fields.get("era", [])]
+                            if values and decade_of(values) is None
+                        }
+                    )[:2]
+                    era_caption += f" · {unbucketable} defied parsing"
+                    if examples:
+                        # The examples are illustrative only — the counts carry
+                        # the honesty. Curly quotes (an era value can BEGIN with
+                        # an apostrophe, e.g. "'60s jangle pop", which doubles a
+                        # straight quote), each example bounded to 16 chars, and
+                        # the parenthetical appended only while the caption stays
+                        # footnote-sized.
+                        shown = ", ".join(
+                            "“{}”".format(v if len(v) <= 16 else v[:15] + "…") for v in examples
+                        )
+                        candidate = f"{era_caption} ({shown}, ...)"
+                        if len(candidate) <= 70:
+                            era_caption = candidate
+                chart_panel("When your library lives", decade_buckets, caption=era_caption)
+                if datable >= 50:
+                    if post_2010_pct >= 50:
+                        info(
+                            f"Your library skews {post_2010_pct:.0f}% post-2010 "
+                            f"({post_2010} of {datable} datable tracks)."
+                        )
+                    else:
+                        info(
+                            f"Your library skews {100 - post_2010_pct:.0f}% pre-2010 "
+                            f"({datable - post_2010} of {datable} datable tracks)."
+                        )
+
+            if extra_blocks:
+                facet_columns(extra_blocks)
+
+            payload["facets"] = {
+                "genres": [{"label": label, "tracks": n} for label, n in genre_counts[:8]],
+                "moods": [{"label": label, "tracks": n} for label, n in mood_counts[:8]],
+                "themes": [{"label": label, "tracks": n} for label, n in theme_counts[:8]],
+                "instrumentation": [
+                    {"label": label, "tracks": n} for label, n in instrument_counts[:8]
+                ],
+            }
+            if datable:
+                payload["decades"] = {
+                    "buckets": [{"decade": d, "tracks": n} for d, n in decade_buckets],
+                    "datable": datable,
+                    "unbucketable": unbucketable,
+                    "post_2010_pct": round(post_2010_pct, 1),
+                }
+
+        # The sound, measured: AcousticBrainz tempo + key distributions.
+        sonic_rows = conn.execute("SELECT sonic_blob, features_json FROM track_sonic").fetchall()
+        vecs = [decode_vector(r["sonic_blob"]) for r in sonic_rows if r["sonic_blob"] is not None]
+        if len(vecs) >= 10:
+            section("The sound, measured")
+            bpm_idx = SONIC_FEATURES.index("bpm_norm")
+            # bpm_norm == 0.0 means AcousticBrainz had no tempo for the track —
+            # excluded rather than fabricated as 40 BPM.
+            bpms = sorted(
+                vec[bpm_idx] * 180 + 40 for vec in vecs if len(vec) > bpm_idx and vec[bpm_idx] > 0.0
+            )
+            histogram: List[Tuple[int, int]] = []
+            if bpms:
+                bucket_counter = Counter(int(b // 20 * 20) for b in bpms)
+                histogram = sorted(bucket_counter.items())
+                median_bpm = round(statistics.median(bpms))
+                # Titled with len(bpms) — the tracks actually charted — never
+                # len(vecs): sonic rows without an AB tempo are excluded from
+                # the buckets, so they must be excluded from the claim too.
+                no_tempo = len(vecs) - len(bpms)
+                tempo_caption = f"median {median_bpm} BPM"
+                if no_tempo:
+                    tempo_caption += (
+                        f" · {no_tempo} track{'s' if no_tempo != 1 else ''} "
+                        "without AB tempo excluded"
+                    )
+                chart_panel(
+                    f"Tempo distribution · {len(bpms)}/{total} tracks (AcousticBrainz)",
+                    [(f"{lo}–{lo + 19}", n) for lo, n in histogram],
+                    caption=tempo_caption,
+                )
+            key_counter: Counter = Counter()
+            for r in sonic_rows:
+                try:
+                    features = json.loads(r["features_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                key = features.get("key")
+                if isinstance(key, str):
+                    key = key.strip()
+                    if key and "none" not in key.lower():
+                        key_counter[key] += 1
+            top_keys = sorted(key_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+            if top_keys:
+                notice("Common keys: " + " · ".join(f"{k} ({n})" for k, n in top_keys))
+            payload["sonic"] = {
+                "tracks": len(vecs),
+                # Additive: how many of those tracks the BPM histogram actually
+                # covers (rows without an AB tempo are excluded, never charted).
+                "bpm_tracks": len(bpms),
+                "bpm_histogram": [
+                    {"bucket": f"{lo}-{lo + 19}", "tracks": n} for lo, n in histogram
+                ],
+                "bpm_median": round(statistics.median(bpms)) if bpms else None,
+                "keys": [{"key": k, "tracks": n} for k, n in top_keys],
+            }
+
+        return payload
 
     def export_stats(
         self, playlist_name: Optional[str], export_format: str, output_file: Optional[str]
@@ -3088,10 +4230,20 @@ def _handle_update(cli: "PlaylistCLI", args: Any) -> int:
 def _handle_stats(cli: "PlaylistCLI", args: Any) -> int:
     if hasattr(args, "output") and args.output and not args.export:
         logger.warning("--output requires --export; ignoring --output")
+    json_mode = getattr(args, "json", False)
     if args.export:
+        # Export wins: the file formats are the stable machine contract here.
+        if json_mode:
+            warning("--json ignored with --export")
         cli.export_stats(args.playlist, args.export, args.output)
-    else:
-        cli.show_stats(args.playlist)
+        return 0
+    set_json_mode(json_mode)
+    try:
+        payload = cli.show_stats(args.playlist)
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
     return 0
 
 

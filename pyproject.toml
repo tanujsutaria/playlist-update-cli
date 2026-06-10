@@ -49,6 +49,7 @@ py-modules = [
     "rotation_manager",
     "song_store",
     "scoring",
+    "taste_facets",
     "web_search",
     "arg_parse",
     "ui",
