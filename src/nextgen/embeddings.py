@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable, List
 
+logger = logging.getLogger(__name__)
+
 _TQDM_LOCK_MADE_THREAD_SAFE = False
+
+# Process-global once-flag (mirrors _TQDM_LOCK_MADE_THREAD_SAFE): the load
+# announcement is only useful the first time, when the ~17-20s
+# sentence-transformers import actually happens.
+_LOAD_MESSAGE_EMITTED = False
 
 
 def _ensure_thread_safe_tqdm_lock() -> None:
@@ -42,6 +50,18 @@ class EmbeddingModel:
         # Swap tqdm's multiprocessing lock for a threading one before the model
         # (and its progress bars) ever load -- see _ensure_thread_safe_tqdm_lock.
         _ensure_thread_safe_tqdm_lock()
+        # Announce the load *before* the import below: the first
+        # `from sentence_transformers import ...` of a process takes ~17-20s,
+        # and without this message the TUI looks hung on the first /search.
+        # The message reaches the RichLog via configure_logging's root-handler
+        # bridge, so no ui.py coupling is needed here.
+        global _LOAD_MESSAGE_EMITTED
+        if not _LOAD_MESSAGE_EMITTED:
+            logger.info(
+                "Loading embedding model %s (first use; can take ~20s)...",
+                self.model_name,
+            )
+            _LOAD_MESSAGE_EMITTED = True
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as exc:  # pragma: no cover - import-time environment failure

@@ -12,6 +12,9 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
+# Dedicated stderr console so `error()` can surface failures in --json mode
+# without polluting the machine-readable stdout stream.
+_stderr_console = Console(stderr=True)
 _output_sink: Optional[Callable[[RenderableType], None]] = None
 _preview_sink: Optional[Callable[[Optional[RenderableType]], None]] = None
 _json_mode: bool = False
@@ -87,7 +90,10 @@ def table(headers: list[Any], rows: list[list[Any]]) -> None:
     for header in headers:
         t.add_column(str(header), overflow="fold", no_wrap=False)
     for row in rows:
-        t.add_row(*[str(cell) for cell in row])
+        # Rich Text cells pass through untouched so callers can style cells
+        # (e.g. green when a constraint is satisfied); everything else is
+        # coerced with str() as before.
+        t.add_row(*[cell if isinstance(cell, Text) else str(cell) for cell in row])
     _emit(t)
 
 
@@ -98,7 +104,7 @@ def preview_table(headers: list[Any], rows: list[list[Any]], title: Optional[str
     for header in headers:
         t.add_column(str(header), overflow="fold", no_wrap=False)
     for row in rows:
-        t.add_row(*[str(cell) for cell in row])
+        t.add_row(*[cell if isinstance(cell, Text) else str(cell) for cell in row])
     if title:
         _emit_preview(Panel(t, title=title, border_style="cyan"))
     else:
@@ -124,6 +130,32 @@ def info(message: str) -> None:
 
 def warning(message: str) -> None:
     _emit(Text(message, style="yellow"))
+
+
+def error(message: str, *, title: str = "Error") -> None:
+    """Render a failure as a red panel. Red == the command failed.
+
+    Unlike every other helper this is NOT silenced by json mode — a failure
+    must always reach the user. With an output sink installed it routes there
+    (the TUI scrollback); otherwise in json mode it prints to stderr so the
+    `--json` stdout payload stays pure; otherwise it prints to the console.
+    """
+    renderable = Panel(Text(message, style="red"), title=title, border_style="red")
+    if _output_sink:
+        _output_sink(renderable)
+    elif is_json_mode():
+        _stderr_console.print(renderable)
+    else:
+        console.print(renderable)
+
+
+def notice(message: str) -> None:
+    """A dim, low-emphasis line for neutral "nothing to do" outcomes.
+
+    Use this instead of `info` (green == succeeded) when a command completed
+    but produced nothing: no results, empty library, nothing to rank.
+    """
+    _emit(Text(message, style="dim"))
 
 
 def summary_panel(text: str, title: str = "Summary") -> None:

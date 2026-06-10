@@ -6,8 +6,11 @@ deterministic, offline stub so these tests need no model download.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
+import nextgen.embeddings as embeddings_module
 from nextgen.embeddings import EmbeddingModel, _describe_import_failure
 
 
@@ -83,6 +86,46 @@ class TestEmbeddingModel:
         monkeypatch.setattr(model._model, "encode", spy_encode)
         model.embed(["a", "b"])
         assert captured.get("show_progress_bar") is False
+
+
+class TestLoadAnnouncement:
+    """The first sentence-transformers import of a process takes ~17-20s; the
+    model must announce the load via logging *before* it starts so the TUI does
+    not look hung on the first /search or /find. The announcement is
+    once-per-process (a repeat construction is fast and a second message would
+    be noise/misleading).
+    """
+
+    def test_first_construction_announces_the_load(self, caplog, monkeypatch):
+        # Reset the process-global once-flag so test order doesn't matter.
+        monkeypatch.setattr(embeddings_module, "_LOAD_MESSAGE_EMITTED", False)
+        with caplog.at_level(logging.INFO, logger="nextgen.embeddings"):
+            EmbeddingModel("any-model")
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any(
+            "Loading embedding model any-model" in msg and "~20s" in msg for msg in messages
+        ), f"expected a load announcement, got: {messages}"
+
+    def test_announcement_is_logged_at_info_from_this_module(self, caplog, monkeypatch):
+        monkeypatch.setattr(embeddings_module, "_LOAD_MESSAGE_EMITTED", False)
+        with caplog.at_level(logging.INFO, logger="nextgen.embeddings"):
+            EmbeddingModel("any-model")
+        load_records = [
+            rec for rec in caplog.records if "Loading embedding model" in rec.getMessage()
+        ]
+        assert load_records, "load announcement missing"
+        for rec in load_records:
+            assert rec.levelno == logging.INFO
+            assert rec.name == "nextgen.embeddings"
+
+    def test_second_construction_is_silent(self, caplog, monkeypatch):
+        monkeypatch.setattr(embeddings_module, "_LOAD_MESSAGE_EMITTED", False)
+        EmbeddingModel("any-model")  # first construction trips the once-flag
+        with caplog.at_level(logging.INFO, logger="nextgen.embeddings"):
+            EmbeddingModel("another-model")
+        assert not any("Loading embedding model" in rec.getMessage() for rec in caplog.records), (
+            "load announcement must be emitted only once per process"
+        )
 
 
 class TestDescribeImportFailure:

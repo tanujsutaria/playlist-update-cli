@@ -4,10 +4,12 @@ Verifies that every CLI command routes to the correct PlaylistCLI method.
 """
 
 import argparse
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 
+import main as main_module
 from main import PlaylistCLI, dispatch_command
 
 
@@ -452,3 +454,26 @@ class TestDispatchExceptionHandling:
         args = _make_args(playlist="PL")
         rc = dispatch_command(cli, "view", args)
         assert rc == 1
+
+    def test_exception_logs_traceback_with_exc_info(self, cli, caplog, monkeypatch):
+        """A crashed handler must log the REAL traceback (exc_info), not just the
+        one-line repr — UILogHandler's Formatter appends exc_text, so this is
+        what gets the stack into the TUI RichLog and the /debug errors ring."""
+
+        def _boom(cli_arg, args):
+            raise KeyError("kaboom")
+
+        monkeypatch.setitem(main_module._COMMAND_HANDLERS, "boom-test", _boom)
+        with caplog.at_level(logging.ERROR, logger="main"):
+            rc = dispatch_command(cli, "boom-test", _make_args())
+
+        assert rc == 1  # the rc contract is unchanged
+        failures = [r for r in caplog.records if "Command failed" in r.getMessage()]
+        assert failures, "expected a 'Command failed' record"
+        record = failures[-1]
+        assert record.exc_info is not None
+        assert record.exc_info[0] is KeyError
+        # A plain Formatter (what the TUI handler uses) renders the stack.
+        rendered = logging.Formatter("%(message)s").format(record)
+        assert "Traceback" in rendered
+        assert "kaboom" in rendered

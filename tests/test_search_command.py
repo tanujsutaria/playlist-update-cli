@@ -1,6 +1,17 @@
 """Unit tests for the search command workflow."""
 
+import io
+
+import pytest
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+import ui
+from main import format_count
 from nextgen.pipeline import SearchResult
+from nextgen.providers import ProviderConfigError
 
 
 def test_search_sets_last_results(monkeypatch, mock_cli):
@@ -225,6 +236,237 @@ def test_search_keeps_unverified_rows_when_metrics_absent(monkeypatch, mock_cli)
     assert {r["song"] for r in mock_cli.last_search_results} == {"X", "Y"}
 
 
+@pytest.fixture
+def ui_sink():
+    """Capture everything routed through ui._emit; always reset afterwards."""
+    captured = []
+    ui.set_output_sink(captured.append)
+    yield captured
+    ui.set_output_sink(None)
+
+
+def _install_pipeline(monkeypatch, mock_cli, pipeline_factory):
+    monkeypatch.setattr(mock_cli, "_search_pipeline", None, raising=False)
+    monkeypatch.setattr(
+        mock_cli.__class__, "search_pipeline", property(lambda self: pipeline_factory())
+    )
+
+
+def _render(renderable) -> str:
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(renderable)
+    return buf.getvalue()
+
+
+class TestSearchFailureRendering:
+    def test_provider_config_error_renders_actionable_panel(self, monkeypatch, mock_cli, ui_sink):
+        class Fail:
+            def run(self, query, expanded=False, progress=None, on_result=None):
+                raise ProviderConfigError("No search providers configured.")
+
+        _install_pipeline(monkeypatch, mock_cli, Fail)
+
+        mock_cli.search_songs("anything")
+
+        panels = [r for r in ui_sink if isinstance(r, Panel)]
+        assert panels, "expected an error panel on the output sink"
+        panel = panels[-1]
+        assert panel.title == "Search unavailable"
+        assert panel.border_style == "red"
+        text = panel.renderable.plain
+        assert "No search providers configured." in text
+        assert "config/.env" in text
+        assert "/env" in text
+        # The failure still resets the search state.
+        assert mock_cli.last_search_results is None
+
+    def test_generic_failure_renders_red_panel_not_yellow_text(
+        self, monkeypatch, mock_cli, ui_sink
+    ):
+        class Fail:
+            def run(self, query, expanded=False, progress=None, on_result=None):
+                raise RuntimeError("provider exploded")
+
+        _install_pipeline(monkeypatch, mock_cli, Fail)
+
+        mock_cli.search_songs("anything")
+
+        panels = [r for r in ui_sink if isinstance(r, Panel)]
+        assert any(
+            p.border_style == "red" and "provider exploded" in p.renderable.plain for p in panels
+        ), "expected the failure as a red panel"
+        yellow = [r for r in ui_sink if isinstance(r, Text) and r.style == "yellow"]
+        assert not any("provider exploded" in t.plain for t in yellow), (
+            "failure must not be downgraded to a yellow warning"
+        )
+
+
+class TestFormatCount:
+    def test_thousands(self):
+        assert format_count(8200) == "8.2k"
+
+    def test_trailing_zero_trimmed(self):
+        assert format_count(10000) == "10k"
+
+    def test_millions(self):
+        assert format_count(1_500_000) == "1.5M"
+
+    def test_small_numbers_untouched(self):
+        assert format_count(950) == "950"
+
+    def test_fractional_small_number(self):
+        assert format_count(0.85) == "0.85"
+
+
+class TestMetricCell:
+    def test_missing_metric_is_dim_dash(self, mock_cli):
+        cell = mock_cli._metric_cell({}, "monthly_listeners", {"max_monthly_listeners": 10000})
+        assert cell.plain == "—"
+        assert cell.style == "dim"
+
+    def test_unparseable_metric_is_dim_dash(self, mock_cli):
+        cell = mock_cli._metric_cell({"monthly_listeners": "unknown"}, "monthly_listeners", {})
+        assert cell.plain == "—"
+        assert cell.style == "dim"
+
+    def test_bound_satisfied_is_green(self, mock_cli):
+        cell = mock_cli._metric_cell(
+            {"monthly_listeners": 8200}, "monthly_listeners", {"max_monthly_listeners": 10000}
+        )
+        assert cell.plain == "8.2k"
+        assert cell.style == "green"
+
+    def test_bound_violated_is_plain(self, mock_cli):
+        cell = mock_cli._metric_cell(
+            {"monthly_listeners": 50000}, "monthly_listeners", {"max_monthly_listeners": 10000}
+        )
+        assert cell.plain == "50k"
+        assert cell.style != "green"
+
+    def test_no_bound_is_plain(self, mock_cli):
+        cell = mock_cli._metric_cell({"monthly_listeners": 8200}, "monthly_listeners", {})
+        assert cell.plain == "8.2k"
+        assert cell.style != "green"
+
+    def test_min_bound_mirrors_filter(self, mock_cli):
+        kept = mock_cli._metric_cell(
+            {"monthly_listeners": "12k"}, "monthly_listeners", {"min_monthly_listeners": 10000}
+        )
+        dropped = mock_cli._metric_cell(
+            {"monthly_listeners": "9k"}, "monthly_listeners", {"min_monthly_listeners": 10000}
+        )
+        assert kept.style == "green"
+        assert dropped.style != "green"
+
+    def test_similarity_percentage_normalized_like_filter(self, mock_cli):
+        # 85 -> 0.85 (the 1<sim<=100 -> /100 rule); default floor 0.55 -> green.
+        cell = mock_cli._metric_cell(
+            {"similarity": 85}, "similarity", {"similarity_requested": True}
+        )
+        assert cell.plain == "0.85"
+        assert cell.style == "green"
+
+    def test_similarity_below_floor_is_plain(self, mock_cli):
+        cell = mock_cli._metric_cell(
+            {"similarity": 0.4}, "similarity", {"similarity_requested": True}
+        )
+        assert cell.plain == "0.40"
+        assert cell.style != "green"
+
+    def test_similarity_not_requested_is_plain(self, mock_cli):
+        cell = mock_cli._metric_cell({"similarity": 0.9}, "similarity", {})
+        assert cell.plain == "0.90"
+        assert cell.style != "green"
+
+
+class TestSearchResultsPersistenceAndMetricColumns:
+    def _result(self):
+        return SearchResult(
+            track_id="a|||obscure",
+            song="Obscure",
+            artist="A",
+            year="2024",
+            score=0.9,
+            strict_ratio=0.8,
+            sources=["s1"],
+            providers=["claude"],
+            metrics={"monthly_listeners": 8200},
+        )
+
+    def _clean_env(self, monkeypatch):
+        for var in (
+            "SEARCH_STREAM_FULL",
+            "SEARCH_FINAL_TABLE_MODE",
+            "SEARCH_LIVE_MODE",
+            "SEARCH_SIMILARITY_MIN",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_interactive_search_persists_compact_table_with_metrics(
+        self, monkeypatch, mock_cli, ui_sink
+    ):
+        """TUI mode: the final compact table must reach the OUTPUT sink (the
+        scrollback), not only the transient preview — and carry the requested
+        metric column the constraint filter ran on."""
+        monkeypatch.setenv("TUNR_INTERACTIVE", "1")
+        self._clean_env(monkeypatch)
+        fake = _fake_pipeline(
+            [self._result()],
+            last_requested_metrics=["monthly_listeners"],
+            last_constraints={"max_monthly_listeners": 10000},
+        )
+        _install_pipeline(monkeypatch, mock_cli, fake)
+        previews = []
+        ui.set_preview_sink(previews.append)
+        try:
+            mock_cli.search_songs("obscure jams under 10k monthly listeners")
+        finally:
+            ui.set_preview_sink(None)
+
+        tables = [r for r in ui_sink if isinstance(r, Table)]
+        assert tables, "no final table reached the scrollback output sink"
+        final = tables[-1]
+        rendered = _render(final)
+        assert "Listeners" in rendered
+        assert "8.2k" in rendered
+        assert "Obscure" in rendered
+        # Compact projection + the metric column, satisfied bound in green.
+        headers = [col.header for col in final.columns]
+        assert headers == ["#", "Song", "Artist", "Score", "Strict", "Status", "Listeners"]
+        listener_cell = list(final.columns[-1].cells)[0]
+        assert isinstance(listener_cell, Text)
+        assert listener_cell.style == "green"
+
+    def test_noninteractive_full_table_includes_metric_column(self, monkeypatch, mock_cli, ui_sink):
+        monkeypatch.delenv("TUNR_INTERACTIVE", raising=False)
+        self._clean_env(monkeypatch)
+        fake = _fake_pipeline(
+            [self._result()],
+            last_requested_metrics=["monthly_listeners"],
+            last_constraints={"max_monthly_listeners": 10000},
+        )
+        _install_pipeline(monkeypatch, mock_cli, fake)
+
+        mock_cli.search_songs("obscure jams under 10k monthly listeners")
+
+        tables = [r for r in ui_sink if isinstance(r, Table)]
+        assert tables
+        rendered = _render(tables[-1])
+        assert "Listeners" in rendered
+        assert "8.2k" in rendered
+
+    def test_final_table_mode_none_remains_escape_hatch(self, monkeypatch, mock_cli, ui_sink):
+        monkeypatch.setenv("TUNR_INTERACTIVE", "1")
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("SEARCH_FINAL_TABLE_MODE", "none")
+        fake = _fake_pipeline([self._result()])
+        _install_pipeline(monkeypatch, mock_cli, fake)
+
+        mock_cli.search_songs("anything")
+
+        assert not [r for r in ui_sink if isinstance(r, Table)]
+
+
 def _sr(track_id, metrics):
     return SearchResult(
         track_id=track_id,
@@ -274,3 +516,19 @@ class TestApplyMetricConstraints:
         kept, stats = mock_cli._apply_metric_constraints(rows, {})
         assert kept == rows
         assert stats == {"kept": 0, "dropped": 0, "unverified": 0}
+
+
+class TestParseMetricNumberNonFinite:
+    """NaN/Infinity must read as missing: json.loads accepts bare NaN/Infinity
+    literals and float() parses "nan", which used to poison the constraint
+    filter and crash format_count's int() conversion."""
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), "nan", "NaN", "inf", "1e999"]
+    )
+    def test_non_finite_is_none(self, mock_cli, value):
+        assert mock_cli._parse_metric_number(value) is None
+
+    def test_metric_cell_renders_dash_for_nan(self, mock_cli):
+        cell = mock_cli._metric_cell({"monthly_listeners": float("nan")}, "monthly_listeners", {})
+        assert cell.plain == "—"
