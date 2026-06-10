@@ -1095,3 +1095,19 @@ class TestHistoryNavResetOnSubmit:
         app._history_prev()
         app._history_prev()  # must stay on /env-prefixed entries
         assert app.input_value == "/env"
+
+
+class TestQuitExcludedFromHistory:
+    """Persisting /quit makes the next session's first up-arrow recall it."""
+
+    def test_quit_and_exit_not_recorded(self, monkeypatch):
+        app = _make_history_app(monkeypatch, [])
+        for raw in ("/quit", "/exit", "quit"):
+            app._append_history(raw)
+        assert app._history == []
+        assert not app._history_path.exists() or app._history_path.read_text() == ""
+
+    def test_other_commands_still_recorded(self, monkeypatch):
+        app = _make_history_app(monkeypatch, [])
+        app._append_history("/stats")
+        assert app._history == ["/stats"]

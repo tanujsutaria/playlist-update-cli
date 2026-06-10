@@ -477,3 +477,31 @@ class TestDispatchExceptionHandling:
         rendered = logging.Formatter("%(message)s").format(record)
         assert "Traceback" in rendered
         assert "kaboom" in rendered
+
+
+class TestNoisyLoggerSilencing:
+    """configure_logging must keep huggingface/httpx INFO spam out of the UI:
+    the embedding-model cache check logs ~10 "HTTP Request:" lines per load."""
+
+    NOISY = ("httpx", "httpcore", "huggingface_hub", "urllib3")
+
+    def test_noisy_loggers_raised_to_warning(self):
+        import logging
+
+        from main import configure_logging
+
+        # configure_logging mutates process-global logging state (root level,
+        # root handlers, named-logger levels); snapshot and restore so later
+        # tests that depend on the default root level aren't poisoned.
+        root = logging.getLogger()
+        saved_root_level, saved_root_handlers = root.level, root.handlers[:]
+        saved_levels = {name: logging.getLogger(name).level for name in self.NOISY}
+        try:
+            configure_logging(handler=logging.NullHandler())
+            for name in self.NOISY:
+                assert logging.getLogger(name).level == logging.WARNING
+        finally:
+            for name, level in saved_levels.items():
+                logging.getLogger(name).setLevel(level)
+            root.handlers = saved_root_handlers
+            root.setLevel(saved_root_level)

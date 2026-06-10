@@ -90,6 +90,11 @@ def configure_logging(handler: Optional[logging.Handler] = None) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers = []
+    # The embedding model's cache validation (huggingface_hub via httpx) emits
+    # ~10 INFO "HTTP Request:" lines per load, burying the UI's own messages
+    # (e.g. the embedding-load announcement). Surface only their warnings.
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if handler is None:
         handler = RichHandler(

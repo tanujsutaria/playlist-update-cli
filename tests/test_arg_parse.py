@@ -831,3 +831,21 @@ class TestUnknownCommandSelfReference:
     def test_close_match_still_suggested(self):
         message = unknown_command_message("serch", ["search", "clear"])
         assert "Did you mean /search?" in message
+
+
+class TestProgName:
+    """Usage lines must read "tunr ...", not the module name argparse infers."""
+
+    def test_parser_prog_is_tunr(self):
+        parser = setup_parsers()
+        assert parser.prog == "tunr"
+
+    def test_subparser_usage_carries_tunr(self):
+        parser = setup_parsers(exit_on_error=False)
+        sub = None
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices and "update" in action.choices:
+                sub = action.choices["update"]
+                break
+        assert sub is not None
+        assert "tunr update" in sub.format_usage()

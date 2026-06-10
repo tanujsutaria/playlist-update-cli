@@ -82,7 +82,9 @@ def setup_parsers(
     parser_class: Type[argparse.ArgumentParser] = argparse.ArgumentParser,
 ) -> argparse.ArgumentParser:
     """Create and configure argument parser"""
-    parser_kwargs = {"description": "Spotify Playlist Manager CLI"}
+    # prog: usage lines should read "tunr update ...", not the module name
+    # ("main.py update ...") that argparse infers from sys.argv inside the TUI.
+    parser_kwargs = {"prog": "tunr", "description": "Spotify Playlist Manager CLI"}
     if "exit_on_error" in inspect.signature(argparse.ArgumentParser).parameters:
         parser_kwargs["exit_on_error"] = exit_on_error
     parser = parser_class(**parser_kwargs)

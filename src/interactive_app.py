@@ -369,6 +369,10 @@ class PlaylistInteractiveApp(App):
 
     def _append_history(self, raw: str) -> None:
         """Record a submitted command, skipping consecutive duplicates."""
+        # Exiting isn't worth recalling: persisting /quit makes the first
+        # up-arrow of the NEXT session recall it, which invites a misfire.
+        if raw.lstrip("/").strip().lower() in {"quit", "exit"}:
+            return
         if self._history and self._history[-1] == raw:
             return
         self._history.append(raw)
