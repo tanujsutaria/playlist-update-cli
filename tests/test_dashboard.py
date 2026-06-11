@@ -445,7 +445,15 @@ class TestPilotSmoke:
                 await pilot.pause()
                 assert app.screen is not screen  # dismissed
 
-        asyncio.run(drive())
+        try:
+            asyncio.run(drive())
+        finally:
+            # py3.9: asyncio.run() leaves the main thread with *no* current
+            # event loop (set_event_loop was called, so get_event_loop no
+            # longer auto-creates and raises RuntimeError). Restore one so
+            # later headless Textual tests (e.g. test_interactive_app's
+            # compose helpers) keep working regardless of ordering.
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 # ---------------------------------------------------------------------------
