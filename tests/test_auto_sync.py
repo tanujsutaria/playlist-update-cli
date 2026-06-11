@@ -9,13 +9,17 @@ TUNR_AUTO_SYNC_MINUTES (0 disables). All offline; timers/workers are stubbed.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from unittest.mock import MagicMock
 
 import pytest
 
+import interactive_app
 from arg_parse import setup_parsers
 from interactive_app import SPOTIFY_REQUIRED_KEYS, PlaylistInteractiveApp
 from main import PlaylistCLI
+from storage.migrations import ensure_schema
+from storage.repos import Repositories
 
 
 @pytest.fixture(autouse=True)
@@ -53,9 +57,19 @@ class AutoSyncApp(PlaylistInteractiveApp):
 def _make_app(monkeypatch) -> AutoSyncApp:
     for key in SPOTIFY_REQUIRED_KEYS:
         monkeypatch.setenv(key, "test_value")
+    # Auto-sync only arms itself when a cached token exists (a missing token
+    # would otherwise trigger the interactive OAuth flow from the worker).
+    monkeypatch.setattr(
+        interactive_app, "get_cached_token_info", lambda: {"access_token": "cached"}
+    )
     app = AutoSyncApp(cli=PlaylistCLI(), parser=setup_parsers())
     app._refresh_env_status()
     app.cli.sync_listen_history = MagicMock()
+    # Hermetic in-memory DB (the rollback path touches cli.repos.conn).
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    app.cli._repos = Repositories(conn)
     return app
 
 
@@ -135,6 +149,88 @@ class TestMaybeAutoSync:
         app.status = "running /update"
         app._finish_auto_sync()
         assert app.status == "running /update"
+
+    def test_skipped_while_modal_screen_open(self, monkeypatch):
+        """No sync while /dash is on the stack: the dashboard queries the
+        shared sqlite connection synchronously on the app thread."""
+        app = _make_app(monkeypatch)
+        monkeypatch.setattr(
+            type(app), "screen_stack", property(lambda self: ["default", "dashboard"])
+        )
+        app._maybe_auto_sync()
+        app.cli.sync_listen_history.assert_not_called()
+        assert app.started_workers == []
+        assert app.status == "idle"
+
+    def test_skipped_without_cached_token(self, monkeypatch, caplog):
+        """Keys-present is not token-present: without a cached token the lazy
+        SpotifyManager would launch the BLOCKING interactive OAuth flow from
+        the worker thread (browser popup + permanently wedged status gate)."""
+        app = _make_app(monkeypatch)
+        monkeypatch.setattr(interactive_app, "get_cached_token_info", lambda: None)
+
+        with caplog.at_level(logging.INFO, logger="interactive_app"):
+            app._maybe_auto_sync()
+            app._maybe_auto_sync()
+
+        app.cli.sync_listen_history.assert_not_called()
+        assert app.started_workers == []
+        assert app.status == "idle"
+        # Logged once, not every interval.
+        skips = [r for r in caplog.records if "no cached Spotify token" in r.message]
+        assert len(skips) == 1
+
+    def test_runs_when_spotify_already_constructed(self, monkeypatch):
+        """An already-authenticated session never re-checks the token cache."""
+        app = _make_app(monkeypatch)
+        monkeypatch.setattr(interactive_app, "get_cached_token_info", lambda: None)
+        app.cli._spotify = object()  # SpotifyManager already constructed
+        app._maybe_auto_sync()
+        app.cli.sync_listen_history.assert_called_once_with(quiet=True)
+
+
+class TestDashboardGate:
+    def test_open_dashboard_refused_while_busy(self, monkeypatch):
+        """/dash must not open while a worker is mid-write on the shared
+        connection (it queries it synchronously on the app thread)."""
+        app = _make_app(monkeypatch)
+        pushed = []
+        app.push_screen = lambda screen, callback=None: pushed.append(screen)
+
+        app.status = "running /import-history"
+        app._open_dashboard()
+        assert pushed == []
+        assert any("already running" in str(entry) for entry in app.logged)
+
+    def test_open_dashboard_allowed_when_idle(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        pushed = []
+        app.push_screen = lambda screen, callback=None: pushed.append(screen)
+
+        app._open_dashboard()
+        assert len(pushed) == 1
+
+
+class TestFailureRollback:
+    def test_failure_mid_write_rolls_back_open_transaction(self, monkeypatch):
+        """A sync that dies mid-write must not leave an open transaction that
+        the next unrelated command's commit would silently persist."""
+        app = _make_app(monkeypatch)
+
+        def _fail_mid_write(**kwargs):
+            app.cli.repos.conn.execute(
+                "INSERT INTO sync_state (source, cursor, last_synced_at) "
+                "VALUES ('partial', NULL, NULL);"
+            )
+            raise RuntimeError("api down mid-write")
+
+        app.cli.sync_listen_history.side_effect = _fail_mid_write
+        app._maybe_auto_sync()
+
+        assert not app.cli.repos.conn.in_transaction  # rolled back, not dangling
+        app.cli.repos.conn.commit()  # the "next unrelated command" commits
+        assert app.cli.repos.sync_state.get("partial") is None
+        assert app.status == "idle"
 
 
 class TestFailureNoise:

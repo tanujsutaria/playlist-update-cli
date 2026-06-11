@@ -265,6 +265,37 @@ def test_liked_tracks_roundtrip_and_prune(tmp_path: Path) -> None:
     assert repos.liked_tracks.list_all() == []
 
 
+def test_prune_missing_handles_more_than_999_keep_ids(tmp_path: Path) -> None:
+    """Regression: a >999-track liked library must not blow SQLite's
+    bound-variable limit (999 on SQLite < 3.32 — the py3.9 floor era)."""
+    conn = _connect(tmp_path)
+    repos = Repositories(conn)
+    track_ids = []
+    for i in range(1205):
+        track_id = _seed_track(repos, f"Artist {i}", f"Song {i}")
+        repos.liked_tracks.upsert(track_id, "2026-06-01T00:00:00Z", "2026-06-10T00:00:00Z")
+        track_ids.append(track_id)
+
+    keep = track_ids[:1200]  # 5 unliked, >999 kept
+    pruned = repos.liked_tracks.prune_missing(keep)
+    assert pruned == 5
+    assert repos.liked_tracks.count() == 1200
+
+    # Duplicates in keep_ids must not break the delete either.
+    assert repos.liked_tracks.prune_missing(keep + keep) == 0
+    assert repos.liked_tracks.count() == 1200
+
+
+def test_delete_missing_handles_more_than_999_keep_ids(tmp_path: Path) -> None:
+    repos = Repositories(_connect(tmp_path))
+    for i in range(1100):
+        repos.spotify_playlists.upsert(f"pl-{i}", f"Mix {i}")
+
+    keep = [f"pl-{i}" for i in range(1000)]
+    assert repos.spotify_playlists.delete_missing(keep) == 100
+    assert len(repos.spotify_playlists.list_all()) == 1000
+
+
 # ---------------------------------------------------------------------------
 # listen_events COALESCE semantics
 

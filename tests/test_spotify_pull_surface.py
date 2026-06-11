@@ -81,15 +81,18 @@ class TestGetPlaylistItemsFull:
         with pytest.raises(RuntimeError):
             _manager(sp).get_playlist_items_full("pl-1")
 
-    def test_next_page_error_degrades_to_partial(self):
+    def test_next_page_error_propagates(self):
+        """A mid-pagination failure must raise — degrading to a partial list
+        would let /pull persist a truncated membership under the current
+        snapshot_id, freezing the truncation until the playlist changes."""
         sp = MagicMock()
         sp.playlist_items.return_value = {
             "items": [_item("one", "2026-06-01T00:00:00Z")],
             "next": "page2",
         }
         sp.next.side_effect = RuntimeError("flaky")
-        items = _manager(sp).get_playlist_items_full("pl-1")
-        assert len(items) == 1  # first page kept, warning logged, no raise
+        with pytest.raises(RuntimeError, match="flaky"):
+            _manager(sp).get_playlist_items_full("pl-1")
 
 
 class TestCurrentUserId:

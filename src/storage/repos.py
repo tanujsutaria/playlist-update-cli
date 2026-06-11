@@ -11,6 +11,44 @@ def _row_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     return dict(row)
 
 
+# Bound-variable budget for chunked IN (...) deletes. SQLITE_MAX_VARIABLE_NUMBER
+# defaults to 999 on SQLite < 3.32 (plausible for Python 3.9-era builds — the
+# project's support floor), so stay well under it.
+_SQL_VAR_CHUNK = 500
+
+
+def _delete_not_in(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    keep_ids: Sequence[str],
+) -> int:
+    """DELETE rows whose ``column`` is not in ``keep_ids``; return the count.
+
+    Never binds more than ``_SQL_VAR_CHUNK`` variables per statement: a naive
+    ``NOT IN (?,?,…)`` over a whole library blows SQLITE_MAX_VARIABLE_NUMBER
+    ('too many SQL variables') on older SQLite builds. The doomed set is
+    computed in Python and deleted with batched ``IN`` lists instead.
+    ``table``/``column`` are trusted identifiers from the repo call sites.
+    """
+    keep = set(keep_ids)
+    if not keep:
+        cur = conn.execute(f"DELETE FROM {table};")
+        return int(cur.rowcount)
+    existing = [row[0] for row in conn.execute(f"SELECT {column} FROM {table};")]
+    doomed = [value for value in existing if value not in keep]
+    deleted = 0
+    for start in range(0, len(doomed), _SQL_VAR_CHUNK):
+        chunk = doomed[start : start + _SQL_VAR_CHUNK]
+        placeholders = ", ".join(["?"] * len(chunk))
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE {column} IN ({placeholders});",
+            chunk,
+        )
+        deleted += int(cur.rowcount)
+    return deleted
+
+
 @dataclass
 class ArtistsRepo:
     conn: sqlite3.Connection
@@ -85,6 +123,53 @@ class TracksRepo:
               last_decision=excluded.last_decision,
               decision_reason=excluded.decision_reason,
               created_at=excluded.created_at,
+              updated_at=excluded.updated_at;
+            """,
+            values,
+        )
+
+    def upsert_spotify_meta(self, payload: Dict[str, Any]) -> None:
+        """Upsert Spotify metadata WITHOUT touching curation state.
+
+        Mirror/ingest paths (/pull, /ingest, listen-sync) use this instead of
+        :meth:`upsert`: on conflict only the Spotify-sourced metadata columns
+        are refreshed — ``status``/``last_decision``/``decision_reason`` are
+        preserved (a /pull must never revert an 'accepted' track to
+        'candidate') and ``created_at`` keeps the original first-seen stamp.
+        """
+        columns = [
+            "track_id",
+            "spotify_id",
+            "name",
+            "artist_id",
+            "album_name",
+            "release_date",
+            "duration_ms",
+            "explicit",
+            "popularity",
+            "spotify_url",
+            "status",
+            "last_decision",
+            "decision_reason",
+            "created_at",
+            "updated_at",
+        ]
+        values = [payload.get(col) for col in columns]
+        self.conn.execute(
+            f"""
+            INSERT INTO tracks ({", ".join(columns)})
+            VALUES ({", ".join(["?"] * len(columns))})
+            ON CONFLICT(track_id) DO UPDATE SET
+              spotify_id=excluded.spotify_id,
+              name=excluded.name,
+              artist_id=excluded.artist_id,
+              album_name=excluded.album_name,
+              release_date=excluded.release_date,
+              duration_ms=excluded.duration_ms,
+              explicit=excluded.explicit,
+              popularity=excluded.popularity,
+              spotify_url=excluded.spotify_url,
+              created_at=COALESCE(tracks.created_at, excluded.created_at),
               updated_at=excluded.updated_at;
             """,
             values,
@@ -645,17 +730,9 @@ class SpotifyPlaylistsRepo:
         """Delete playlists not in ``keep_ids``; return how many were deleted.
 
         playlist_tracks rows cascade (ON DELETE CASCADE) under foreign_keys=ON.
+        Chunked so a large library never exceeds SQLite's bound-variable limit.
         """
-        ids = list(keep_ids)
-        if not ids:
-            cur = self.conn.execute("DELETE FROM spotify_playlists;")
-        else:
-            placeholders = ", ".join(["?"] * len(ids))
-            cur = self.conn.execute(
-                f"DELETE FROM spotify_playlists WHERE spotify_playlist_id NOT IN ({placeholders});",
-                ids,
-            )
-        return int(cur.rowcount)
+        return _delete_not_in(self.conn, "spotify_playlists", "spotify_playlist_id", keep_ids)
 
 
 @dataclass
@@ -746,17 +823,12 @@ class LikedTracksRepo:
         )
 
     def prune_missing(self, keep_track_ids: Sequence[str]) -> int:
-        """Delete liked rows not in ``keep_track_ids``; return how many were deleted."""
-        ids = list(keep_track_ids)
-        if not ids:
-            cur = self.conn.execute("DELETE FROM liked_tracks;")
-        else:
-            placeholders = ", ".join(["?"] * len(ids))
-            cur = self.conn.execute(
-                f"DELETE FROM liked_tracks WHERE track_id NOT IN ({placeholders});",
-                ids,
-            )
-        return int(cur.rowcount)
+        """Delete liked rows not in ``keep_track_ids``; return how many were deleted.
+
+        Chunked so a >999-track liked library never exceeds SQLite's
+        bound-variable limit ('too many SQL variables' on SQLite < 3.32).
+        """
+        return _delete_not_in(self.conn, "liked_tracks", "track_id", keep_track_ids)
 
     def list_all(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(

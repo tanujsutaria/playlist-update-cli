@@ -178,6 +178,33 @@ class TestEventRows:
         assert {row["source"] for row in rows} == {"recently_played"}
         assert rows[0]["ms_played"] is None  # polling never knows duration
 
+    def test_event_identity_uses_bare_base62_id(self):
+        """Polled events store the BARE base62 id and mint the event_id from it
+        — the identical recipe gdpr_import uses, so the two sources share one
+        convention. (tracks.spotify_id keeps the full URI.)"""
+        import uuid
+
+        cli = _make_cli(
+            [
+                {
+                    "items": [_item("Song One", "Artist A", "2026-06-10T01:00:00Z")],
+                    "cursors": {"after": "1770000000000"},
+                }
+            ]
+        )
+        cli.sync_listen_history()
+
+        rows = _event_rows(cli)
+        assert len(rows) == 1
+        bare_id = "spotify:track:artistasongone"[len("spotify:track:") :]
+        assert rows[0]["spotify_id"] == bare_id  # no 'spotify:track:' prefix
+        expected = uuid.uuid5(uuid.NAMESPACE_URL, f"{bare_id}|2026-06-10T01:00:00Z").hex
+        assert rows[0]["event_id"] == expected
+        # tracks.spotify_id keeps the full-URI convention.
+        track = cli.repos.tracks.get("artist a|||song one")
+        assert track is not None
+        assert track["spotify_id"] == "spotify:track:artistasongone"
+
     def test_resync_same_items_does_not_duplicate(self):
         page = {
             "items": [_item("Song One", "Artist A", "2026-06-10T01:00:00Z")],

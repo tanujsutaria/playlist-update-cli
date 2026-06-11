@@ -141,6 +141,8 @@ class TestHelpCommand:
         # /enrich and /sonic are surfaced under Set up.
         assert "/enrich" in text
         assert "/sonic" in text
+        # /import-history sits in Set up next to its sibling /listen-sync.
+        assert "/import-history" in text
         # /find (the flagship) is surfaced under Discover.
         assert "/find" in text
 
@@ -529,6 +531,9 @@ class TestSetupModeGating:
                 app._handle_command(f"/{cmd} jazz")
             elif cmd in ("plan",):
                 app._handle_command(f'/{cmd} "Test"')
+            elif cmd in ("import-history",):
+                # Local-only GDPR import: must work before API keys exist.
+                app._handle_command(f"/{cmd} export.zip")
             elif cmd in ("interactive",):
                 # /interactive is handled before setup check
                 continue

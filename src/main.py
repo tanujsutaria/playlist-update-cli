@@ -28,6 +28,7 @@ from nextgen.enrich import enrich_tracks
 from nextgen.pipeline import SearchPipeline, SearchResult
 from nextgen.providers import ProviderConfigError
 from nextgen.scoring import SearchScoreConfig
+from plays import PLAY_MS_THRESHOLD
 from rotation_manager import RotationManager
 from scoring import PlaylistScoreConfig
 from song_store import SongStore
@@ -2985,7 +2986,10 @@ class PlaylistCLI:
             popularity=artist.get("popularity"),
             updated_at=now,
         )
-        self.repos.tracks.upsert(
+        # Enrich-not-clobber: refreshes Spotify metadata only. Curation state
+        # (status/last_decision/decision_reason) and created_at survive — a
+        # /pull or auto-sync must never revert an accepted track to candidate.
+        self.repos.tracks.upsert_spotify_meta(
             {
                 "track_id": track_id,
                 "spotify_id": track.get("uri") or track.get("id"),
@@ -3051,7 +3055,14 @@ class PlaylistCLI:
             if not track_id:
                 continue
             played_at = item.get("played_at") or now
-            spotify_id = track.get("uri") or track.get("id")
+            # Listen-event identity: the BARE base62 id (not the full URI)
+            # feeds the uuid5 AND is stored in listen_events.spotify_id — the
+            # identical recipe gdpr_import uses, so both sources share one
+            # event-id convention and the COALESCE-enrich upsert can match
+            # across them. (tracks.spotify_id keeps the full URI — that is a
+            # different column's convention.)
+            raw_id = track.get("uri") or track.get("id")
+            spotify_id = str(raw_id).rsplit(":", 1)[-1] if raw_id else None
             event_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{spotify_id}|{played_at}").hex
             self.repos.listen_events.upsert(
                 {
@@ -3162,6 +3173,7 @@ class PlaylistCLI:
         sp = self.spotify.sp
         liked = 0
         keep_ids: List[str] = []
+        seen: set = set()
         offset = 0
         while True:
             batch = sp.current_user_saved_tracks(limit=50, offset=offset)
@@ -3176,6 +3188,12 @@ class PlaylistCLI:
                 track_id = self._upsert_spotify_track(track, artists[0], now)
                 if not track_id:
                     continue
+                # Two liked versions of one song (single + album) canonicalize
+                # to the same track_id; keep the first occurrence so neither
+                # the reported count nor keep_ids is inflated by duplicates.
+                if track_id in seen:
+                    continue
+                seen.add(track_id)
                 self.repos.liked_tracks.upsert(
                     track_id, added_at=item.get("added_at"), synced_at=now
                 )
@@ -3296,6 +3314,12 @@ class PlaylistCLI:
             latest_played_after = None
             if added_at and events:
                 for event in events:
+                    # Canonical play rule (plays.py): a sub-30s event (only
+                    # known for GDPR-imported rows) is a skip, not a play —
+                    # it must not rotate the track out.
+                    ms_played = event.get("ms_played")
+                    if ms_played is not None and ms_played < PLAY_MS_THRESHOLD:
+                        continue
                     played_at = parse_ts(event.get("played_at"))
                     if played_at and played_at > added_at:
                         played_after = True
@@ -4800,10 +4824,21 @@ def _handle_import_history(cli: "PlaylistCLI", args: Any) -> int:
     try:
         section("Import History", f"{path}{' (dry run)' if dry_run else ''}")
         staged = "counted" if dry_run else "imported"
+        progress = {"seen": 0, "imported": 0}
 
         def _progress(seen: int, imported: int) -> None:
+            progress["seen"], progress["imported"] = seen, imported
             if seen and seen % 5000 == 0:
                 info(f"… {seen:,} records scanned · {imported:,} plays {staged}")
+
+        def _rollback() -> None:
+            # The export parses lazily, so a failure mid-stream can leave an
+            # uncommitted partial batch on the long-lived TUI connection; roll
+            # it back so the next unrelated commit can't silently persist it.
+            try:
+                cli.repos.conn.rollback()
+            except Exception:
+                logger.debug("Rollback after failed import failed.", exc_info=True)
 
         try:
             payload = import_streaming_history(
@@ -4813,9 +4848,26 @@ def _handle_import_history(cli: "PlaylistCLI", args: Any) -> int:
                 on_progress=_progress,
             )
         except GdprImportError as exc:
-            payload = {"error": str(exc)}
+            _rollback()
+            payload = {
+                "error": str(exc),
+                "records_seen": progress["seen"],
+                "imported_before_error": progress["imported"],
+            }
             error(str(exc))
+            if progress["seen"]:
+                warning(
+                    f"Import aborted after {progress['seen']:,} records "
+                    f"({progress['imported']:,} plays staged). Full batches committed "
+                    "before the failure were kept; the uncommitted tail was rolled "
+                    "back. Re-running the import after fixing the export is safe "
+                    "(idempotent)."
+                )
             return 1
+        except Exception as exc:
+            _rollback()
+            payload = {"error": str(exc)}
+            raise
 
         verb = "Would import" if dry_run else "Imported"
         summary_panel(
@@ -4949,6 +5001,17 @@ def dispatch_command(cli: "PlaylistCLI", command: str, args: object) -> int:
             return 1
         return handler(cli, args)
     except Exception as e:
+        # Backstop rollback: a handler that died mid-write (e.g. listen-sync's
+        # upsert loop) must not leave an open transaction on the long-lived
+        # TUI connection — the next unrelated command's commit would silently
+        # persist the partial write. Only touch an ALREADY-OPEN connection;
+        # never lazily create one just to roll it back.
+        repos = getattr(cli, "_repos", None)
+        if repos is not None:
+            try:
+                repos.conn.rollback()
+            except Exception:
+                logger.debug("Backstop rollback failed.", exc_info=True)
         # exc_info=True threads the traceback to every handler: the TUI's
         # UILogHandler formatter appends exc_text (so /debug errors and the
         # RichLog show the real traceback) and the CLI RichHandler renders a

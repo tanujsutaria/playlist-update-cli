@@ -236,6 +236,40 @@ class TestPullPlaylists:
         # Memberships cascade with the playlist row.
         assert cli.repos.playlist_tracks.list_for_playlist("pl-2") == []
 
+    def test_pull_does_not_clobber_curated_track_state(self, cli):
+        """The mirror must enrich, not clobber: status/last_decision/
+        decision_reason/created_at set by curation survive a /pull."""
+        _seed_remote(cli)
+        first_seen = "2026-01-01T00:00:00Z"
+        cli.repos.artists.upsert(artist_id="artist a", name="Artist A")
+        cli.repos.tracks.upsert(
+            {
+                "track_id": "artist a|||song one",
+                "name": "Song One",
+                "artist_id": "artist a",
+                "status": "accepted",
+                "last_decision": "accepted",
+                "decision_reason": "search: beach vibes",
+                "created_at": first_seen,
+                "updated_at": first_seen,
+            }
+        )
+        cli.repos.conn.commit()
+
+        rc = _run(cli, "pull")
+        assert rc == 0
+
+        track = cli.repos.tracks.get("artist a|||song one")
+        assert track is not None
+        assert track["status"] == "accepted"
+        assert track["last_decision"] == "accepted"
+        assert track["decision_reason"] == "search: beach vibes"
+        assert track["created_at"] == first_seen  # first-seen provenance kept
+        # …while Spotify metadata was still refreshed by the mirror.
+        assert track["popularity"] == 42
+        assert track["album_name"] == "Song One Album"
+        assert track["updated_at"] != first_seen
+
     def test_duplicate_track_in_playlist_kept_once(self, cli):
         cli.spotify.add_playlist(
             "pl-dup",
@@ -278,6 +312,20 @@ class TestPullLiked:
         payload = cli.pull_spotify_library(liked_only=True)
         assert payload["liked"]["pruned"] == 1
         assert cli.repos.liked_tracks.count() == 1
+
+    def test_duplicate_liked_versions_counted_once(self, cli):
+        """A single + album version of one song canonicalize to one track_id;
+        the liked count and keep set must not be inflated by the duplicate."""
+        cli.spotify.liked_items = [
+            {"added_at": "2026-06-04T00:00:00Z", "track": _spotify_track("Song One", "Artist A")},
+            {"added_at": "2026-06-05T00:00:00Z", "track": _spotify_track("Song One", "Artist A")},
+        ]
+        payload = cli.pull_spotify_library(liked_only=True)
+        assert payload["liked"]["liked"] == 1
+        assert cli.repos.liked_tracks.count() == 1
+        # First occurrence wins (same convention as playlist memberships).
+        row = cli.repos.liked_tracks.list_all()[0]
+        assert row["added_at"] == "2026-06-04T00:00:00Z"
 
     def test_liked_pagination(self, cli):
         cli.spotify.liked_items = [
@@ -357,6 +405,33 @@ class TestPullErrors:
         out = capsys.readouterr().out
         assert "Pull failed" in out
         assert "network down" in out
+
+    def test_pagination_failure_never_persists_truncated_mirror(self, cli):
+        """A mid-pagination failure aborts the pull (rollback): no snapshot_id
+        is stored for the truncated playlist, so the next pull re-fetches it
+        instead of snapshot-skipping a frozen partial membership."""
+        _seed_remote(cli)
+        real_items_full = cli.spotify.get_playlist_items_full
+
+        def _flaky(playlist_id):
+            cli.spotify.items_full_calls.append(playlist_id)
+            raise RuntimeError("page 2 fetch failed")
+
+        cli.spotify.get_playlist_items_full = _flaky
+        rc = _run(cli, "pull")
+        assert rc == 1
+        # Whole pull rolled back: nothing persisted, snapshot_id not stored.
+        assert cli.repos.spotify_playlists.get("pl-1") is None
+        assert cli.repos.playlist_tracks.count() == 0
+
+        # Next pull re-fetches every playlist (no stale snapshot skip).
+        cli.spotify.get_playlist_items_full = real_items_full
+        rc = _run(cli, "pull")
+        assert rc == 0
+        assert cli.spotify.items_full_calls[-2:] == ["pl-1", "pl-2"]
+        stored = cli.repos.spotify_playlists.get("pl-1")
+        assert stored is not None
+        assert stored["snapshot_id"] == "snap-1"
 
 
 class TestPullParsing:

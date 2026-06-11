@@ -330,6 +330,15 @@ class TestInteractiveBarChart:
         chart.action_cursor_down()
         assert chart.selected == 0
 
+    def test_render_never_soft_wraps(self):
+        """on_click maps event.y -> row index, so row i must render on line i
+        even when the terminal is narrower than label+bar+value (the bar is
+        floored at 8 cells): the Text must be no-wrap/crop, never wrapped."""
+        chart = _chart([("a very long label that overflows", 3.0, {"group": "g"})])
+        rendered = chart.render()
+        assert rendered.no_wrap is True
+        assert rendered.overflow == "crop"
+
 
 # ---------------------------------------------------------------------------
 # DashboardScreen: tab/range cycling (headless — _refresh_data stubbed out)

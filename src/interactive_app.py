@@ -24,6 +24,7 @@ from textual.widgets import Input, RichLog, Static
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
+from spotify_manager import get_cached_token_info
 from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
@@ -88,6 +89,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "find",
     "enrich",
     "sonic",
+    # GDPR-export import touches only the local DB/filesystem — exactly the
+    # audience without API credentials yet.
+    "import-history",
     "interactive",
 }
 
@@ -97,7 +101,16 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
 HELP_GROUPS: "list[tuple[str, list[str]]]" = [
     (
         "Set up",
-        ["auth-status", "auth-refresh", "pull", "ingest", "listen-sync", "enrich", "sonic"],
+        [
+            "auth-status",
+            "auth-refresh",
+            "pull",
+            "ingest",
+            "listen-sync",
+            "import-history",
+            "enrich",
+            "sonic",
+        ],
     ),
     (
         "Playlists",
@@ -241,6 +254,8 @@ class PlaylistInteractiveApp(App):
         self._app_thread_id: Optional[int] = None
         # Background listen-sync: warn once, then stay quiet on repeat failures.
         self._auto_sync_warned = False
+        # Log the "no cached token" skip once per session, not every interval.
+        self._auto_sync_token_warned = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -662,13 +677,28 @@ class PlaylistInteractiveApp(App):
         self.set_timer(3, self._maybe_auto_sync)
 
     def _maybe_auto_sync(self) -> None:
-        """Run a quiet listen-sync iff nothing else is running.
+        """Run a quiet listen-sync iff nothing else is using the connection.
 
         Takes the SAME `status` gate `_run_command` checks (both run on the
-        app thread, so check-then-set cannot race), guaranteeing user commands
-        and the auto-sync never overlap on the single shared sqlite connection.
+        app thread, so check-then-set cannot race), and additionally bails
+        while a pushed screen (e.g. /dash) is active — the dashboard queries
+        the shared sqlite connection synchronously on the app thread, so a
+        concurrent worker-thread sync would violate the serialized-use
+        contract documented in storage/db.py. Together these guarantee user
+        work and the auto-sync never overlap on the single shared connection.
         """
         if self._setup_mode or self.status != "idle":
+            return
+        if len(self.screen_stack) > 1:
+            return  # a modal screen (/dash) is reading the shared connection
+        if getattr(self.cli, "_spotify", None) is None and not get_cached_token_info():
+            # No cached token: touching cli.spotify would launch the BLOCKING
+            # interactive OAuth flow from a background worker (surprise
+            # browser popup + a worker that never returns = wedged gate).
+            # Skip quietly until the user authenticates.
+            if not self._auto_sync_token_warned:
+                self._auto_sync_token_warned = True
+                logger.info("Auto-sync skipped: no cached Spotify token yet (run /auth-status).")
             return
         self.status = "auto-sync"
         self.run_worker(self._auto_sync_worker, thread=True)
@@ -677,6 +707,14 @@ class PlaylistInteractiveApp(App):
         try:
             self.cli.sync_listen_history(quiet=True)
         except Exception:
+            # A failure mid-write would leave an open transaction on the
+            # long-lived shared connection — the next unrelated command's
+            # commit would silently persist the partial sync. Roll it back
+            # (best-effort) before logging.
+            try:
+                self.cli.repos.conn.rollback()
+            except Exception:
+                logger.debug("Rollback after failed auto-sync failed.", exc_info=True)
             if not self._auto_sync_warned:
                 self._auto_sync_warned = True
                 logger.warning(
@@ -1323,7 +1361,15 @@ class PlaylistInteractiveApp(App):
         self._clear_pending()
 
     def _open_dashboard(self) -> None:
-        """Push the /dash screen; refocus the command input when it closes."""
+        """Push the /dash screen; refocus the command input when it closes.
+
+        Gated on the same `status` check as `_run_command`: the dashboard
+        queries the shared sqlite connection synchronously on the app thread,
+        so it must not open while a worker (command or auto-sync) is mid-write.
+        """
+        if self.status != "idle":
+            self.append_log(Text("Another command is already running.", style="yellow"))
+            return
 
         def _refocus(_result: object = None) -> None:
             try:

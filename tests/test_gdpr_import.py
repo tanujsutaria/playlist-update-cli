@@ -315,32 +315,41 @@ class TestImportStreamingHistory:
         assert _count(conn, "artists") == 0
 
     def test_polled_event_gets_enriched_not_duplicated(self, tmp_path):
+        """The cross-source dedup contract, end to end: the polled event is
+        written by the REAL sync_listen_history (fake spotipy client only), so
+        this test fails if the two id recipes ever drift apart again."""
         conn = _connect(tmp_path)
         repos = Repositories(conn)
-        # Seed what the recently_played polling path would have written: a bare
-        # event (no ms_played/skipped) under the same deterministic event_id.
-        repos.artists.upsert(artist_id="artist d", name="Artist D")
-        repos.tracks.upsert(
-            {
-                "track_id": "artist d|||polled song",
-                "name": "Polled Song",
-                "artist_id": "artist d",
-                "created_at": "2023-03-01T09:31:00Z",
-                "updated_at": "2023-03-01T09:31:00Z",
-            }
-        )
+        cli = PlaylistCLI.__new__(PlaylistCLI)
+        cli._repos = repos
+
+        class _FakeSp:
+            def current_user_recently_played(self, limit=50, **kwargs):
+                return {
+                    "items": [
+                        {
+                            "played_at": "2023-03-01T09:30:00Z",
+                            "track": {
+                                "name": "Polled Song",
+                                "uri": "spotify:track:ddd555",
+                                "artists": [{"name": "Artist D"}],
+                                "album": {"name": "Album D"},
+                            },
+                        }
+                    ],
+                    "cursors": {"after": "1677663000000"},
+                }
+
+        class _FakeSpotify:
+            sp = _FakeSp()
+
+        cli._spotify = _FakeSpotify()
+        cli.sync_listen_history()
+
         event_id = _event_id("ddd555", "2023-03-01T09:30:00Z")
-        repos.listen_events.upsert(
-            {
-                "event_id": event_id,
-                "track_id": "artist d|||polled song",
-                "spotify_id": "ddd555",
-                "played_at": "2023-03-01T09:30:00Z",
-                "source": "recently_played",
-                "created_at": "2023-03-01T09:31:00Z",
-            }
-        )
-        conn.commit()
+        polled = _rows(conn, "SELECT * FROM listen_events WHERE event_id = ?;", (event_id,))
+        assert len(polled) == 1  # the real polling path mints the shared recipe
+        assert polled[0]["ms_played"] is None
 
         import_streaming_history(repos, iter_streaming_records(_write_zip(tmp_path)))
 
@@ -469,6 +478,44 @@ class TestImportHistoryCommand:
         assert rc == 1
         payload = json.loads(capsys.readouterr().out)
         assert "not found" in payload["error"]
+
+    def test_mid_stream_failure_rolls_back_partial_batch(self, tmp_path, capsys):
+        """Files parse lazily, so a corrupt LATER file fails mid-import. The
+        uncommitted partial batch must be rolled back — otherwise the next
+        unrelated command's commit would silently persist it."""
+        root = tmp_path / "export"
+        inner = root / "Spotify Extended Streaming History"
+        inner.mkdir(parents=True)
+        (inner / FILE1_NAME).write_text(json.dumps(FILE1), encoding="utf-8")
+        (inner / FILE2_NAME).write_text("{not json", encoding="utf-8")
+
+        cli = _cli(tmp_path)
+        rc = dispatch_command(cli, "import-history", _args(path=str(root)))
+        assert rc == 1
+        assert not cli.repos.conn.in_transaction  # rolled back, not dangling
+
+        cli.repos.conn.commit()  # the "next unrelated command" commits
+        assert _count(cli.repos.conn, "listen_events") == 0
+        assert _count(cli.repos.conn, "tracks") == 0
+
+        out = capsys.readouterr().out
+        assert "Could not parse" in out
+        assert "rolled" in out  # partial-progress warning discloses the state
+
+    def test_mid_stream_failure_json_payload_reports_progress(self, tmp_path, capsys):
+        root = tmp_path / "export"
+        inner = root / "Spotify Extended Streaming History"
+        inner.mkdir(parents=True)
+        (inner / FILE1_NAME).write_text(json.dumps(FILE1), encoding="utf-8")
+        (inner / FILE2_NAME).write_text("{not json", encoding="utf-8")
+
+        cli = _cli(tmp_path)
+        rc = dispatch_command(cli, "import-history", _args(path=str(root), json=True))
+        assert rc == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "Could not parse" in payload["error"]
+        assert payload["records_seen"] == 4  # all of FILE1 before FILE2 raised
+        assert payload["imported_before_error"] == 3
 
 
 # ---------------------------------------------------------------------------

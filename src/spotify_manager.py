@@ -432,9 +432,12 @@ class SpotifyManager:
         """All items of a playlist, with added_at + rich track fields (paginated).
 
         Unlike ``get_playlist_tracks`` this takes a playlist ID (not a name),
-        keeps ``added_at``, and PROPAGATES the initial fetch error so callers
-        can surface scope hints (403). Next-page failures degrade to a partial
-        list with a warning, matching the existing pagination idiom.
+        keeps ``added_at``, and PROPAGATES fetch errors — including next-page
+        failures — so callers can surface scope hints (403) and, crucially,
+        so /pull never persists a silently truncated membership: storing a
+        partial page list alongside the current snapshot_id would freeze the
+        truncation until the playlist changes remotely (the snapshot-skip
+        check would keep skipping it).
         """
         items: List[Dict] = []
         results = _retry_with_backoff(
@@ -447,9 +450,13 @@ class SpotifyManager:
             if results.get("next"):
                 try:
                     results = _retry_with_backoff(lambda r=results: self.sp.next(r))
-                except Exception as e:
-                    logger.warning(f"Error fetching next page of playlist items: {e}")
-                    break
+                except Exception:
+                    logger.warning(
+                        "Error fetching next page of playlist items for %s; aborting "
+                        "so a truncated mirror is never persisted.",
+                        playlist_id,
+                    )
+                    raise
             else:
                 break
         return items

@@ -353,7 +353,10 @@ class InteractiveBarChart(Widget, can_focus=True):
         label_width = 24
         total_width = self.size.width or 80
         bar_width = max(8, min(36, total_width - label_width - value_width - 6))
-        out = Text()
+        # no_wrap/crop: on_click assumes row i renders on line i, so a row
+        # must never soft-wrap onto a second visual line at narrow widths
+        # (bar_width is floored at 8, so lines can exceed the widget width).
+        out = Text(no_wrap=True, overflow="crop")
         for index, ((label, value, _detail), value_label) in enumerate(
             zip(self.rows, value_labels)
         ):
