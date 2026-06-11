@@ -129,6 +129,9 @@ def setup_parsers(
         help="Export stats to a file (csv or json)",
     )
     stats_parser.add_argument("--output", help="Output file path (optional)", default=None)
+    stats_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
 
     # Profile command (library visualization)
     profile_parser = subparsers.add_parser(
