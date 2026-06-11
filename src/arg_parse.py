@@ -389,6 +389,42 @@ def setup_parsers(
         help="Number of recent plays to pull (default: 50)",
     )
 
+    # GDPR extended-streaming-history import (zip / folder / single json)
+    import_history_parser = subparsers.add_parser(
+        "import-history",
+        help="Import a Spotify GDPR extended-streaming-history export into the listen ledger",
+    )
+    import_history_parser.add_argument(
+        "path",
+        help="Export .zip, the extracted folder, or one Streaming_History_Audio*.json file",
+    )
+    import_history_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count what would be imported without writing anything",
+    )
+    import_history_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the import summary as machine-readable JSON",
+    )
+
+    # Pull command (read-only mirror of the user's real Spotify library)
+    pull_parser = subparsers.add_parser(
+        "pull", help="Mirror your Spotify playlists + liked songs locally (read-only)"
+    )
+    pull_scope = pull_parser.add_mutually_exclusive_group()
+    pull_scope.add_argument("--liked-only", action="store_true", help="Only sync liked songs")
+    pull_scope.add_argument("--playlists-only", action="store_true", help="Only sync playlists")
+    pull_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-fetch every playlist even when its snapshot_id is unchanged",
+    )
+    pull_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
+
     # Rotation based on listen ledger
     rotate_played_parser = subparsers.add_parser(
         "rotate-played", help="Legacy: rotate by listen history (use rotate)"

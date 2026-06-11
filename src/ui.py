@@ -27,7 +27,7 @@ _output_sink: Optional[Callable[[RenderableType], None]] = None
 _preview_sink: Optional[Callable[[Optional[RenderableType]], None]] = None
 _json_mode: bool = False
 
-# --- ink: the tunr visual language -------------------------------------------
+# --- ink: the tunr visual language (OP-1 edition) -----------------------------
 # Codified style grammar — every chart in the app speaks the same dialect:
 #   * fill bars (hbar / stacked_bar) = counted facts ("we counted tracks")
 #   * lollipops                      = measured probabilities (a classifier call)
@@ -36,17 +36,29 @@ _json_mode: bool = False
 #     (sparklines, growth curves, heat strips) — never on ranked bars.
 # `green` stays "succeeded", `yellow` stays "warning", and `red` stays reserved
 # exclusively for failure (the `error()` contract) — never decorative.
+#
+# OP-1 palette mapping (Teenage Engineering): blue is the data ink (counted
+# facts, titles, accents), orange owns markers/selection (and the table-header
+# accent — the roles magenta used to play), warm white is the neutral tick,
+# and missing data stays grey — the honesty doctrine survives the re-skin.
+ACCENT_BLUE = "#00b4e6"  # op-1 blue — primary data ink
+ACCENT_GREEN = "#00e05a"  # op-1 green — success only, never decorative
+ACCENT_WHITE = "#fffff6"  # op-1 warm white — neutral foreground ink
+ACCENT_ORANGE = "#f26200"  # op-1 orange — markers / selection only
+
 RAMP_LO = ColorTriplet(28, 36, 54)  # dark slate — cold end of every gradient
-RAMP_HI = ColorTriplet(64, 200, 180)  # teal — hot end; harmonizes with cyan accents
-BAR_STYLE = "cyan"  # primary data fill (counted facts)
-FILL_STYLE = "dark_cyan"  # coverage fills (have-vs-missing bars)
+RAMP_HI = ColorTriplet(0, 180, 230)  # op-1 blue — hot end; matches ACCENT_BLUE
+BAR_STYLE = ACCENT_BLUE  # primary data fill (counted facts)
+FILL_STYLE = "#0077a8"  # coverage fills (have-vs-missing bars) — darker blue
 TRACK_STYLE = "grey30"  # the unfilled remainder of a bar (always drawn)
 MISSING_STYLE = "grey23"  # data we DO NOT have — always shown, never hidden
-CARD_BORDER = "grey50"  # rounded panel borders (quiet, not white)
-MARKER_STYLE = "magenta"  # measurement markers (lollipop dots)
-NEUTRAL_TICK_STYLE = "bold white"  # the ┊ classifier-neutral / target tick
+CARD_BORDER = "#8a8d8f"  # rounded panel borders — op-1 muted grey (quiet, not white)
+MARKER_STYLE = ACCENT_ORANGE  # measurement markers (lollipop dots)
+NEUTRAL_TICK_STYLE = f"bold {ACCENT_WHITE}"  # the ┊ classifier-neutral / target tick
 VALUE_STYLE = "bold"  # numeric values
 CAPTION_STYLE = "dim italic"  # honesty captions under every chart
+TABLE_HEADER_STYLE = f"bold {ACCENT_ORANGE}"  # table headers (was bold magenta)
+SUBSECTION_STYLE = f"bold {ACCENT_BLUE}"  # subsection lines & panel titles (was bold cyan)
 
 # A style argument: either a Rich style string or a Style object. The RichLog
 # sink runs with markup=False, so styles must be real objects/strings on Text
@@ -116,11 +128,11 @@ def section(title: str, subtitle: Optional[str] = None) -> None:
 
 
 def subsection(title: str) -> None:
-    _emit(Text(title, style="bold cyan"))
+    _emit(Text(title, style=SUBSECTION_STYLE))
 
 
 def table(headers: list[Any], rows: list[list[Any]]) -> None:
-    t = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE, expand=True)
+    t = Table(show_header=True, header_style=TABLE_HEADER_STYLE, box=box.SIMPLE, expand=True)
     for header in headers:
         t.add_column(str(header), overflow="fold", no_wrap=False)
     for row in rows:
@@ -134,13 +146,13 @@ def table(headers: list[Any], rows: list[list[Any]]) -> None:
 def preview_table(headers: list[Any], rows: list[list[Any]], title: Optional[str] = None) -> None:
     if not _preview_sink:
         return
-    t = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE, expand=True)
+    t = Table(show_header=True, header_style=TABLE_HEADER_STYLE, box=box.SIMPLE, expand=True)
     for header in headers:
         t.add_column(str(header), overflow="fold", no_wrap=False)
     for row in rows:
         t.add_row(*[cell if isinstance(cell, Text) else str(cell) for cell in row])
     if title:
-        _emit_preview(Panel(t, title=title, border_style="cyan"))
+        _emit_preview(Panel(t, title=title, border_style=ACCENT_BLUE))
     else:
         _emit_preview(t)
 
@@ -278,7 +290,7 @@ def bar_chart(
         return str(int(v)) if v == int(v) else f"{v:.2f}"
 
     chart = Table(show_header=False, box=box.SIMPLE, expand=False, pad_edge=False)
-    chart.add_column("Label", style="cyan", overflow="fold", no_wrap=True)
+    chart.add_column("Label", style=ACCENT_BLUE, overflow="fold", no_wrap=True)
     chart.add_column("Bar", no_wrap=True)
     chart.add_column("Value", justify="right", no_wrap=True)
     for label, value in zip(labels, nums):
@@ -489,7 +501,7 @@ def chips(
     values: Sequence[str],
     *,
     max_items: int = 3,
-    style: StyleLike = "cyan",
+    style: StyleLike = ACCENT_BLUE,
     sep: str = " · ",
 ) -> Text:
     """Inline value chips: `dream pop · shoegaze`, separators dim.
@@ -679,7 +691,7 @@ def chart_panel(
         body = grid
     panel = Panel(
         body,
-        title=Text(title, style="bold cyan"),
+        title=Text(title, style=SUBSECTION_STYLE),
         title_align="left",
         subtitle=Text(caption, style=CAPTION_STYLE) if caption else None,
         subtitle_align="right",
@@ -775,7 +787,7 @@ def coverage_panel(
         )
     panel = Panel(
         grid,
-        title=Text(title, style="bold cyan") if title else None,
+        title=Text(title, style=SUBSECTION_STYLE) if title else None,
         title_align="left",
         subtitle=Text(caption, style=CAPTION_STYLE) if caption else None,
         subtitle_align="right",
@@ -799,7 +811,7 @@ def ink_panel(
 ) -> Panel:
     """A generic ink-styled rounded panel around an arbitrary renderable.
 
-    Same chrome as `chart_panel` (bold-cyan left title, dim-italic right
+    Same chrome as `chart_panel` (SUBSECTION_STYLE left title, dim-italic right
     `caption` subtitle as the honesty-footnote slot, ROUNDED box) for blocks
     that aren't label/bar/value charts — e.g. the /taste masthead or the
     core-vs-frontier contrast cards. A caption that outgrows the panel (or
@@ -809,7 +821,7 @@ def ink_panel(
     """
     panel = Panel(
         body,
-        title=Text(title, style="bold cyan") if title else None,
+        title=Text(title, style=SUBSECTION_STYLE) if title else None,
         title_align="left",
         subtitle=Text(caption, style=CAPTION_STYLE) if caption else None,
         subtitle_align="right",
@@ -841,7 +853,7 @@ def side_by_side(*renderables: RenderableType, padding: Tuple[int, int] = (0, 1)
 def insight(message: str) -> None:
     """A gated, computed finding: `◆ {message}`. Templates only fire on hard
     conditions — every number in an insight is computed, never adjectival."""
-    _emit(Text.assemble(("◆ ", "cyan"), (message, "")))
+    _emit(Text.assemble(("◆ ", ACCENT_BLUE), (message, "")))
 
 
 def caption(message: str) -> None:

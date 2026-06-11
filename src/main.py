@@ -20,6 +20,7 @@ from rich.logging import RichHandler
 from rich.text import Text
 
 from config import AppConfig, env_flag, env_int
+from gdpr_import import GdprImportError, import_streaming_history, iter_streaming_records
 from models import Song, track_id_for
 from nextgen.acoustic import backfill_sonic
 from nextgen.embeddings import EmbeddingModel
@@ -3005,15 +3006,37 @@ class PlaylistCLI:
         )
         return track_id
 
-    def sync_listen_history(self, limit: int = 50) -> None:
-        """Sync recently played tracks into the listen ledger."""
+    def sync_listen_history(self, limit: int = 50, quiet: bool = False) -> None:
+        """Sync recently played tracks into the listen ledger.
+
+        Cursor-based: the last seen Spotify ``cursors.after`` is persisted in
+        ``sync_state['recently_played']`` and replayed as ``after=`` on the next
+        call, so repeated syncs only fetch genuinely new plays. ``quiet=True``
+        is the auto-sync voice: no section header, at most one dim caption when
+        new plays land, and API errors are re-raised (the caller logs once)
+        instead of warning into the scrollback every interval.
+        """
         now = datetime.utcnow().isoformat() + "Z"
-        section("Listen Ledger", "Recently Played")
+        if not quiet:
+            section("Listen Ledger", "Recently Played")
         try:
+            state = self.repos.sync_state.get("recently_played")
+            cursor = (state or {}).get("cursor")
+            after: Optional[int] = None
+            if cursor:
+                try:
+                    after = int(cursor)
+                except (TypeError, ValueError):
+                    after = None  # corrupt cursor: fall back to a cursor-less pull
             sp = self.spotify.sp
-            payload = sp.current_user_recently_played(limit=limit)
+            if after is not None:
+                payload = sp.current_user_recently_played(limit=limit, after=after)
+            else:
+                payload = sp.current_user_recently_played(limit=limit)
             items = payload.get("items") or []
         except Exception as exc:
+            if quiet:
+                raise
             hint = scope_error_hint(exc)
             warning(hint if hint else f"Listen sync failed: {exc}")
             return
@@ -3038,11 +3061,184 @@ class PlaylistCLI:
                     "played_at": played_at,
                     "source": "recently_played",
                     "created_at": now,
+                    "context_uri": (item.get("context") or {}).get("uri"),
                 }
             )
             added += 1
 
-        info(f"Recorded {added} listen events.")
+        # Persist the new cursor when the response carries one; an empty page
+        # with no cursors leaves the stored cursor untouched (we still record
+        # that a sync happened via last_synced_at).
+        new_after = (payload.get("cursors") or {}).get("after")
+        next_cursor = str(new_after) if new_after is not None else cursor
+        self.repos.sync_state.set("recently_played", next_cursor, now)
+        self.repos.conn.commit()
+
+        if quiet:
+            if added:
+                caption(f"auto-sync: {added} new play{'s' if added != 1 else ''}")
+        else:
+            info(f"Recorded {added} listen events.")
+
+    def _pull_playlists(self, full: bool, now: str) -> Dict[str, Any]:
+        """Mirror the user's Spotify playlists into spotify_playlists/playlist_tracks.
+
+        Unchanged playlists (same ``snapshot_id``) are skipped unless ``full``;
+        unfollowed playlists are deleted (memberships cascade). Caller commits.
+        """
+        sp = self.spotify.sp
+        me = self.spotify.current_user_id()
+
+        remote: List[dict] = []
+        results = sp.current_user_playlists(limit=50)
+        while results:
+            remote.extend(p for p in (results.get("items") or []) if p)
+            results = sp.next(results) if results.get("next") else None
+
+        synced = 0
+        skipped = 0
+        memberships = 0
+        keep_ids: List[str] = []
+        for playlist in remote:
+            playlist_id = playlist.get("id")
+            if not playlist_id:
+                continue
+            keep_ids.append(playlist_id)
+            snapshot_id = playlist.get("snapshot_id")
+            stored = self.repos.spotify_playlists.get(playlist_id)
+            if not full and stored and snapshot_id and stored.get("snapshot_id") == snapshot_id:
+                skipped += 1
+                continue
+
+            items = self.spotify.get_playlist_items_full(playlist_id)
+            rows: List[Dict[str, Any]] = []
+            seen: set = set()
+            for position, item in enumerate(items):
+                track = item.get("track") or {}
+                artists = track.get("artists") or []
+                if not artists:
+                    continue
+                track_id = self._upsert_spotify_track(track, artists[0], now)
+                # The same canonical track can appear twice in one playlist;
+                # keep the first occurrence (PK is (playlist_id, track_id)).
+                if not track_id or track_id in seen:
+                    continue
+                seen.add(track_id)
+                rows.append(
+                    {
+                        "track_id": track_id,
+                        "added_at": item.get("added_at"),
+                        "position": position,
+                        "synced_at": now,
+                    }
+                )
+
+            owner = playlist.get("owner") or {}
+            # FK order: the playlist row must exist before its membership rows.
+            self.repos.spotify_playlists.upsert(
+                playlist_id,
+                name=playlist.get("name") or playlist_id,
+                owner=owner.get("display_name") or owner.get("id"),
+                is_owned=1 if (me and owner.get("id") == me) else 0,
+                snapshot_id=snapshot_id,
+                total_tracks=(playlist.get("tracks") or {}).get("total"),
+                synced_at=now,
+            )
+            self.repos.playlist_tracks.replace_for_playlist(playlist_id, rows)
+            memberships += len(rows)
+            synced += 1
+
+        removed = self.repos.spotify_playlists.delete_missing(keep_ids)
+        self.repos.sync_state.set("pull_playlists", None, now)
+        return {
+            "synced": synced,
+            "skipped": skipped,
+            "removed": removed,
+            "memberships": memberships,
+        }
+
+    def _pull_liked(self, now: str) -> Dict[str, Any]:
+        """Mirror the user's liked songs into liked_tracks (prunes unliked). Caller commits."""
+        sp = self.spotify.sp
+        liked = 0
+        keep_ids: List[str] = []
+        offset = 0
+        while True:
+            batch = sp.current_user_saved_tracks(limit=50, offset=offset)
+            items = batch.get("items") or []
+            if not items:
+                break
+            for item in items:
+                track = item.get("track") or {}
+                artists = track.get("artists") or []
+                if not artists:
+                    continue
+                track_id = self._upsert_spotify_track(track, artists[0], now)
+                if not track_id:
+                    continue
+                self.repos.liked_tracks.upsert(
+                    track_id, added_at=item.get("added_at"), synced_at=now
+                )
+                keep_ids.append(track_id)
+                liked += 1
+            offset += len(items)
+            if len(items) < 50:
+                break
+        pruned = self.repos.liked_tracks.prune_missing(keep_ids)
+        self.repos.sync_state.set("pull_liked", None, now)
+        return {"liked": liked, "pruned": pruned}
+
+    def pull_spotify_library(
+        self,
+        liked_only: bool = False,
+        playlists_only: bool = False,
+        full: bool = False,
+    ) -> Dict[str, Any]:
+        """Pull-mirror the user's real Spotify library (playlists + liked songs).
+
+        Read-only mirror: remote Spotify is the source of truth; local edits to
+        the mirror tables are never pushed back. Returns the summary payload
+        (also the --json contract).
+        """
+        now = datetime.utcnow().isoformat() + "Z"
+        section("Pull", "Spotify Library Mirror")
+        payload: Dict[str, Any] = {"playlists": None, "liked": None, "synced_at": now}
+        try:
+            if not liked_only:
+                payload["playlists"] = self._pull_playlists(full=full, now=now)
+            if not playlists_only:
+                payload["liked"] = self._pull_liked(now=now)
+            self.repos.conn.commit()
+        except Exception as exc:
+            self.repos.conn.rollback()
+            hint = scope_error_hint(exc)
+            warning(hint if hint else f"Pull failed: {exc}")
+            payload["error"] = str(exc)
+            return payload
+
+        rows: List[List[Any]] = []
+        playlists_summary = payload["playlists"]
+        if playlists_summary:
+            rows.extend(
+                [
+                    ["Playlists synced", playlists_summary["synced"]],
+                    ["Skipped (unchanged)", playlists_summary["skipped"]],
+                    ["Removed (unfollowed)", playlists_summary["removed"]],
+                    ["Memberships written", playlists_summary["memberships"]],
+                ]
+            )
+        liked_summary = payload["liked"]
+        if liked_summary:
+            rows.extend(
+                [
+                    ["Liked tracks", liked_summary["liked"]],
+                    ["Liked pruned", liked_summary["pruned"]],
+                ]
+            )
+        if rows:
+            key_value_table(rows)
+        caption("mirror is read-only; local edits are not pushed")
+        return payload
 
     def rotate_playlist_played(self, playlist_name: str, max_replace: Optional[int] = None) -> None:
         """Rotate a playlist by removing tracks played since they were added."""
@@ -4586,6 +4782,75 @@ def _handle_listen_sync(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_import_history(cli: "PlaylistCLI", args: Any) -> int:
+    """Import a GDPR extended-streaming-history export into the listen ledger.
+
+    Streams the export (zip / extracted folder / single json) through
+    ``gdpr_import.import_streaming_history``; event ids reuse the
+    recently_played uuid5 recipe so re-imports and API-polled overlap enrich
+    instead of duplicating. Progress is plain periodic text lines (works in
+    both the console and the TUI RichLog — no tqdm, so TUNR_INTERACTIVE
+    needs no special-casing).
+    """
+    json_mode = getattr(args, "json", False)
+    dry_run = getattr(args, "dry_run", False)
+    path = Path(args.path).expanduser()
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    try:
+        section("Import History", f"{path}{' (dry run)' if dry_run else ''}")
+        staged = "counted" if dry_run else "imported"
+
+        def _progress(seen: int, imported: int) -> None:
+            if seen and seen % 5000 == 0:
+                info(f"… {seen:,} records scanned · {imported:,} plays {staged}")
+
+        try:
+            payload = import_streaming_history(
+                cli.repos,
+                iter_streaming_records(path),
+                dry_run=dry_run,
+                on_progress=_progress,
+            )
+        except GdprImportError as exc:
+            payload = {"error": str(exc)}
+            error(str(exc))
+            return 1
+
+        verb = "Would import" if dry_run else "Imported"
+        summary_panel(
+            f"{verb} {payload['imported']:,} plays from {payload['files']} file(s) — "
+            f"{payload['records_total']:,} records scanned; skipped "
+            f"{payload['episodes_skipped']:,} podcast/episode rows and "
+            f"{payload['missing_metadata']:,} rows without track metadata.",
+            title="Import History",
+        )
+        caption("play counts include partial plays; aggregation applies the 30s rule via ms_played")
+        caption("overlap with API-polled events dedupes only on exact timestamps")
+        return 0
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
+
+
+def _handle_pull(cli: "PlaylistCLI", args: Any) -> int:
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    try:
+        payload = cli.pull_spotify_library(
+            liked_only=getattr(args, "liked_only", False),
+            playlists_only=getattr(args, "playlists_only", False),
+            full=getattr(args, "full", False),
+        )
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
+    return 1 if payload.get("error") else 0
+
+
 def _handle_rotate_played(cli: "PlaylistCLI", args: Any) -> int:
     # Deprecated alias for `rotate`; kept one release so existing muscle memory
     # and scripts get a redirect instead of an "unknown command" error.
@@ -4660,6 +4925,8 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "debug": _handle_debug,
     "ingest": _handle_ingest,
     "listen-sync": _handle_listen_sync,
+    "import-history": _handle_import_history,
+    "pull": _handle_pull,
     "rotate-played": _handle_rotate_played,
     "rotate": _handle_rotate,
     "backup": _handle_backup,

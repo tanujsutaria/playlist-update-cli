@@ -40,7 +40,7 @@ Top-level modules import each other bare (`from models import Song`,
 declares the top-level modules in `[tool.setuptools] py-modules` and finds the
 sub-packages.
 
-**Single system of record: SQLite at `data/tunr.db` (schema v4).** Managed by
+**Single system of record: SQLite at `data/tunr.db` (schema v7).** Managed by
 `storage/` (`Database`, `migrations.ensure_schema`, `Repositories`, `vectors`).
 The legacy pickle/numpy store and `db_manager.py` are **retired** — data was
 migrated and re-embedded (768-dim `all-mpnet-base-v2`) via

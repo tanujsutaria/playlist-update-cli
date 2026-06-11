@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 def _row_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -422,6 +422,13 @@ class ListenEventsRepo:
             "played_at",
             "source",
             "created_at",
+            # v7 telemetry columns (optional, default None). On conflict these
+            # are enrich-not-clobber via COALESCE: a GDPR re-import can add
+            # ms_played to an event first seen via polling, but a None payload
+            # never erases previously stored data.
+            "ms_played",
+            "skipped",
+            "context_uri",
         ]
         values = [payload.get(col) for col in columns]
         self.conn.execute(
@@ -433,7 +440,10 @@ class ListenEventsRepo:
               spotify_id=excluded.spotify_id,
               played_at=excluded.played_at,
               source=excluded.source,
-              created_at=excluded.created_at;
+              created_at=excluded.created_at,
+              ms_played=COALESCE(excluded.ms_played, listen_events.ms_played),
+              skipped=COALESCE(excluded.skipped, listen_events.skipped),
+              context_uri=COALESCE(excluded.context_uri, listen_events.context_uri);
             """,
             values,
         )
@@ -559,6 +569,207 @@ class GenerationTracksRepo:
 
 
 @dataclass
+class SyncStateRepo:
+    conn: sqlite3.Connection
+
+    def get(self, source: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM sync_state WHERE source = ?;",
+            (source,),
+        ).fetchone()
+        return _row_dict(row)
+
+    def set(
+        self,
+        source: str,
+        cursor: Optional[str],
+        last_synced_at: Optional[str],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO sync_state (source, cursor, last_synced_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+              cursor=excluded.cursor,
+              last_synced_at=excluded.last_synced_at;
+            """,
+            (source, cursor, last_synced_at),
+        )
+
+
+@dataclass
+class SpotifyPlaylistsRepo:
+    conn: sqlite3.Connection
+
+    def upsert(
+        self,
+        spotify_playlist_id: str,
+        name: str,
+        owner: Optional[str] = None,
+        is_owned: int = 0,
+        snapshot_id: Optional[str] = None,
+        total_tracks: Optional[int] = None,
+        synced_at: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO spotify_playlists (
+              spotify_playlist_id, name, owner, is_owned, snapshot_id, total_tracks, synced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(spotify_playlist_id) DO UPDATE SET
+              name=excluded.name,
+              owner=excluded.owner,
+              is_owned=excluded.is_owned,
+              snapshot_id=excluded.snapshot_id,
+              total_tracks=excluded.total_tracks,
+              synced_at=excluded.synced_at;
+            """,
+            (spotify_playlist_id, name, owner, is_owned, snapshot_id, total_tracks, synced_at),
+        )
+
+    def get(self, spotify_playlist_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM spotify_playlists WHERE spotify_playlist_id = ?;",
+            (spotify_playlist_id,),
+        ).fetchone()
+        return _row_dict(row)
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM spotify_playlists ORDER BY name ASC;",
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_missing(self, keep_ids: Sequence[str]) -> int:
+        """Delete playlists not in ``keep_ids``; return how many were deleted.
+
+        playlist_tracks rows cascade (ON DELETE CASCADE) under foreign_keys=ON.
+        """
+        ids = list(keep_ids)
+        if not ids:
+            cur = self.conn.execute("DELETE FROM spotify_playlists;")
+        else:
+            placeholders = ", ".join(["?"] * len(ids))
+            cur = self.conn.execute(
+                f"DELETE FROM spotify_playlists WHERE spotify_playlist_id NOT IN ({placeholders});",
+                ids,
+            )
+        return int(cur.rowcount)
+
+
+@dataclass
+class PlaylistTracksRepo:
+    conn: sqlite3.Connection
+
+    def replace_for_playlist(
+        self,
+        spotify_playlist_id: str,
+        rows: Iterable[Dict[str, Any]],
+    ) -> None:
+        """DELETE then re-INSERT the playlist's membership rows.
+
+        Not atomic by itself — the caller wraps this in a transaction/commit
+        (e.g. ``Database.session``), per the repos-never-commit convention.
+        """
+        self.conn.execute(
+            "DELETE FROM playlist_tracks WHERE spotify_playlist_id = ?;",
+            (spotify_playlist_id,),
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO playlist_tracks (
+              spotify_playlist_id, track_id, added_at, position, synced_at
+            )
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            [
+                (
+                    spotify_playlist_id,
+                    row["track_id"],
+                    row.get("added_at"),
+                    row.get("position"),
+                    row.get("synced_at"),
+                )
+                for row in rows
+            ],
+        )
+
+    def list_for_playlist(self, spotify_playlist_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM playlist_tracks
+            WHERE spotify_playlist_id = ?
+            ORDER BY position ASC;
+            """,
+            (spotify_playlist_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def playlists_for_track(self, track_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT p.*
+            FROM spotify_playlists p
+            JOIN playlist_tracks pt ON pt.spotify_playlist_id = p.spotify_playlist_id
+            WHERE pt.track_id = ?
+            ORDER BY p.name ASC;
+            """,
+            (track_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM playlist_tracks;").fetchone()
+        return int(row[0])
+
+
+@dataclass
+class LikedTracksRepo:
+    conn: sqlite3.Connection
+
+    def upsert(
+        self,
+        track_id: str,
+        added_at: Optional[str] = None,
+        synced_at: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO liked_tracks (track_id, added_at, synced_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(track_id) DO UPDATE SET
+              added_at=excluded.added_at,
+              synced_at=excluded.synced_at;
+            """,
+            (track_id, added_at, synced_at),
+        )
+
+    def prune_missing(self, keep_track_ids: Sequence[str]) -> int:
+        """Delete liked rows not in ``keep_track_ids``; return how many were deleted."""
+        ids = list(keep_track_ids)
+        if not ids:
+            cur = self.conn.execute("DELETE FROM liked_tracks;")
+        else:
+            placeholders = ", ".join(["?"] * len(ids))
+            cur = self.conn.execute(
+                f"DELETE FROM liked_tracks WHERE track_id NOT IN ({placeholders});",
+                ids,
+            )
+        return int(cur.rowcount)
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM liked_tracks ORDER BY added_at DESC;",
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM liked_tracks;").fetchone()
+        return int(row[0])
+
+
+@dataclass
 class Repositories:
     conn: sqlite3.Connection
 
@@ -613,3 +824,19 @@ class Repositories:
     @property
     def generation_tracks(self) -> GenerationTracksRepo:
         return GenerationTracksRepo(self.conn)
+
+    @property
+    def sync_state(self) -> SyncStateRepo:
+        return SyncStateRepo(self.conn)
+
+    @property
+    def spotify_playlists(self) -> SpotifyPlaylistsRepo:
+        return SpotifyPlaylistsRepo(self.conn)
+
+    @property
+    def playlist_tracks(self) -> PlaylistTracksRepo:
+        return PlaylistTracksRepo(self.conn)
+
+    @property
+    def liked_tracks(self) -> LikedTracksRepo:
+        return LikedTracksRepo(self.conn)

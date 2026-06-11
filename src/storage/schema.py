@@ -216,3 +216,52 @@ def schema_v6() -> list[str]:
         "ALTER TABLE search_runs ADD COLUMN summary TEXT;",
         "ALTER TABLE search_candidates ADD COLUMN metrics_json TEXT;",
     ]
+
+
+def schema_v7() -> list[str]:
+    # Spotify library sync: a local mirror of remote playlists / liked songs,
+    # one cursor row per sync source, and richer listen_events telemetry so a
+    # GDPR export and live polling can enrich the same event rows.
+    return [
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+          source TEXT PRIMARY KEY,
+          cursor TEXT,
+          last_synced_at TEXT
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS spotify_playlists (
+          spotify_playlist_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          owner TEXT,
+          is_owned INTEGER DEFAULT 0,
+          snapshot_id TEXT,
+          total_tracks INTEGER,
+          synced_at TEXT
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+          spotify_playlist_id TEXT NOT NULL
+            REFERENCES spotify_playlists(spotify_playlist_id) ON DELETE CASCADE,
+          track_id TEXT NOT NULL REFERENCES tracks(track_id),
+          added_at TEXT,
+          position INTEGER,
+          synced_at TEXT,
+          PRIMARY KEY (spotify_playlist_id, track_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS liked_tracks (
+          track_id TEXT PRIMARY KEY REFERENCES tracks(track_id),
+          added_at TEXT,
+          synced_at TEXT
+        );
+        """,
+        "ALTER TABLE listen_events ADD COLUMN ms_played INTEGER;",
+        "ALTER TABLE listen_events ADD COLUMN skipped INTEGER;",
+        "ALTER TABLE listen_events ADD COLUMN context_uri TEXT;",
+        "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id);",
+        "CREATE INDEX IF NOT EXISTS idx_liked_tracks_added ON liked_tracks(added_at);",
+    ]

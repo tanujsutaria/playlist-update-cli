@@ -419,6 +419,53 @@ class SpotifyManager:
             logger.debug("Full error:", exc_info=True)
             return []
 
+    # Rich field filter for the /pull library mirror: keeps added_at (which
+    # get_playlist_tracks' filter drops) plus the track metadata the local
+    # `tracks` upsert wants. `next` must stay in the filter or sp.next() can't
+    # paginate.
+    PLAYLIST_ITEM_FIELDS = (
+        "items(added_at,track(name,id,uri,artists(name),"
+        "album(name,release_date),duration_ms,explicit,popularity,external_urls)),next"
+    )
+
+    def get_playlist_items_full(self, playlist_id: str) -> List[Dict]:
+        """All items of a playlist, with added_at + rich track fields (paginated).
+
+        Unlike ``get_playlist_tracks`` this takes a playlist ID (not a name),
+        keeps ``added_at``, and PROPAGATES the initial fetch error so callers
+        can surface scope hints (403). Next-page failures degrade to a partial
+        list with a warning, matching the existing pagination idiom.
+        """
+        items: List[Dict] = []
+        results = _retry_with_backoff(
+            lambda: self.sp.playlist_items(playlist_id, fields=self.PLAYLIST_ITEM_FIELDS)
+        )
+        while results:
+            for item in results.get("items") or []:
+                if item and item.get("track"):
+                    items.append(item)
+            if results.get("next"):
+                try:
+                    results = _retry_with_backoff(lambda r=results: self.sp.next(r))
+                except Exception as e:
+                    logger.warning(f"Error fetching next page of playlist items: {e}")
+                    break
+            else:
+                break
+        return items
+
+    def current_user_id(self) -> Optional[str]:
+        """The authenticated user's Spotify id (cached from auth; refetch fallback)."""
+        cached = getattr(self, "user_id", None)
+        if cached:
+            return cached
+        try:
+            self.user_id = (self.sp.current_user() or {}).get("id")
+        except Exception as e:
+            logger.error(f"Error fetching current user id: {e}")
+            return None
+        return self.user_id
+
     def get_track_info(self, uri: str) -> Optional[Dict]:
         """Get track info from URI"""
         try:

@@ -4,6 +4,8 @@ Tests all interactive-only commands, aliases, shlex error handling,
 setup mode gating, and worker error display.
 """
 
+import re
+
 import pytest
 
 from arg_parse import setup_parsers
@@ -13,6 +15,7 @@ from interactive_app import (
     PlaylistInteractiveApp,
 )
 from main import PlaylistCLI
+from ui import ACCENT_BLUE
 
 
 @pytest.fixture(autouse=True)
@@ -145,7 +148,9 @@ class TestHelpCommand:
         app = _make_app(monkeypatch)
         app._handle_command("/help")
         text = _logged_text(app)
-        assert "/import" not in text  # legacy hidden
+        # Exact-row match: /import (legacy) is hidden; /import-history is a
+        # different, non-legacy command and may legitimately appear.
+        assert not re.search(r"/import(?![-\w])", text)  # legacy hidden
         assert "/help all" in text  # but discoverable
 
     def test_help_all_reveals_legacy(self, monkeypatch):
@@ -153,7 +158,7 @@ class TestHelpCommand:
         app._handle_command("/help all")
         text = _logged_text(app)
         assert "Legacy" in text
-        assert "/import" in text
+        assert re.search(r"/import(?![-\w])", text)  # the legacy row itself
         assert app.commands == []  # still not dispatched to argparse
 
 
@@ -167,7 +172,7 @@ class TestCommandHelp:
         panel = app.logged[-1]
         assert isinstance(panel, Panel)
         assert panel.title == "/update"
-        assert panel.border_style == "cyan"
+        assert panel.border_style == ACCENT_BLUE
         assert "--count" in _logged_text(app)
 
     def test_help_subcommand_accepts_slash_prefix(self, monkeypatch):
@@ -184,7 +189,7 @@ class TestCommandHelp:
         panel = app.logged[-1]
         assert isinstance(panel, Panel)
         assert panel.title == "Help"
-        assert panel.border_style == "cyan"
+        assert panel.border_style == ACCENT_BLUE
         assert "--count" in _logged_text(app)
 
     def test_missing_arg_error_carries_usage(self, monkeypatch):
@@ -785,23 +790,23 @@ class TestSpinnerGate:
         return app
 
     def test_applying_search_results_animates(self, monkeypatch):
-        """Non-'Running …' busy statuses must still animate the spinner."""
+        """Non-'running …' busy statuses must still animate the spinner."""
         app = self._spinner_app(monkeypatch)
         app.spinner_calls.clear()
-        app.status = "Applying search results"
+        app.status = "applying search results"
         assert app.spinner_calls == ["start"]
 
     def test_idle_stops_spinner(self, monkeypatch):
         app = self._spinner_app(monkeypatch)
-        app.status = "Running /stats"
+        app.status = "running /stats"
         app.spinner_calls.clear()
-        app.status = "Idle"
+        app.status = "idle"
         assert app.spinner_calls == ["stop"]
 
     def test_setup_required_does_not_animate(self, monkeypatch):
         app = self._spinner_app(monkeypatch)
         app.spinner_calls.clear()
-        app.status = "Setup Required"
+        app.status = "setup required"
         assert "start" not in app.spinner_calls
 
 
