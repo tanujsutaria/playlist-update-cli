@@ -49,6 +49,7 @@ class TestSetupParsers:
             "interactive",
             "ingest",
             "listen-sync",
+            "pull",
             "rotate",
             "rotate-played",
         ]

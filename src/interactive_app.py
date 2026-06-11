@@ -18,11 +18,16 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.reactive import reactive
+from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
+from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
+from spotify_manager import get_cached_token_info
 from ui import (
+    ACCENT_BLUE,
+    SUBSECTION_STYLE,
     clear_preview,
     info,
     json_output,
@@ -37,6 +42,25 @@ from ui import (
 from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
+
+# OP-1 (Teenage Engineering) theme: warm off-white ink on near-black chrome,
+# with the OP-1 accents mapped onto Textual's semantic slots. The App CSS
+# below uses theme variables ($background, $surface, …) so all chrome follows
+# this palette; the Rich-side twin lives in ui.py (ACCENT_* / ink constants).
+OP1_THEME = Theme(
+    name="op-1",
+    primary="#00b4e6",  # op-1 blue
+    secondary="#8a8d8f",  # muted grey
+    accent="#f26200",  # op-1 orange
+    foreground="#fffff6",  # warm white
+    background="#0d0d0d",
+    surface="#1c1e1f",
+    panel="#2a2c2e",
+    success="#00e05a",  # op-1 green
+    warning="#f2a900",
+    error="#ff4f4f",
+    dark=True,
+)
 
 # Persisted command history is capped to this many lines (enforced on load).
 HISTORY_MAX_LINES = 500
@@ -65,6 +89,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     "find",
     "enrich",
     "sonic",
+    # GDPR-export import touches only the local DB/filesystem — exactly the
+    # audience without API credentials yet.
+    "import-history",
     "interactive",
 }
 
@@ -72,7 +99,19 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
 # an "Other" bucket; legacy commands are hidden unless `/help all` is used. The
 # descriptions still come from argparse, so this map only controls ORDER/grouping.
 HELP_GROUPS: "list[tuple[str, list[str]]]" = [
-    ("Set up", ["auth-status", "auth-refresh", "ingest", "listen-sync", "enrich", "sonic"]),
+    (
+        "Set up",
+        [
+            "auth-status",
+            "auth-refresh",
+            "pull",
+            "ingest",
+            "listen-sync",
+            "import-history",
+            "enrich",
+            "sonic",
+        ],
+    ),
     (
         "Playlists",
         [
@@ -91,7 +130,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         ],
     ),
     ("Discover", ["find", "search"]),
-    ("Insight", ["stats", "profile", "taste", "list-rotations", "list-backups"]),
+    ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups"]),
 ]
 HELP_LEGACY = {"import"}
 
@@ -107,6 +146,8 @@ META_COMMAND_HELP = {
     "errors": "Show error log (alias for /debug errors)",
     "expand": "Expand the last search",
     "search-more": "Expand the last search",
+    "dash": "Open the interactive dashboard (taste · stats · plays)",
+    "dashboard": "Open the interactive dashboard (taste · stats · plays)",
     "clear": "Clear the output pane",
     "cls": "Clear the output pane",
     "quit": "Exit the app",
@@ -130,7 +171,7 @@ class UILogHandler(logging.Handler):
             elif record.levelno >= logging.WARNING:
                 style = "yellow"
             elif record.levelno >= logging.INFO:
-                style = "cyan"
+                style = ACCENT_BLUE
             elif record.levelno >= logging.DEBUG:
                 style = "dim"
             text = Text(message, style=style)
@@ -144,14 +185,14 @@ class UILogHandler(logging.Handler):
 class PlaylistInteractiveApp(App):
     CSS = """
     Screen {
-        background: #0b0f14;
-        color: #e6edf3;
+        background: $background;
+        color: $foreground;
     }
     #top_bar {
         height: 1;
         padding: 0 2;
-        background: #0f141a;
-        color: #9da7b3;
+        background: $surface;
+        color: $secondary;
     }
     #body {
         height: 1fr;
@@ -174,8 +215,8 @@ class PlaylistInteractiveApp(App):
     }
     #command_input {
         dock: bottom;
-        background: #0f141a;
-        border: solid #2d333b;
+        background: $surface;
+        border: solid $panel;
     }
     """
 
@@ -184,7 +225,9 @@ class PlaylistInteractiveApp(App):
         ("ctrl+l", "clear_log", "Clear output"),
     ]
 
-    status = reactive("Idle")
+    # Status sentinels are lowercase on purpose — the top bar renders them
+    # verbatim, and the chrome follows TE's lowercase convention.
+    status = reactive("idle")
     SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
     def __init__(self, cli: PlaylistCLI, parser: argparse.ArgumentParser) -> None:
@@ -209,6 +252,10 @@ class PlaylistInteractiveApp(App):
         self._run_started: Optional[float] = None
         self._last_run_note: str = ""
         self._app_thread_id: Optional[int] = None
+        # Background listen-sync: warn once, then stay quiet on repeat failures.
+        self._auto_sync_warned = False
+        # Log the "no cached token" skip once per session, not every interval.
+        self._auto_sync_token_warned = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -216,9 +263,14 @@ class PlaylistInteractiveApp(App):
             yield Static(id="search_preview")
             yield RichLog(id="output", highlight=False, markup=False, wrap=True, min_width=20)
             yield Static(id="setup_screen")
-        yield Input(placeholder="Type /help for commands", id="command_input")
+        yield Input(placeholder="type /help for commands", id="command_input")
 
     def on_mount(self) -> None:
+        # Theme plumbing first: register the OP-1 palette and switch to it so
+        # the CSS theme variables above resolve against it (Textual 8.x's
+        # documented flow: register_theme + set `theme` in on_mount).
+        self.register_theme(OP1_THEME)
+        self.theme = "op-1"
         self._app_thread_id = threading.get_ident()
         self._mounted = True
         set_output_sink(self._emit_renderable)
@@ -229,6 +281,8 @@ class PlaylistInteractiveApp(App):
         self._show_welcome()
         if self._missing_spotify_keys:
             self._show_setup()
+        else:
+            self._schedule_auto_sync()
         self.query_one(Input).focus()
         self._update_top_bar()
 
@@ -270,8 +324,8 @@ class PlaylistInteractiveApp(App):
 
     def watch_status(self, value: str) -> None:
         # Busy means "any non-idle work", not just statuses that happen to
-        # start with "Running" (e.g. "Applying search results").
-        busy = value not in {"Idle", "Setup Required"} and not self._setup_mode
+        # start with "running" (e.g. "applying search results").
+        busy = value not in {"idle", "setup required"} and not self._setup_mode
         if busy:
             self._start_spinner()
         else:
@@ -478,6 +532,9 @@ class PlaylistInteractiveApp(App):
         if text in ("expand", "search-more"):
             self._expand_search()
             return
+        if text in ("dash", "dashboard"):
+            self._open_dashboard()
+            return
         if text in ("clear", "cls"):
             self.action_clear_log()
             return
@@ -499,7 +556,7 @@ class PlaylistInteractiveApp(App):
         command, args, error = parse_tokens(tokens, extra_commands=self._meta_command_names())
         if error:
             if isinstance(error, HelpText):
-                self.append_log(Panel(Text(str(error)), title="Help", border_style="cyan"))
+                self.append_log(Panel(Text(str(error)), title="Help", border_style=ACCENT_BLUE))
             else:
                 self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
             return
@@ -522,11 +579,11 @@ class PlaylistInteractiveApp(App):
         self._run_command(command, args)
 
     def _run_command(self, command: str, args: object) -> None:
-        if self.status != "Idle":
+        if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         self._run_started = time.monotonic()
-        self.status = f"Running /{command}"
+        self.status = f"running /{command}"
         self.run_worker(lambda: self._execute_command(command, args), thread=True)
 
     def _execute_command(self, command: str, args: object) -> None:
@@ -594,7 +651,85 @@ class PlaylistInteractiveApp(App):
 
     def _set_idle(self) -> None:
         self._run_started = None
-        self.status = "Idle"
+        self.status = "idle"
+
+    # ------------------------------------------------------------------
+    # Background listen-sync (quiet, cursor-based)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auto_sync_minutes() -> int:
+        """Auto-sync interval in minutes (TUNR_AUTO_SYNC_MINUTES; 0 disables)."""
+        try:
+            return int(os.environ.get("TUNR_AUTO_SYNC_MINUTES", "30"))
+        except ValueError:
+            logger.warning("Invalid TUNR_AUTO_SYNC_MINUTES; using the 30-minute default.")
+            return 30
+
+    def _schedule_auto_sync(self) -> None:
+        """Arm the periodic quiet listen-sync plus a one-shot warm-up sync."""
+        minutes = self._auto_sync_minutes()
+        if minutes <= 0:
+            return
+        self.set_interval(60 * minutes, self._maybe_auto_sync)
+        # One-shot initial sync shortly after launch so the ledger is fresh
+        # without waiting a full interval.
+        self.set_timer(3, self._maybe_auto_sync)
+
+    def _maybe_auto_sync(self) -> None:
+        """Run a quiet listen-sync iff nothing else is using the connection.
+
+        Takes the SAME `status` gate `_run_command` checks (both run on the
+        app thread, so check-then-set cannot race), and additionally bails
+        while a pushed screen (e.g. /dash) is active — the dashboard queries
+        the shared sqlite connection synchronously on the app thread, so a
+        concurrent worker-thread sync would violate the serialized-use
+        contract documented in storage/db.py. Together these guarantee user
+        work and the auto-sync never overlap on the single shared connection.
+        """
+        if self._setup_mode or self.status != "idle":
+            return
+        if len(self.screen_stack) > 1:
+            return  # a modal screen (/dash) is reading the shared connection
+        if getattr(self.cli, "_spotify", None) is None and not get_cached_token_info():
+            # No cached token: touching cli.spotify would launch the BLOCKING
+            # interactive OAuth flow from a background worker (surprise
+            # browser popup + a worker that never returns = wedged gate).
+            # Skip quietly until the user authenticates.
+            if not self._auto_sync_token_warned:
+                self._auto_sync_token_warned = True
+                logger.info("Auto-sync skipped: no cached Spotify token yet (run /auth-status).")
+            return
+        self.status = "auto-sync"
+        self.run_worker(self._auto_sync_worker, thread=True)
+
+    def _auto_sync_worker(self) -> None:
+        try:
+            self.cli.sync_listen_history(quiet=True)
+        except Exception:
+            # A failure mid-write would leave an open transaction on the
+            # long-lived shared connection — the next unrelated command's
+            # commit would silently persist the partial sync. Roll it back
+            # (best-effort) before logging.
+            try:
+                self.cli.repos.conn.rollback()
+            except Exception:
+                logger.debug("Rollback after failed auto-sync failed.", exc_info=True)
+            if not self._auto_sync_warned:
+                self._auto_sync_warned = True
+                logger.warning(
+                    "Background listen-sync failed; retrying quietly each interval.",
+                    exc_info=True,
+                )
+            else:
+                logger.debug("Background listen-sync failed again.", exc_info=True)
+        finally:
+            self._dispatch_ui(self._finish_auto_sync)
+
+    def _finish_auto_sync(self) -> None:
+        # Release the gate only if auto-sync still holds it.
+        if self.status == "auto-sync":
+            self.status = "idle"
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -612,14 +747,14 @@ class PlaylistInteractiveApp(App):
         welcome.append("Welcome to Tunr\n", style="bold")
         welcome.append("Launch any time with: tunr\n", style="dim")
         welcome.append("Commands are slash-prefixed. Type /help for the list.\n", style="dim")
-        self.append_log(Panel(welcome, title="Welcome", border_style="cyan"))
+        self.append_log(Panel(welcome, title="Welcome", border_style=ACCENT_BLUE))
 
     @staticmethod
     def _help_table(title: str, rows: "list[tuple[str, str]]") -> Table:
         t = Table(title=title, title_justify="left", box=box.SIMPLE, show_header=False, expand=True)
         # No fixed width on the command column: it sizes to the longest name so
         # commands like /restore-previous-rotation aren't truncated.
-        t.add_column("Command", style="cyan", no_wrap=True)
+        t.add_column("Command", style=ACCENT_BLUE, no_wrap=True)
         t.add_column("Description", overflow="fold", no_wrap=False)
         for name, help_text in rows:
             t.add_row(name, help_text or "")
@@ -649,7 +784,13 @@ class PlaylistInteractiveApp(App):
         mapped = set(HELP_LEGACY)
         for title, names in HELP_GROUPS:
             mapped.update(names)
-            rows = [(f"/{name}", summaries[name]) for name in names if name in summaries]
+            # Meta (TUI-only) commands like /dash can live in a task group too;
+            # their one-liners come from META_COMMAND_HELP instead of argparse.
+            rows = [
+                (f"/{name}", summaries.get(name) or META_COMMAND_HELP[name])
+                for name in names
+                if name in summaries or name in META_COMMAND_HELP
+            ]
             if rows:
                 self.append_log(self._help_table(title, rows))
 
@@ -699,11 +840,13 @@ class PlaylistInteractiveApp(App):
             return
         meta = META_COMMAND_HELP.get(name)
         if meta is not None:
-            self.append_log(Panel(Text(meta), title=f"/{name}", border_style="cyan"))
+            self.append_log(Panel(Text(meta), title=f"/{name}", border_style=ACCENT_BLUE))
             return
         sub = self._find_subparser(name)
         if sub is not None:
-            self.append_log(Panel(Text(sub.format_help()), title=f"/{name}", border_style="cyan"))
+            self.append_log(
+                Panel(Text(sub.format_help()), title=f"/{name}", border_style=ACCENT_BLUE)
+            )
             return
         candidates = [cmd for cmd, _ in self._command_summaries()]
         candidates.extend(self._meta_command_names())
@@ -722,34 +865,34 @@ class PlaylistInteractiveApp(App):
             return
         command_input = self.query_one(Input)
         if self._setup_mode:
-            command_input.placeholder = "Setup required. Type /setup"
+            command_input.placeholder = "setup required. type /setup"
         else:
-            command_input.placeholder = "Type /help for commands"
+            command_input.placeholder = "type /help for commands"
 
     def _render_top_bar(self):
         width = self.size.width or 0
         label_text = "tunr"
         content_width = max(0, width - 4)
         max_status_width = max(0, content_width - len(label_text) - 1)
-        status_style = "green" if self.status == "Idle" else "yellow"
+        status_style = "green" if self.status == "idle" else "yellow"
         if self._setup_mode:
             status_style = "red"
         if max_status_width < 8:
-            return Text(label_text, style="bold cyan")
+            return Text(label_text, style=SUBSECTION_STYLE)
         status_label = self.status
         if self._spinner_timer is not None:
             status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
-        if self.status != "Idle" and self._run_started is not None:
+        if self.status != "idle" and self._run_started is not None:
             elapsed = self._format_elapsed(time.monotonic() - self._run_started)
             status_label = f"{status_label} • {elapsed}"
-        elif self.status == "Idle" and self._last_run_note:
-            status_label = f"Idle · {self._last_run_note}"
+        elif self.status == "idle" and self._last_run_note:
+            status_label = f"idle · {self._last_run_note}"
         status_text = Text(status_label, style=status_style)
         status_text.truncate(max_status_width, overflow="ellipsis")
         table = Table.grid(expand=True)
         table.add_column(justify="left")
         table.add_column(justify="right")
-        table.add_row(Text(label_text, style="bold cyan"), status_text)
+        table.add_row(Text(label_text, style=SUBSECTION_STYLE), status_text)
         return table
 
     def _start_spinner(self) -> None:
@@ -781,10 +924,10 @@ class PlaylistInteractiveApp(App):
         self._missing_spotify_keys = [key for key in SPOTIFY_REQUIRED_KEYS if not status.get(key)]
         prev_setup = self._setup_mode
         self._setup_mode = bool(self._missing_spotify_keys)
-        if self._setup_mode and self.status == "Idle":
-            self.status = "Setup Required"
-        elif not self._setup_mode and self.status == "Setup Required":
-            self.status = "Idle"
+        if self._setup_mode and self.status == "idle":
+            self.status = "setup required"
+        elif not self._setup_mode and self.status == "setup required":
+            self.status = "idle"
         if prev_setup != self._setup_mode:
             self._update_setup_screen()
             self._update_top_bar()
@@ -1127,7 +1270,7 @@ class PlaylistInteractiveApp(App):
             style="dim",
         )
         return Group(
-            Panel(setup, title="Setup", border_style="cyan"), self._env_table(), provider_text
+            Panel(setup, title="Setup", border_style=ACCENT_BLUE), self._env_table(), provider_text
         )
 
     def _prompt_search_followup(self) -> None:
@@ -1192,7 +1335,7 @@ class PlaylistInteractiveApp(App):
             return
 
     def _apply_search_results(self, mode: str, playlist_name: Optional[str] = None) -> None:
-        if self.status != "Idle":
+        if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         track_ids = self._pending_payload.get("track_ids") or []
@@ -1213,9 +1356,28 @@ class PlaylistInteractiveApp(App):
                 self.call_from_thread(self._set_idle)
 
         self._run_started = time.monotonic()
-        self.status = "Applying search results"
+        self.status = "applying search results"
         self.run_worker(_worker, thread=True)
         self._clear_pending()
+
+    def _open_dashboard(self) -> None:
+        """Push the /dash screen; refocus the command input when it closes.
+
+        Gated on the same `status` check as `_run_command`: the dashboard
+        queries the shared sqlite connection synchronously on the app thread,
+        so it must not open while a worker (command or auto-sync) is mid-write.
+        """
+        if self.status != "idle":
+            self.append_log(Text("Another command is already running.", style="yellow"))
+            return
+
+        def _refocus(_result: object = None) -> None:
+            try:
+                self.query_one(Input).focus()
+            except Exception:
+                logger.debug("Could not refocus input after dashboard close", exc_info=True)
+
+        self.push_screen(DashboardScreen(self.cli), callback=_refocus)
 
     def _expand_search(self) -> None:
         if self._setup_mode:
@@ -1226,12 +1388,12 @@ class PlaylistInteractiveApp(App):
                 Text("No previous search to expand. Run /search <criteria> first.", style="yellow")
             )
             return
-        if self.status != "Idle":
+        if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         self.append_log(Text(f"Expanding search: {self.cli.last_search_query}", style="bold"))
         self._run_started = time.monotonic()
-        self.status = "Running /expand"
+        self.status = "running /expand"
         self.run_worker(lambda: self._execute_expand(), thread=True)
 
     def _execute_expand(self) -> None:

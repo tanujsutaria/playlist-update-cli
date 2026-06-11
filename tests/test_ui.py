@@ -472,7 +472,7 @@ class TestChips:
     def test_values_joined_with_dim_separators(self):
         text = ui.chips(["dream pop", "shoegaze"])
         assert text.plain == "dream pop · shoegaze"
-        assert style_at(text, 0) == "cyan"
+        assert style_at(text, 0) == ui.ACCENT_BLUE
 
     def test_truncation_appends_dim_count(self):
         text = ui.chips(["a", "b", "c", "d", "e"], max_items=3)
@@ -596,7 +596,7 @@ class TestChartPanel:
         assert panel.box is box.ROUNDED
         assert panel.border_style == ui.CARD_BORDER
         assert panel.title.plain == "Era fingerprint"
-        assert panel.title.style == "bold cyan"
+        assert panel.title.style == ui.SUBSECTION_STYLE
         assert panel.title_align == "left"
 
     def test_value_fmt_applied(self, reset_sinks):
@@ -792,7 +792,7 @@ class TestInsightAndCaption:
         ui.insight("Tempo spans 82–185 BPM.")
         text = captured[0]
         assert text.plain == "◆ Tempo spans 82–185 BPM."
-        assert style_at(text, 0) == "cyan"
+        assert style_at(text, 0) == ui.ACCENT_BLUE
 
     def test_caption_is_dim_italic(self, reset_sinks):
         captured = []
@@ -910,7 +910,7 @@ class TestInkPanel:
         assert panel.box is box.ROUNDED
         assert panel.border_style == ui.CARD_BORDER
         assert panel.title.plain == "The core"
-        assert panel.title.style == "bold cyan"
+        assert panel.title.style == ui.SUBSECTION_STYLE
         assert panel.title_align == "left"
         assert panel.subtitle.plain == "top quartile"
         assert panel.subtitle.style == ui.CAPTION_STYLE

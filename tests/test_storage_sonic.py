@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from storage.db import Database
-from storage.migrations import ensure_schema
+from storage.migrations import LATEST_VERSION, ensure_schema
 from storage.repos import Repositories
 from storage.sonic import SONIC_DIM, SONIC_FEATURES, build_sonic_vector
 from storage.vectors import decode_vector, encode_vector
@@ -85,7 +85,7 @@ class TestSonicSchemaAndRepo:
         }
         assert "track_sonic" in names
         # track_sonic lands in v5; ensure_schema migrates fully to the latest version.
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == LATEST_VERSION
 
     def test_upsert_get_roundtrip(self, tmp_path):
         conn = self._conn(tmp_path)

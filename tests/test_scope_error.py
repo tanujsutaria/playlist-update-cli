@@ -7,6 +7,7 @@ actionable re-auth hint (instead of a raw 403 traceback) on a scope error.
 
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,8 @@ import pytest
 import ui
 from main import PlaylistCLI
 from spotify_manager import SCOPE_REAUTH_HINT, SPOTIFY_SCOPES, scope_error_hint
+from storage.migrations import ensure_schema
+from storage.repos import Repositories
 
 
 class _FakeSpotifyException(Exception):
@@ -37,6 +40,12 @@ def _cli_with_spotify(side_effect) -> PlaylistCLI:
     cli._spotify.sp.current_user_recently_played.side_effect = side_effect
     cli._spotify.sp.current_user_top_tracks.side_effect = side_effect
     cli._spotify.get_playlist_tracks.side_effect = side_effect
+    # The cursor-based listen sync reads sync_state BEFORE the API call, so
+    # the CLI needs a real (in-memory, offline) repos — never data/tunr.db.
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    cli._repos = Repositories(conn)
     return cli
 
 

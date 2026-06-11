@@ -10,9 +10,10 @@ from .schema import (
     schema_v4,
     schema_v5,
     schema_v6,
+    schema_v7,
 )
 
-LATEST_VERSION = 6
+LATEST_VERSION = 7
 
 
 def _get_version(conn: sqlite3.Connection) -> int:
@@ -75,5 +76,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if version == 5:
         _apply_statements(conn, schema_v6())
         version = 6
+
+    if version == 6:
+        _apply_statements(conn, schema_v7())
+        version = 7
 
     _set_version(conn, LATEST_VERSION)

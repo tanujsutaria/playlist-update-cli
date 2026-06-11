@@ -47,7 +47,7 @@ def test_schema_v4_tables_and_version(tmp_path: Path) -> None:
     assert "rotation_generations" in names
     assert "generation_tracks" in names
     assert "track_sonic" in names  # v5
-    assert _schema_version(conn) == 6
+    assert _schema_version(conn) == 7
 
     # v6 additive columns: persisted search summary + per-candidate metrics.
     run_cols = {r[1] for r in conn.execute("PRAGMA table_info(search_runs);")}
@@ -57,7 +57,7 @@ def test_schema_v4_tables_and_version(tmp_path: Path) -> None:
 
     # Idempotent: re-running on a fully-migrated db is a no-op.
     ensure_schema(conn)
-    assert _schema_version(conn) == 6
+    assert _schema_version(conn) == 7
 
 
 def _write_legacy_fixtures(data_dir: Path) -> None:
