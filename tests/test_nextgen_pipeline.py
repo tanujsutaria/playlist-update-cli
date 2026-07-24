@@ -1,4 +1,13 @@
-from nextgen.pipeline import _extract_year_target
+from __future__ import annotations
+
+import pytest
+
+from nextgen import pipeline as pipeline_mod
+from nextgen.pipeline import SearchPipeline, _extract_year_target
+from nextgen.providers import ProviderRun
+from storage.db import Database
+from storage.migrations import ensure_schema
+from storage.repos import Repositories
 
 
 def test_extract_year_target_two_digit_decades_not_future():
@@ -24,3 +33,58 @@ def test_extract_year_target_bare_year():
 
 def test_extract_year_target_none_when_absent():
     assert _extract_year_target("uplifting acoustic folk") is None
+
+
+# ---------------------------------------------------------------------------
+# Progress threading: pipeline.run hands its `progress` callback straight down
+# to run_providers as `on_progress`, so provider-level updates ("providers
+# k/N") ride the same string channel as the coarse stage names.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repos(tmp_path):
+    db = Database(tmp_path / "tunr.db")
+    conn = db.connect()
+    ensure_schema(conn)
+    return Repositories(conn)
+
+
+def _empty_provider_run() -> ProviderRun:
+    return ProviderRun(results=[], providers=[], summary="", constraints={}, policy={})
+
+
+class TestRunProgressThreading:
+    def test_progress_forwarded_as_on_progress(self, repos, monkeypatch):
+        captured = {}
+
+        def fake_run_providers(query, expanded=False, on_progress=None):
+            captured["on_progress"] = on_progress
+            return _empty_provider_run()
+
+        monkeypatch.setattr(pipeline_mod, "run_providers", fake_run_providers)
+        stages = []
+
+        def _cb(stage: str) -> None:
+            stages.append(stage)
+
+        SearchPipeline(repos).run("progress threading query", progress=_cb)
+
+        assert captured["on_progress"] is _cb
+        # The coarse stage names still flow through the same callback.
+        assert "search" in stages
+        assert "extract" in stages
+
+    def test_no_progress_passes_none(self, repos, monkeypatch):
+        """Backward compat: run() without progress hands run_providers None."""
+        captured = {}
+
+        def fake_run_providers(query, expanded=False, on_progress=None):
+            captured["on_progress"] = on_progress
+            return _empty_provider_run()
+
+        monkeypatch.setattr(pipeline_mod, "run_providers", fake_run_providers)
+
+        SearchPipeline(repos).run("no progress query")
+
+        assert captured["on_progress"] is None

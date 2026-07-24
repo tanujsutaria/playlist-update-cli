@@ -22,7 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from llm_json import parse_json_output as _parse_json_output
 
@@ -998,6 +998,7 @@ def run_deep_search(
     provider: str = "auto",
     timeout_sec: int = 120,
     expanded: bool = False,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[dict], Dict[str, List[dict]], List[str], Optional[str], List[str], str, dict, dict]:
     commands = detect_search_commands()
     selected = select_commands(commands, provider)
@@ -1066,8 +1067,17 @@ def run_deep_search(
                 started = time.monotonic()
                 future = executor.submit(_run_command, label, command, payload, timeout_sec)
                 future_to_meta[future] = (label, idx, started)
+        completed_runs = 0
         for future in as_completed(future_to_meta):
             label, idx, started = future_to_meta[future]
+            # A run "completed" whether it succeeded or failed — the counter
+            # tracks liveness ("k of N provider runs done"), not success.
+            completed_runs += 1
+            if on_progress:
+                try:
+                    on_progress(f"providers {completed_runs}/{total_runs}")
+                except Exception:
+                    logger.debug("Progress callback failed; continuing.", exc_info=True)
             try:
                 results, summary = future.result(timeout=timeout_sec + 30)
             except Exception as exc:

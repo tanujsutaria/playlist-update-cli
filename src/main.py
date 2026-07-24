@@ -65,6 +65,7 @@ from ui import (
     console,
     coverage_panel,
     emit_json,
+    emit_status,
     error,
     facet_columns,
     heat_strip,
@@ -2622,7 +2623,11 @@ class PlaylistCLI:
         section("Deep Search", query_text)
 
         def _progress(stage: str) -> None:
+            # Two copies on purpose: the scrollback "Stage:" line is the
+            # durable record (it feeds /debug last), while emit_status feeds
+            # the live top-bar readout in the TUI (no-op elsewhere).
             info(f"Stage: {stage}")
+            emit_status(stage)
 
         interactive = os.getenv("TUNR_INTERACTIVE") == "1"
         status_label = "fresh"
