@@ -129,6 +129,19 @@ check_untyped_defs = false
 ignore_missing_imports = true
 exclude = ["tests/", "specs/", "proposals/", "build/", "src/setup.py"]
 
+# numpy >= 2.3.2 ships PEP 695 `type` statements in its own stubs
+# (numpy/__init__.pyi), which mypy hard-rejects as a syntax error under our
+# deliberate python_version = "3.10" analysis target ("Type statement is only
+# supported in Python 3.12 and greater" — and the error prevents ALL further
+# checking). CI installs deps unpinned, so this broke every PR's lint job on
+# 2026-07-24 while the older numpy in local venvs kept `make ci` green.
+# Skipping numpy's stubs types it as Any — consistent with the non-strict
+# baseline above. Revisit if/when python_version moves to 3.12.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
 # --- Type-check baseline -----------------------------------------------------
 # These legacy modules are not yet type-clean and are scheduled for
 # refactor/removal (see docs/REMEDIATION_PLAN.md). Drop each module from this
