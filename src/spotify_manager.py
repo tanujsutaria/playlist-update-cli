@@ -79,9 +79,19 @@ SPOTIFY_SCOPES = [
 SCOPE_REAUTH_HINT = (
     "Spotify denied this request for a missing permission (scope). The app's "
     "requested scopes changed since you last authorized, so your cached token is "
-    "stale. Re-authorize: delete .spotify_cache/.spotify_token and re-run the "
-    "command, then approve the Spotify consent screen."
+    "stale. Re-authorize: run /auth-reset --yes, then re-run the command and "
+    "approve the Spotify consent screen."
 )
+
+
+def missing_scopes(scope: Optional[str]) -> List[str]:
+    """Return the required scopes a token's space-separated scope string lacks.
+
+    ``scope`` is the ``scope`` field of a cached token info dict (or None).
+    An empty/missing scope string counts as lacking every required scope.
+    """
+    granted = set(scope.split()) if scope else set()
+    return [s for s in SPOTIFY_SCOPES if s not in granted]
 
 
 def scope_error_hint(exc: Exception) -> Optional[str]:
@@ -113,8 +123,28 @@ class _SecureCacheFileHandler(spotipy.cache_handler.CacheFileHandler):
             logger.debug("Could not chmod token cache file to 0600", exc_info=True)
 
 
+def _token_cache_path() -> Path:
+    """Absolute path of the cached-token file (the only token path in the app)."""
+    return Path(__file__).parent.parent / ".spotify_cache" / ".spotify_token"
+
+
+def reset_cached_token() -> bool:
+    """Delete the cached Spotify token file, if any.
+
+    Deletes by path only — the file's contents are never read. Returns True if
+    a token file was removed, False if none existed. The next command that
+    needs Spotify will re-open the OAuth consent flow and cache a fresh token
+    with the currently requested scopes.
+    """
+    try:
+        _token_cache_path().unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _get_cache_handler() -> spotipy.cache_handler.CacheFileHandler:
-    cache_dir = Path(__file__).parent.parent / ".spotify_cache"
+    cache_dir = _token_cache_path().parent
     cache_dir.mkdir(exist_ok=True, mode=0o700)
     # mkdir(mode=...) is a no-op when the directory already exists, so enforce
     # private permissions explicitly — a pre-existing cache dir may be 0755.
@@ -122,7 +152,7 @@ def _get_cache_handler() -> spotipy.cache_handler.CacheFileHandler:
         cache_dir.chmod(0o700)
     except OSError:
         logger.debug("Could not chmod .spotify_cache dir to 0700", exc_info=True)
-    cache_path = cache_dir / ".spotify_token"
+    cache_path = _token_cache_path()
     if cache_path.exists():
         try:
             cache_path.chmod(0o600)

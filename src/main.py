@@ -35,7 +35,9 @@ from song_store import SongStore
 from spotify_manager import (
     SpotifyManager,
     get_cached_token_info,
+    missing_scopes,
     refresh_cached_token,
+    reset_cached_token,
     scope_error_hint,
 )
 from storage.db import Database
@@ -4377,10 +4379,44 @@ class PlaylistCLI:
         if scope:
             rows.append(["Scopes", scope])
 
-        if rows:
-            key_value_table(rows)
+        # Verdict: diff the CACHED token's granted scopes against what the app
+        # requests now. This reads the cache only — it does not live-validate
+        # the token against Spotify.
+        missing = missing_scopes(scope)
+        if missing:
+            rows.append(["Verdict", f"missing scopes: {', '.join(missing)} -> run /auth-reset"])
         else:
-            info("Token metadata not available.")
+            rows.append(["Verdict", "cached token grants all required scopes"])
+
+        key_value_table(rows)
+
+    def auth_reset(self, yes: bool = False):
+        """Delete the cached Spotify token so the next command re-authorizes.
+
+        Destructive, so it acts only with ``yes=True`` (the ``--yes`` flag);
+        otherwise it prints what it would do. Also drops the in-memory Spotify
+        client — a live client keeps using its old token until expiry, which
+        would make "the next command re-opens consent" false.
+        """
+        if not yes:
+            warning(
+                "auth-reset deletes the cached Spotify token; the next Spotify "
+                "command will re-open the consent screen. Run /auth-reset --yes "
+                "to confirm."
+            )
+            return
+        removed = reset_cached_token()
+        self._spotify = None
+        if removed:
+            info(
+                "Cached Spotify token deleted. The next Spotify command will "
+                "re-open the consent screen so you can grant the current scopes."
+            )
+        else:
+            info(
+                "No cached Spotify token found — nothing to delete. The next "
+                "Spotify command will open the consent screen."
+            )
 
     def auth_refresh(self):
         """Refresh Spotify auth token if possible."""
@@ -4951,6 +4987,11 @@ def _handle_auth_refresh(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_auth_reset(cli: "PlaylistCLI", args: Any) -> int:
+    cli.auth_reset(yes=getattr(args, "yes", False))
+    return 0
+
+
 def _handle_interactive(cli: "PlaylistCLI", args: Any) -> int:
     logger.info("Already running. Use the interactive UI directly.")
     return 0
@@ -4988,6 +5029,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "list-backups": _handle_list_backups,
     "auth-status": _handle_auth_status,
     "auth-refresh": _handle_auth_refresh,
+    "auth-reset": _handle_auth_reset,
     "interactive": _handle_interactive,
 }
 

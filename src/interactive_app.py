@@ -24,7 +24,7 @@ from textual.widgets import Input, RichLog, Static
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
-from spotify_manager import get_cached_token_info
+from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
 from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
@@ -92,6 +92,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # GDPR-export import touches only the local DB/filesystem — exactly the
     # audience without API credentials yet.
     "import-history",
+    # Token-file deletion only; needs no API credentials (and is exactly what
+    # a half-configured setup may need to get unstuck).
+    "auth-reset",
     "interactive",
 }
 
@@ -104,6 +107,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         [
             "auth-status",
             "auth-refresh",
+            "auth-reset",
             "pull",
             "ingest",
             "listen-sync",
@@ -256,6 +260,11 @@ class PlaylistInteractiveApp(App):
         self._auto_sync_warned = False
         # Log the "no cached token" skip once per session, not every interval.
         self._auto_sync_token_warned = False
+        # Set after an insufficient-scope (403) failure: retrying with the same
+        # stale token can never succeed and burns the busy slot each interval,
+        # so auto-sync stands down until a cached token granting all required
+        # scopes appears (e.g. after /auth-reset --yes + re-auth).
+        self._auto_sync_scope_blocked = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -691,6 +700,16 @@ class PlaylistInteractiveApp(App):
             return
         if len(self.screen_stack) > 1:
             return  # a modal screen (/dash) is reading the shared connection
+        if self._auto_sync_scope_blocked:
+            # Stand down after an insufficient-scope failure — but self-clear
+            # the moment a cached token granting every required scope appears
+            # (the user ran /auth-reset --yes and re-authorized). A live client
+            # picks a re-cached token up automatically, so resuming is safe.
+            token_info = get_cached_token_info()
+            if token_info is None or missing_scopes(token_info.get("scope")):
+                return
+            self._auto_sync_scope_blocked = False
+            logger.info("Auto-sync resuming: cached token now grants the required scopes.")
         if getattr(self.cli, "_spotify", None) is None and not get_cached_token_info():
             # No cached token: touching cli.spotify would launch the BLOCKING
             # interactive OAuth flow from a background worker (surprise
@@ -706,7 +725,7 @@ class PlaylistInteractiveApp(App):
     def _auto_sync_worker(self) -> None:
         try:
             self.cli.sync_listen_history(quiet=True)
-        except Exception:
+        except Exception as exc:
             # A failure mid-write would leave an open transaction on the
             # long-lived shared connection — the next unrelated command's
             # commit would silently persist the partial sync. Roll it back
@@ -715,7 +734,15 @@ class PlaylistInteractiveApp(App):
                 self.cli.repos.conn.rollback()
             except Exception:
                 logger.debug("Rollback after failed auto-sync failed.", exc_info=True)
-            if not self._auto_sync_warned:
+            hint = scope_error_hint(exc)
+            if hint is not None:
+                # A stale-scope token can never succeed on retry: log the
+                # actionable hint once and stand down (the blocked flag is
+                # self-clearing — _maybe_auto_sync resumes when a cached token
+                # with the required scopes appears).
+                self._auto_sync_scope_blocked = True
+                logger.warning("Background listen-sync blocked by a missing scope. %s", hint)
+            elif not self._auto_sync_warned:
                 self._auto_sync_warned = True
                 logger.warning(
                     "Background listen-sync failed; retrying quietly each interval.",
