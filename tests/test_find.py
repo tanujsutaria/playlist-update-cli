@@ -180,6 +180,15 @@ class TestFindDispatch:
         assert "Aligned" in out and "Offbeat" in out
         assert "Preview only" in out  # no --to given
 
+    def test_find_persists_ranked_order_for_results_browser(self, tmp_path, capsys):
+        """/results mirrors what /find rendered: the taste-ranked order is
+        persisted on the cli (a fresh /search clears it)."""
+        cli = _cli(_seed(tmp_path))
+        _mock_search(cli)
+        rc = dispatch_command(cli, "find", self._args(taste_weight=1.0))
+        assert rc == 0
+        assert [r["track_id"] for r in cli.last_find_ranked] == ["r|||aligned", "r|||offbeat"]
+
     def test_json_payload_is_taste_ranked(self, tmp_path, capsys):
         cli = _cli(_seed(tmp_path))
         _mock_search(cli)
