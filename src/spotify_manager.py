@@ -11,6 +11,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from tqdm import tqdm
 
 from models import Song
+from ui import emit_status, info, warning
 
 logger = logging.getLogger(__name__)
 
@@ -207,11 +208,40 @@ def refresh_cached_token() -> Optional[Dict[str, Any]]:
         return None
 
 
+CONSENT_WAIT_STAGE = "waiting for Spotify consent"
+
+
+def _announce_consent_wait() -> None:
+    """Surface an imminent interactive OAuth wait in-app, on both channels.
+
+    spotipy's interactive flow opens a browser and then BLOCKS the calling
+    thread waiting for the redirect callback — with no output of its own, the
+    TUI looks frozen (observed live: /pull hung silently on a redirect_uri
+    mismatch). Say what we are waiting for, and on which redirect URI, so a
+    browser-side failure is diagnosable from inside the app. Routes through
+    the ui module's process-global sinks only — no Textual import here.
+    """
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI") or "(SPOTIFY_REDIRECT_URI is not set)"
+    warning(
+        "Waiting for Spotify consent in your browser — approve access there. "
+        f"Listening on {redirect_uri}. If the browser shows an error or "
+        "nothing opened, press Ctrl+C here and run /auth-status."
+    )
+    emit_status(CONSENT_WAIT_STAGE)
+
+
 class SpotifyManager:
     """Manages Spotify playlist operations"""
 
     def __init__(self):
         auth_manager = _get_auth_manager(open_browser=True)
+
+        # No valid cached token means the first API call below will enter the
+        # interactive OAuth flow (browser + blocking wait on the redirect).
+        # Announce it FIRST — a valid cached token skips all consent messaging.
+        interactive_flow_imminent = get_cached_token_info() is None
+        if interactive_flow_imminent:
+            _announce_consent_wait()
 
         # Initialize Spotify client with auth manager
         self.sp = spotipy.Spotify(auth_manager=auth_manager)
@@ -222,7 +252,13 @@ class SpotifyManager:
             logger.debug("Successfully authenticated with Spotify")
         except Exception as e:
             logger.error(f"Failed to authenticate: {e}")
+            if interactive_flow_imminent:
+                emit_status(None)  # never leave a stale "waiting" stage behind
             raise
+
+        if interactive_flow_imminent:
+            info("Spotify authorization complete — token cached for future commands.")
+            emit_status(None)
 
         self.playlists: Dict[str, str] = {}
         self._load_playlists()
