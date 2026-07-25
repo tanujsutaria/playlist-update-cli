@@ -7,24 +7,28 @@ import os
 import shlex
 import threading
 import time
+from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, NamedTuple, Optional, Tuple
 
 from rich import box
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container
 from textual.reactive import reactive
+from textual.screen import Screen
 from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
+from completions import TunrSuggester
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
-from spotify_manager import get_cached_token_info
+from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
 from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
@@ -93,6 +97,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # GDPR-export import touches only the local DB/filesystem — exactly the
     # audience without API credentials yet.
     "import-history",
+    # Token-file deletion only; needs no API credentials (and is exactly what
+    # a half-configured setup may need to get unstuck).
+    "auth-reset",
     "interactive",
 }
 
@@ -105,6 +112,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         [
             "auth-status",
             "auth-refresh",
+            "auth-reset",
             "pull",
             "ingest",
             "listen-sync",
@@ -154,6 +162,73 @@ META_COMMAND_HELP = {
     "quit": "Exit the app",
     "exit": "Exit the app",
 }
+
+
+class PaletteCommand(NamedTuple):
+    """One tunr command as surfaced in the ctrl+p command palette."""
+
+    name: str
+    help: str
+    needs_argument: bool
+
+
+class TunrCommandProvider(Provider):
+    """Command-palette provider for tunr slash commands (ctrl+p).
+
+    Fuzzy-searches every advertised registry command plus the TUI meta
+    commands, each with its one-line help. Selecting an arg-taking command
+    preloads ``/cmd `` into the input for the user to finish; a provably
+    no-arg command is submitted through the exact same path (and gates) as
+    typed input.
+    """
+
+    def _palette_app(self) -> "Optional[PlaylistInteractiveApp]":
+        """The tunr app, or None when the palette should offer nothing.
+
+        Offers nothing when the palette was opened over a pushed screen
+        (e.g. /dash): the command input is not reachable there, and running
+        a command would race the modal screen's synchronous reads of the
+        shared sqlite connection.
+        """
+        app = self.app
+        if not isinstance(app, PlaylistInteractiveApp):
+            return None
+        stack = app.screen_stack
+        if stack and self.screen is not stack[0]:
+            return None
+        return app
+
+    @staticmethod
+    def _callback(app: "PlaylistInteractiveApp", entry: PaletteCommand) -> Callable[[], None]:
+        """Pick the palette action for one command (insert vs submit)."""
+        if entry.needs_argument:
+            return partial(app._palette_insert, entry.name)
+        return partial(app._palette_submit, entry.name)
+
+    async def search(self, query: str) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        matcher = self.matcher(query)
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            score = matcher.match(display)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(display),
+                    self._callback(app, entry),
+                    text=display,
+                    help=entry.help,
+                )
+
+    async def discover(self) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            yield DiscoveryHit(display, self._callback(app, entry), help=entry.help)
 
 
 class UILogHandler(logging.Handler):
@@ -236,6 +311,10 @@ class PlaylistInteractiveApp(App):
         ("ctrl+l", "clear_log", "Clear output"),
     ]
 
+    # ctrl+p command palette: the stock providers plus the tunr command
+    # inventory (see TunrCommandProvider above).
+    COMMANDS = App.COMMANDS | {TunrCommandProvider}
+
     # Status sentinels are lowercase on purpose — the top bar renders them
     # verbatim, and the chrome follows TE's lowercase convention.
     status = reactive("idle")
@@ -247,6 +326,7 @@ class PlaylistInteractiveApp(App):
         self.parser = parser
         self._history_path = self._resolve_history_path()
         self._history: List[str] = self._load_history()
+        self._suggester = self._build_suggester()
         self._history_index: Optional[int] = None
         self._history_prefix: str = ""
         self._navigating = False
@@ -273,6 +353,11 @@ class PlaylistInteractiveApp(App):
         self._auto_sync_warned = False
         # Log the "no cached token" skip once per session, not every interval.
         self._auto_sync_token_warned = False
+        # Set after an insufficient-scope (403) failure: retrying with the same
+        # stale token can never succeed and burns the busy slot each interval,
+        # so auto-sync stands down until a cached token granting all required
+        # scopes appears (e.g. after /auth-reset --yes + re-auth).
+        self._auto_sync_scope_blocked = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -280,7 +365,11 @@ class PlaylistInteractiveApp(App):
             yield Static(id="search_preview")
             yield RichLog(id="output", highlight=False, markup=False, wrap=True, min_width=20)
             yield Static(id="setup_screen")
-        yield Input(placeholder="type /help for commands", id="command_input")
+        yield Input(
+            placeholder="type /help for commands",
+            id="command_input",
+            suggester=self._suggester,
+        )
 
     def on_mount(self) -> None:
         # Theme plumbing first: register the OP-1 palette and switch to it so
@@ -370,6 +459,18 @@ class PlaylistInteractiveApp(App):
         if self._pending_action and not raw.startswith("/"):
             self.append_log(Text(f"> {raw}", style="bold"))
             self._handle_pending_input(raw)
+            return
+        self._submit_text(raw)
+
+    def _submit_text(self, raw: str) -> None:
+        """Submit command text exactly as if it had been typed and entered.
+
+        Single choke point shared by the input widget and the command
+        palette: the setup-mode gate in _handle_command and the idle gate in
+        _run_command both apply downstream, unchanged.
+        """
+        raw = raw.strip()
+        if not raw:
             return
         if self._pending_action and raw.startswith("/"):
             # A slash command cancels the armed wizard so stray text typed
@@ -748,6 +849,16 @@ class PlaylistInteractiveApp(App):
             return
         if len(self.screen_stack) > 1:
             return  # a modal screen (/dash) is reading the shared connection
+        if self._auto_sync_scope_blocked:
+            # Stand down after an insufficient-scope failure — but self-clear
+            # the moment a cached token granting every required scope appears
+            # (the user ran /auth-reset --yes and re-authorized). A live client
+            # picks a re-cached token up automatically, so resuming is safe.
+            token_info = get_cached_token_info()
+            if token_info is None or missing_scopes(token_info.get("scope")):
+                return
+            self._auto_sync_scope_blocked = False
+            logger.info("Auto-sync resuming: cached token now grants the required scopes.")
         if getattr(self.cli, "_spotify", None) is None and not get_cached_token_info():
             # No cached token: touching cli.spotify would launch the BLOCKING
             # interactive OAuth flow from a background worker (surprise
@@ -763,7 +874,7 @@ class PlaylistInteractiveApp(App):
     def _auto_sync_worker(self) -> None:
         try:
             self.cli.sync_listen_history(quiet=True)
-        except Exception:
+        except Exception as exc:
             # A failure mid-write would leave an open transaction on the
             # long-lived shared connection — the next unrelated command's
             # commit would silently persist the partial sync. Roll it back
@@ -772,7 +883,15 @@ class PlaylistInteractiveApp(App):
                 self.cli.repos.conn.rollback()
             except Exception:
                 logger.debug("Rollback after failed auto-sync failed.", exc_info=True)
-            if not self._auto_sync_warned:
+            hint = scope_error_hint(exc)
+            if hint is not None:
+                # A stale-scope token can never succeed on retry: log the
+                # actionable hint once and stand down (the blocked flag is
+                # self-clearing — _maybe_auto_sync resumes when a cached token
+                # with the required scopes appears).
+                self._auto_sync_scope_blocked = True
+                logger.warning("Background listen-sync blocked by a missing scope. %s", hint)
+            elif not self._auto_sync_warned:
                 self._auto_sync_warned = True
                 logger.warning(
                     "Background listen-sync failed; retrying quietly each interval.",
@@ -884,11 +1003,109 @@ class PlaylistInteractiveApp(App):
     def _meta_command_names() -> List[str]:
         return [name for name in META_COMMAND_HELP if name != "?"]
 
+    def _build_suggester(self) -> TunrSuggester:
+        """Assemble the ghost-text suggester from the parser + meta inventory.
+
+        History is handed over as a provider callable because
+        ``_append_history`` REBINDS ``self._history`` on truncation. Note that
+        history navigation (`_set_input_value`) also writes recalled lines
+        into the Input, which triggers the suggester on them — deliberate:
+        a recalled line may show a longer, more recent line as ghost text,
+        but never suggests itself (pinned by tests).
+        """
+        command_names = [name for name, _ in self._command_summaries()]
+        flag_map = {}
+        for name in command_names:
+            sub = self._find_subparser(name)
+            if sub is not None:
+                flag_map[name] = [
+                    option for action in sub._actions for option in action.option_strings
+                ]
+        return TunrSuggester(
+            commands=command_names + self._meta_command_names(),
+            flags=flag_map,
+            history=lambda: self._history,
+        )
+
     def _find_subparser(self, name: str) -> Optional[argparse.ArgumentParser]:
         for action in self.parser._actions:
             if isinstance(action, argparse._SubParsersAction):
                 return action.choices.get(name)
         return None
+
+    # ------------------------------------------------------------------
+    # Command palette (ctrl+p)
+    # ------------------------------------------------------------------
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Stock system commands minus the theme switcher.
+
+        The default "Theme" entry would knock the session off the OP-1
+        palette that the App CSS and the Rich-side twin in ui.py both assume.
+        Filter by title so this stays correct regardless of the order the
+        upstream commands are yielded in.
+        """
+        for command in super().get_system_commands(screen):
+            if "theme" in command.title.lower():
+                continue
+            yield command
+
+    @staticmethod
+    def _subparser_needs_argument(sub: argparse.ArgumentParser) -> bool:
+        """True when a command takes ANY positional or required option.
+
+        Safest-default classification for the palette: even an optional
+        positional (nargs='?') counts, because it is often effectively
+        required (e.g. /backup <name>). Only provably no-arg commands are
+        submitted directly; everything else is preloaded into the input.
+        """
+        for action in sub._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if not action.option_strings:
+                return True  # positional, even an optional one
+            if action.required:
+                return True
+        return False
+
+    def _palette_commands(self) -> List[PaletteCommand]:
+        """Palette inventory: advertised registry commands + meta commands."""
+        commands: List[PaletteCommand] = []
+        seen = set()
+        for name, help_text in self._command_summaries():
+            seen.add(name)
+            sub = self._find_subparser(name)
+            needs_argument = sub is None or self._subparser_needs_argument(sub)
+            commands.append(PaletteCommand(name, help_text, needs_argument))
+        for name in self._meta_command_names():
+            if name in seen:
+                continue
+            # Meta commands are all callable with no arguments.
+            commands.append(PaletteCommand(name, META_COMMAND_HELP[name], False))
+        return commands
+
+    def _palette_submit(self, name: str) -> None:
+        """Palette callback for a provably no-arg command.
+
+        Submits through _submit_text so the setup-mode and busy gates apply
+        exactly as they do for typed input.
+        """
+        self._submit_text(f"/{name}")
+
+    def _palette_insert(self, name: str) -> None:
+        """Palette callback for an arg-taking command.
+
+        Preloads ``/name `` into the input and focuses it so the user can
+        finish the arguments; nothing is submitted or dispatched.
+        """
+        self._write_input(f"/{name} ")
+        self._focus_input()
+
+    def _focus_input(self) -> None:
+        try:
+            self.query_one(Input).focus()
+        except Exception:
+            logger.debug("Could not focus the command input", exc_info=True)
 
     def _show_command_help(self, raw_name: str) -> None:
         name = raw_name.strip().lstrip("/").strip()

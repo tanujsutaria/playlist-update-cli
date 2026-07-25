@@ -431,6 +431,23 @@ class TestDispatchAuthRefresh:
         cli.auth_refresh.assert_called_once()
 
 
+# ---- auth-reset ----
+class TestDispatchAuthReset:
+    def test_auth_reset_routes_yes_flag(self, cli):
+        cli.auth_reset = MagicMock()
+        args = _make_args(yes=True)
+        rc = dispatch_command(cli, "auth-reset", args)
+        assert rc == 0
+        cli.auth_reset.assert_called_once_with(yes=True)
+
+    def test_auth_reset_defaults_to_unconfirmed(self, cli):
+        cli.auth_reset = MagicMock()
+        args = _make_args()
+        rc = dispatch_command(cli, "auth-reset", args)
+        assert rc == 0
+        cli.auth_reset.assert_called_once_with(yes=False)
+
+
 # ---- interactive ----
 class TestDispatchInteractive:
     def test_interactive_does_not_crash(self, cli):

@@ -55,6 +55,18 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 
 ## Usage
 
+### Inline autocomplete
+As you type, the input shows grey ghost text completing the command name
+(`/up` -> `/update`), then the current command's flags (`--fr` -> `--fresh-days`),
+falling back to your most recent matching history line. Press Right (with the
+cursor at the end) to accept the suggestion. Mistyped flags also get a
+did-you-mean hint (`unrecognized --cout — did you mean --count?`).
+### Command palette (ctrl+p)
+Press `ctrl+p` to open a fuzzy-searchable palette of every slash command with its
+one-line help. Picking a command that takes arguments preloads `/cmd ` into the
+input for you to finish; commands with no arguments run immediately. The stock
+theme switcher is removed from the palette so the OP-1 theme stays put.
+
 ### Output styling
 The UI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 
@@ -159,9 +171,17 @@ To broaden the last search (expanded source policy):
 ```bash
 /auth-status
 /auth-refresh
+/auth-reset --yes
 /clean
 /clean --dry-run
 ```
+
+`/auth-status` diffs the cached token's scopes against what the app needs and
+prints a verdict (e.g. `missing scopes: user-read-recently-played -> run
+/auth-reset`). `/auth-reset --yes` deletes only the cached token file so the
+next Spotify command re-opens the consent screen; bare `/auth-reset` just
+explains what it would do. Background listen-sync stops retrying after a
+missing-scope (403) failure and resumes automatically once you re-authorize.
 
 ### Help and exit
 ```bash

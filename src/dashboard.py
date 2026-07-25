@@ -401,9 +401,7 @@ class DashboardScreen(Screen[None]):
     EMPTY_MESSAGES: ClassVar[Dict[str, str]] = {
         "taste": "no enriched context yet — run /enrich",
         "stats": "library is empty — run /ingest or /search to begin",
-        "plays": (
-            "no plays yet — run /listen-sync (delete .spotify_cache token + re-auth if it 403s)"
-        ),
+        "plays": "no plays yet — run /listen-sync (if it 403s: /auth-reset --yes, then re-auth)",
     }
 
     DEFAULT_CSS = """
