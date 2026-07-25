@@ -1124,6 +1124,102 @@ class TestQuitExcludedFromHistory:
 
 
 # ============================================================================
+# Ghost-text autocomplete (suggester wiring + Pilot end-to-end)
+# ============================================================================
+
+
+class TestSuggesterWiring:
+    def test_compose_input_carries_the_suggester(self, monkeypatch):
+        from textual.widgets import Input
+
+        from completions import TunrSuggester
+
+        app = _make_app(monkeypatch)
+        widgets = _compose_widgets(app)
+        command_input = next(w for w in widgets if isinstance(w, Input))
+        assert command_input.suggester is app._suggester
+        assert isinstance(app._suggester, TunrSuggester)
+
+    def test_inventory_covers_subcommands_meta_and_flags(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        suggester = app._suggester
+        assert "update" in suggester._commands
+        assert "help" in suggester._commands  # meta command
+        assert "interactive" not in suggester._commands  # hidden in the UI
+        assert "--fresh-days" in suggester._flags["update"]
+        assert "--playlist" in suggester._flags["stats"]
+
+    def test_history_provider_follows_list_rebind(self, monkeypatch):
+        """_append_history REBINDS self._history on truncation; the suggester
+        must keep seeing the live list, not a stale captured reference."""
+        app = _make_app(monkeypatch)
+        app._history = ["/stats --json"]  # rebind, like the truncation path
+        assert app._suggester._history() == ["/stats --json"]
+
+    def test_recalled_history_line_gets_no_self_suggestion(self, monkeypatch):
+        """History navigation writes recalled lines into the Input, which
+        triggers the suggester. Deliberate: the recalled line itself is never
+        suggested (only a longer, more recent line may ghost past it)."""
+        import asyncio
+
+        app = _make_history_app(monkeypatch, ["/stats"])
+        app._history_prev()  # recalls "/stats" into the input
+        recalled = app.input_value
+        try:
+            suggestion = asyncio.run(app._suggester.get_suggestion(recalled))
+        finally:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        assert suggestion is None
+
+
+class TestSuggesterPilot:
+    def test_typing_ghosts_and_right_arrow_accepts(self, monkeypatch):
+        import asyncio
+        import logging
+
+        from textual.widgets import Input
+
+        import ui
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        # Belt and braces: disable the auto-sync timer so the Pilot app never
+        # schedules background work during the test.
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")
+        app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+
+        # on_mount's configure_logging replaces the root handlers AND raises
+        # the root level to INFO; restore both afterwards so later tests log
+        # normally (a leaked INFO level makes caplog-based tests see records
+        # they never see on a clean run).
+        root_logger = logging.getLogger()
+        saved_handlers = list(root_logger.handlers)
+        saved_level = root_logger.level
+
+        async def drive():
+            async with app.run_test(size=(90, 30)) as pilot:
+                command_input = app.query_one(Input)
+                await pilot.press(*"/up")
+                await pilot.pause()  # let the suggester worker deliver
+                assert command_input._suggestion == "/update"
+                await pilot.press("right")  # cursor at end -> accept ghost
+                assert command_input.value == "/update"
+
+        try:
+            asyncio.run(drive())
+        finally:
+            # py3.9: restore a current event loop after asyncio.run (repo
+            # pattern, see tests/test_dashboard.py TestPilotSmoke).
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            root_logger.handlers = saved_handlers
+            root_logger.setLevel(saved_level)
+            # on_mount installed the app as the global ui sinks; Textual 8
+            # never fires on_shutdown under run_test, so drop them here or
+            # every later ui-emitting test talks to a dead app.
+            ui.set_output_sink(None)
+            ui.set_preview_sink(None)
+
+
 # ctrl+p command palette: inventory, classification, callbacks, curation
 # ============================================================================
 

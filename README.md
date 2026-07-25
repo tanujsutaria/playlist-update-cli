@@ -55,6 +55,12 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 
 ## Usage
 
+### Inline autocomplete
+As you type, the input shows grey ghost text completing the command name
+(`/up` -> `/update`), then the current command's flags (`--fr` -> `--fresh-days`),
+falling back to your most recent matching history line. Press Right (with the
+cursor at the end) to accept the suggestion. Mistyped flags also get a
+did-you-mean hint (`unrecognized --cout — did you mean --count?`).
 ### Command palette (ctrl+p)
 Press `ctrl+p` to open a fuzzy-searchable palette of every slash command with its
 one-line help. Picking a command that takes arguments preloads `/cmd ` into the

@@ -25,6 +25,7 @@ from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
+from completions import TunrSuggester
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
 from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
@@ -314,6 +315,7 @@ class PlaylistInteractiveApp(App):
         self.parser = parser
         self._history_path = self._resolve_history_path()
         self._history: List[str] = self._load_history()
+        self._suggester = self._build_suggester()
         self._history_index: Optional[int] = None
         self._history_prefix: str = ""
         self._navigating = False
@@ -346,7 +348,11 @@ class PlaylistInteractiveApp(App):
             yield Static(id="search_preview")
             yield RichLog(id="output", highlight=False, markup=False, wrap=True, min_width=20)
             yield Static(id="setup_screen")
-        yield Input(placeholder="type /help for commands", id="command_input")
+        yield Input(
+            placeholder="type /help for commands",
+            id="command_input",
+            suggester=self._suggester,
+        )
 
     def on_mount(self) -> None:
         # Theme plumbing first: register the OP-1 palette and switch to it so
@@ -939,6 +945,30 @@ class PlaylistInteractiveApp(App):
     @staticmethod
     def _meta_command_names() -> List[str]:
         return [name for name in META_COMMAND_HELP if name != "?"]
+
+    def _build_suggester(self) -> TunrSuggester:
+        """Assemble the ghost-text suggester from the parser + meta inventory.
+
+        History is handed over as a provider callable because
+        ``_append_history`` REBINDS ``self._history`` on truncation. Note that
+        history navigation (`_set_input_value`) also writes recalled lines
+        into the Input, which triggers the suggester on them — deliberate:
+        a recalled line may show a longer, more recent line as ghost text,
+        but never suggests itself (pinned by tests).
+        """
+        command_names = [name for name, _ in self._command_summaries()]
+        flag_map = {}
+        for name in command_names:
+            sub = self._find_subparser(name)
+            if sub is not None:
+                flag_map[name] = [
+                    option for action in sub._actions for option in action.option_strings
+                ]
+        return TunrSuggester(
+            commands=command_names + self._meta_command_names(),
+            flags=flag_map,
+            history=lambda: self._history,
+        )
 
     def _find_subparser(self, name: str) -> Optional[argparse.ArgumentParser]:
         for action in self.parser._actions:
