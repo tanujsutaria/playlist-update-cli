@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+import spotify_manager
 import ui
 from arg_parse import parse_tokens
 from main import PlaylistCLI, dispatch_command
@@ -56,7 +57,7 @@ class FakeSp:
     def current_user_saved_tracks(self, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
         self.saved_pages_served += 1
         items = self._owner.liked_items[offset : offset + limit]
-        return {"items": items}
+        return {"items": items, "total": len(self._owner.liked_items)}
 
 
 class FakeSpotify:
@@ -98,16 +99,41 @@ class FakeSpotify:
     def current_user_id(self) -> Optional[str]:
         return self.user_id
 
-    def get_playlist_items_full(self, playlist_id: str) -> List[Dict[str, Any]]:
+    def get_playlist_items_full(
+        self,
+        playlist_id: str,
+        on_page: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         self.items_full_calls.append(playlist_id)
-        return list(self.playlist_items.get(playlist_id, []))
+        items = list(self.playlist_items.get(playlist_id, []))
+        # Mirror the real client's paging contract: on_page fires once per
+        # (simulated 100-item) page with (page_number, items_so_far).
+        if on_page is not None:
+            pages = max(1, -(-len(items) // 100))
+            for page_no in range(1, pages + 1):
+                on_page(page_no, min(page_no * 100, len(items)))
+        return items
 
 
 @pytest.fixture(autouse=True)
 def _no_sink():
+    """Reset every process-global sink these tests can touch (see test_ui.py's
+    reset_sinks): output + status sinks and the spotify_manager retry-notice
+    callback, so nothing leaks across test ordering."""
     ui.set_output_sink(None)
+    ui.set_status_sink(None)
+    spotify_manager.set_retry_status_callback(None)
     yield
     ui.set_output_sink(None)
+    ui.set_status_sink(None)
+    spotify_manager.set_retry_status_callback(None)
+
+
+@pytest.fixture
+def status_sink() -> List[str]:
+    seen: List[str] = []
+    ui.set_status_sink(lambda stage: seen.append(stage) if stage is not None else None)
+    return seen
 
 
 @pytest.fixture
@@ -413,7 +439,7 @@ class TestPullErrors:
         _seed_remote(cli)
         real_items_full = cli.spotify.get_playlist_items_full
 
-        def _flaky(playlist_id):
+        def _flaky(playlist_id, on_page=None):
             cli.spotify.items_full_calls.append(playlist_id)
             raise RuntimeError("page 2 fetch failed")
 
@@ -432,6 +458,147 @@ class TestPullErrors:
         stored = cli.repos.spotify_playlists.get("pl-1")
         assert stored is not None
         assert stored["snapshot_id"] == "snap-1"
+
+
+class TestPullProgress:
+    """Live progress for /pull: top-bar stage strings via the ui status sink,
+    throttled scrollback lines, visible rate-limit backoff — no per-item spam."""
+
+    def test_status_stages_emitted_in_order(self, cli, status_sink):
+        _seed_remote(cli)
+        rc = _run(cli, "pull")
+        assert rc == 0
+
+        # Playlist-list paging, per-playlist counts, per-playlist track fetch,
+        # then liked paging — in that order.
+        assert "playlists p1" in status_sink
+        assert "playlists 1/2" in status_sink
+        assert "playlists 2/2" in status_sink
+        assert any(s.startswith("tracks: Beach Mix") for s in status_sink)
+        assert any(s.startswith("tracks: Algo Mix") for s in status_sink)
+        assert any(s.startswith("liked ") for s in status_sink)
+
+        first_playlist = status_sink.index("playlists 1/2")
+        first_tracks = min(i for i, s in enumerate(status_sink) if s.startswith("tracks: "))
+        first_liked = min(i for i, s in enumerate(status_sink) if s.startswith("liked "))
+        assert first_playlist < first_tracks < first_liked
+
+    def test_liked_status_shows_running_count_over_total(self, cli, status_sink):
+        cli.spotify.liked_items = [
+            {
+                "added_at": "2026-06-01T00:00:00Z",
+                "track": _spotify_track(f"Song {i}", f"Artist {i}"),
+            }
+            for i in range(130)
+        ]
+        _run(cli, "pull --liked-only")
+        assert "liked 50/130" in status_sink
+        assert "liked 100/130" in status_sink
+
+    def test_playlist_track_paging_reaches_status_bar(self, cli, status_sink):
+        # 250 tracks -> 3 simulated pages from the fake's on_page contract.
+        cli.spotify.add_playlist(
+            "pl-big",
+            "Big Mix",
+            "snap-big",
+            [
+                _playlist_item(f"Song {i}", f"Artist {i}", "2026-06-01T00:00:00Z")
+                for i in range(250)
+            ],
+        )
+        _run(cli, "pull --playlists-only")
+        assert "tracks: Big Mix p2" in status_sink
+        assert "tracks: Big Mix p3" in status_sink
+
+    def test_scrollback_progress_is_throttled_not_per_item(self, cli, capsys):
+        # 130 liked tracks across 3 pages must produce exactly ONE throttled
+        # "liked:" progress line (the 100-item crossing), never one per item.
+        cli.spotify.liked_items = [
+            {
+                "added_at": "2026-06-01T00:00:00Z",
+                "track": _spotify_track(f"Song {i}", f"Artist {i}"),
+            }
+            for i in range(130)
+        ]
+        _run(cli, "pull --liked-only")
+        out = capsys.readouterr().out
+        assert out.count("liked:") == 1
+        # Sanity: the whole scrollback stays bounded (summary + a few lines),
+        # nowhere near one line per track.
+        assert len(out.splitlines()) < 30
+
+    def test_status_never_emitted_per_item(self, cli, status_sink):
+        cli.spotify.liked_items = [
+            {
+                "added_at": "2026-06-01T00:00:00Z",
+                "track": _spotify_track(f"Song {i}", f"Artist {i}"),
+            }
+            for i in range(130)
+        ]
+        _run(cli, "pull --liked-only")
+        # 3 pages -> a handful of stage strings, not 130.
+        assert len(status_sink) <= 6
+
+    def test_final_summary_unchanged(self, cli, capsys):
+        _seed_remote(cli)
+        rc = _run(cli, "pull")
+        assert rc == 0
+        out = capsys.readouterr().out
+        for label in (
+            "Playlists synced",
+            "Skipped (unchanged)",
+            "Removed (unfollowed)",
+            "Memberships written",
+            "Liked tracks",
+            "Liked pruned",
+        ):
+            assert label in out
+        assert "mirror is read-only; local edits are not pushed" in out
+
+    def test_rate_limit_backoff_reaches_status_sink(self, status_sink):
+        """The retry helper surfaces '429 -> sleeping' through the callback /pull
+        installs, instead of only a logger.warning nobody sees in the TUI."""
+
+        class _RateLimited(Exception):
+            http_status = 429
+
+        calls = {"n": 0}
+
+        def _flaky_once():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _RateLimited("429 rate limited")
+            return "ok"
+
+        spotify_manager.set_retry_status_callback(ui.emit_status)
+        result = spotify_manager._retry_with_backoff(_flaky_once, base_delay=0.0)
+        assert result == "ok"
+        assert any(s.startswith("rate limited — retrying in") for s in status_sink)
+
+    def test_pull_installs_and_uninstalls_retry_callback(self, cli):
+        _seed_remote(cli)
+        seen_during: List[Any] = []
+        real_liked = cli.spotify.sp.current_user_saved_tracks
+
+        def _spy(limit=50, offset=0):
+            seen_during.append(spotify_manager._retry_status_callback)
+            return real_liked(limit=limit, offset=offset)
+
+        cli.spotify.sp.current_user_saved_tracks = _spy
+        cli.pull_spotify_library(liked_only=True)
+        # Installed while the pull's Spotify calls run…
+        assert seen_during and all(cb is not None for cb in seen_during)
+        # …and uninstalled afterwards so other commands stay logger-only.
+        assert spotify_manager._retry_status_callback is None
+
+    def test_pull_error_still_uninstalls_retry_callback(self, cli):
+        def _boom(limit=50):
+            raise RuntimeError("network down")
+
+        cli.spotify.sp.current_user_playlists = _boom
+        rc = _run(cli, "pull")
+        assert rc == 1
+        assert spotify_manager._retry_status_callback is None
 
 
 class TestPullParsing:
