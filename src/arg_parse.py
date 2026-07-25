@@ -496,6 +496,15 @@ def setup_parsers(
     # Auth commands
     subparsers.add_parser("auth-status", help="Show Spotify auth token status")
     subparsers.add_parser("auth-refresh", help="Refresh Spotify auth token if possible")
+    auth_reset_parser = subparsers.add_parser(
+        "auth-reset",
+        help="Delete the cached Spotify token so the next command re-opens consent",
+    )
+    auth_reset_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the reset (without this flag nothing is deleted)",
+    )
 
     # Interactive UI
     subparsers.add_parser("interactive", help="Launch the interactive UI")
@@ -513,6 +522,48 @@ def parse_args() -> Tuple[str, Any]:
         return None, None
 
     return args.command, args
+
+
+def _subcommand_option_strings(parser: argparse.ArgumentParser, name: str) -> list[str]:
+    """Option strings (--count, --dry-run, ...) of the named subcommand."""
+    sub_action = next(
+        (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None
+    )
+    if sub_action is None:
+        return []
+    sub = sub_action.choices.get(name)
+    if sub is None:
+        return []
+    return [option for action in sub._actions for option in action.option_strings]
+
+
+def _flag_did_you_mean(tokens: Sequence[str]) -> list[str]:
+    """Did-you-mean hints for mistyped flags ("--cout" -> "--count").
+
+    Detection goes through ``parse_known_args`` extras — NEVER string-match
+    argparse's error wording (it varies across the py3.9-3.12 matrix). Any
+    other parse failure (missing positional, bad int, ...) makes
+    ``parse_known_args`` raise too, and then there is no flag to correct.
+    """
+    if not tokens:
+        return []
+    parser = setup_parsers(exit_on_error=False, parser_class=_NoExitArgumentParser)
+    try:
+        _, extras = parser.parse_known_args(list(tokens))
+    except (argparse.ArgumentError, _HelpRequested):
+        return []
+    option_strings = _subcommand_option_strings(parser, tokens[0])
+    if not option_strings:
+        return []
+    hints = []
+    for extra in extras:
+        if not extra.startswith("-"):
+            continue
+        flag = extra.split("=", 1)[0]
+        matches = difflib.get_close_matches(flag, option_strings, n=1, cutoff=0.6)
+        if matches:
+            hints.append(f"Unrecognized {flag} — did you mean {matches[0]}?")
+    return hints
 
 
 def parse_tokens(
@@ -546,7 +597,11 @@ def parse_tokens(
     except _HelpRequested as exc:
         return None, None, HelpText(exc.text)
     except argparse.ArgumentError as exc:
-        return None, None, str(exc)
+        message = str(exc)
+        hints = _flag_did_you_mean(tokens)
+        if hints:
+            message = "\n".join([message, *hints])
+        return None, None, message
 
     if not getattr(args, "command", None):
         return None, None, "No command provided."

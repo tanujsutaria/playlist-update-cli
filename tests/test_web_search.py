@@ -282,3 +282,85 @@ def test_run_command_retry_depth_is_bounded(monkeypatch):
     assert summary == ""
     # Initial call + at most _MAX_RUN_DEPTH retries before the guard trips.
     assert calls["count"] <= _MAX_RUN_DEPTH + 1
+
+
+# ---------------------------------------------------------------------------
+# run_deep_search on_progress: "providers k/N" liveness, fired per completed
+# run (success OR failure), optional and fully backward-compatible.
+# ---------------------------------------------------------------------------
+
+
+def _patch_single_provider(monkeypatch, parallel=2, fail=False):
+    """One fake provider, `parallel` runs, no subprocess/network."""
+    import web_search
+
+    monkeypatch.setenv("WEB_SEARCH_PARALLEL_PER_PROVIDER", str(parallel))
+    monkeypatch.delenv("WEB_SEARCH_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("WEB_SEARCH_MODEL", raising=False)
+    monkeypatch.setattr(
+        web_search, "detect_search_commands", lambda env=None: {"claude": "claude --json"}
+    )
+
+    def _fake_run(label, command, payload, timeout_sec):
+        if fail:
+            raise RuntimeError("boom")
+        return ([{"song": "S", "artist": "A", "sources": []}], "summary")
+
+    monkeypatch.setattr(web_search, "_run_command", _fake_run)
+
+
+def test_run_deep_search_emits_providers_progress(monkeypatch):
+    from web_search import run_deep_search
+
+    _patch_single_provider(monkeypatch, parallel=2)
+    seen = []
+
+    results, _, providers, error, _, _, _, _ = run_deep_search(
+        "some query", on_progress=seen.append
+    )
+
+    assert error is None
+    assert results
+    assert providers == ["claude"]
+    # Numbered by completion order, so the sequence is deterministic even
+    # though the two runs race on real threads.
+    assert seen == ["providers 1/2", "providers 2/2"]
+
+
+def test_run_deep_search_without_on_progress_is_backward_compatible(monkeypatch):
+    from web_search import run_deep_search
+
+    _patch_single_provider(monkeypatch, parallel=1)
+
+    results, _, _, error, _, _, _, _ = run_deep_search("some query")
+
+    assert error is None
+    assert results
+
+
+def test_run_deep_search_counts_failed_runs(monkeypatch):
+    """A run that raises still advances the counter — it tracks liveness, not success."""
+    from web_search import run_deep_search
+
+    _patch_single_provider(monkeypatch, parallel=1, fail=True)
+    seen = []
+
+    results, _, _, error, _, _, _, _ = run_deep_search("some query", on_progress=seen.append)
+
+    assert seen == ["providers 1/1"]
+    assert results == []
+    assert error == "No results returned by providers."
+
+
+def test_run_deep_search_survives_progress_callback_errors(monkeypatch):
+    from web_search import run_deep_search
+
+    _patch_single_provider(monkeypatch, parallel=1)
+
+    def _explode(note):
+        raise RuntimeError("callback bug")
+
+    results, _, _, error, _, _, _, _ = run_deep_search("some query", on_progress=_explode)
+
+    assert error is None
+    assert results

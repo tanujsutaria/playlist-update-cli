@@ -28,12 +28,43 @@ def style_at(text: Text, index: int):
 
 @pytest.fixture
 def reset_sinks():
-    """Ensure module-global sinks are cleared before and after each test."""
+    """Ensure module-global sinks are cleared before and after each test.
+
+    The status sink is process-global like the others — every test that
+    installs one MUST use this fixture or CI flakes across test ordering.
+    """
     ui.set_output_sink(None)
     ui.set_preview_sink(None)
+    ui.set_status_sink(None)
     yield
     ui.set_output_sink(None)
     ui.set_preview_sink(None)
+    ui.set_status_sink(None)
+
+
+class TestStatusSink:
+    def test_emit_status_routes_to_sink(self, reset_sinks):
+        seen = []
+        ui.set_status_sink(seen.append)
+        ui.emit_status("extract 87/120")
+        assert seen == ["extract 87/120"]
+
+    def test_emit_status_none_clears_through_sink(self, reset_sinks):
+        seen = []
+        ui.set_status_sink(seen.append)
+        ui.emit_status(None)
+        assert seen == [None]
+
+    def test_emit_status_without_sink_is_noop(self, reset_sinks):
+        # Plain-CLI mode: no sink installed, must not raise or print.
+        ui.emit_status("providers 3/10")
+
+    def test_set_status_sink_none_uninstalls(self, reset_sinks):
+        seen = []
+        ui.set_status_sink(seen.append)
+        ui.set_status_sink(None)
+        ui.emit_status("score 25/50")
+        assert seen == []
 
 
 class TestStdoutRendering:

@@ -38,7 +38,7 @@ class TestRunProviders:
     def test_normalizes_into_provider_run(self, monkeypatch):
         captured = {}
 
-        def fake_run_deep_search(query, expanded=False):
+        def fake_run_deep_search(query, expanded=False, on_progress=None):
             captured["query"] = query
             captured["expanded"] = expanded
             return _canned(
@@ -69,7 +69,7 @@ class TestRunProviders:
     def test_default_expanded_is_false(self, monkeypatch):
         captured = {}
 
-        def fake_run_deep_search(query, expanded=False):
+        def fake_run_deep_search(query, expanded=False, on_progress=None):
             captured["expanded"] = expanded
             return _canned()
 
@@ -82,7 +82,7 @@ class TestRunProviders:
         monkeypatch.setattr(
             providers,
             "run_deep_search",
-            lambda query, expanded=False: _canned(
+            lambda query, expanded=False, on_progress=None: _canned(
                 results=[], providers_list=[], summary="", constraints={}, policy={}
             ),
         )
@@ -95,7 +95,39 @@ class TestRunProviders:
         monkeypatch.setattr(
             providers,
             "run_deep_search",
-            lambda query, expanded=False: _canned(error="No search providers configured."),
+            lambda query, expanded=False, on_progress=None: _canned(
+                error="No search providers configured."
+            ),
         )
         with pytest.raises(RuntimeError, match="No search providers configured."):
             run_providers("anything")
+
+
+class TestRunProvidersOnProgress:
+    def test_forwards_on_progress_callback(self, monkeypatch):
+        captured = {}
+
+        def fake_run_deep_search(query, expanded=False, on_progress=None):
+            captured["on_progress"] = on_progress
+            return _canned()
+
+        monkeypatch.setattr(providers, "run_deep_search", fake_run_deep_search)
+
+        def _cb(note: str) -> None:
+            pass
+
+        run_providers("a query", on_progress=_cb)
+        assert captured["on_progress"] is _cb
+
+    def test_on_progress_defaults_to_none(self, monkeypatch):
+        """Backward compat: existing two-arg callers keep working unchanged."""
+        captured = {}
+
+        def fake_run_deep_search(query, expanded=False, on_progress=None):
+            captured["on_progress"] = on_progress
+            return _canned()
+
+        monkeypatch.setattr(providers, "run_deep_search", fake_run_deep_search)
+
+        run_providers("a query")
+        assert captured["on_progress"] is None

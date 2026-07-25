@@ -40,6 +40,7 @@ class TestSetupParsers:
             "diff",
             "auth-status",
             "auth-refresh",
+            "auth-reset",
             "search",
             "find",
             "undo",
@@ -59,6 +60,23 @@ class TestSetupParsers:
             if hasattr(action, "choices") and action.choices:
                 for cmd in expected_commands:
                     assert cmd in action.choices, f"Command '{cmd}' not found in parser"
+
+
+class TestAuthResetCommand:
+    """Tests for auth-reset command parsing"""
+
+    def test_parse_auth_reset_defaults_unconfirmed(self):
+        """Bare auth-reset parses with yes=False (nothing gets deleted)."""
+        parser = setup_parsers()
+        args = parser.parse_args(["auth-reset"])
+        assert args.command == "auth-reset"
+        assert args.yes is False
+
+    def test_parse_auth_reset_with_yes(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["auth-reset", "--yes"])
+        assert args.command == "auth-reset"
+        assert args.yes is True
 
 
 class TestImportCommand:
@@ -850,3 +868,45 @@ class TestProgName:
                 break
         assert sub is not None
         assert "tunr update" in sub.format_usage()
+
+
+class TestFlagDidYouMean:
+    """Mistyped flags get a difflib did-you-mean, detected via parse_known_args
+    extras (never by string-matching argparse wording)."""
+
+    def test_update_mistyped_count(self):
+        command, args, error = parse_tokens(["update", "My Playlist", "--cout", "5"])
+        assert command is None
+        assert error is not None
+        assert "Unrecognized --cout — did you mean --count?" in error
+
+    def test_stats_mistyped_playlist(self):
+        command, args, error = parse_tokens(["stats", "--playlst", "X"])
+        assert command is None
+        assert error is not None
+        assert "Unrecognized --playlst — did you mean --playlist?" in error
+
+    def test_equals_form_suggests_bare_flag(self):
+        command, args, error = parse_tokens(["update", "My Playlist", "--cout=5"])
+        assert error is not None
+        assert "did you mean --count?" in error
+
+    def test_unrelated_flag_gets_no_suggestion(self):
+        command, args, error = parse_tokens(["update", "My Playlist", "--zzzzqqq"])
+        assert command is None
+        assert error is not None
+        assert "did you mean" not in error
+
+    def test_missing_required_arg_has_no_flag_hint(self):
+        # parse_known_args raises here too — no extras, no hint, and the
+        # original usage-carrying error is preserved.
+        command, args, error = parse_tokens(["update"])
+        assert error is not None
+        assert "did you mean" not in error
+        assert "usage: tunr update" in error
+
+    def test_valid_flags_still_parse(self):
+        command, args, error = parse_tokens(["update", "My Playlist", "--count", "5"])
+        assert error is None
+        assert command == "update"
+        assert args.count == 5

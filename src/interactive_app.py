@@ -7,25 +7,29 @@ import os
 import shlex
 import threading
 import time
+from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, NamedTuple, Optional, Tuple
 
 from rich import box
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container
 from textual.reactive import reactive
+from textual.screen import Screen
 from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
+from completions import TunrSuggester
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
 from results_screen import ResultsAction, ResultsScreen, results_for_browse
-from spotify_manager import get_cached_token_info
+from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
 from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
@@ -36,6 +40,7 @@ from ui import (
     section,
     set_output_sink,
     set_preview_sink,
+    set_status_sink,
     subsection,
     table,
     warning,
@@ -93,6 +98,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # GDPR-export import touches only the local DB/filesystem — exactly the
     # audience without API credentials yet.
     "import-history",
+    # Token-file deletion only; needs no API credentials (and is exactly what
+    # a half-configured setup may need to get unstuck).
+    "auth-reset",
     "interactive",
 }
 
@@ -105,6 +113,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         [
             "auth-status",
             "auth-refresh",
+            "auth-reset",
             "pull",
             "ingest",
             "listen-sync",
@@ -158,6 +167,73 @@ META_COMMAND_HELP = {
 }
 
 
+class PaletteCommand(NamedTuple):
+    """One tunr command as surfaced in the ctrl+p command palette."""
+
+    name: str
+    help: str
+    needs_argument: bool
+
+
+class TunrCommandProvider(Provider):
+    """Command-palette provider for tunr slash commands (ctrl+p).
+
+    Fuzzy-searches every advertised registry command plus the TUI meta
+    commands, each with its one-line help. Selecting an arg-taking command
+    preloads ``/cmd `` into the input for the user to finish; a provably
+    no-arg command is submitted through the exact same path (and gates) as
+    typed input.
+    """
+
+    def _palette_app(self) -> "Optional[PlaylistInteractiveApp]":
+        """The tunr app, or None when the palette should offer nothing.
+
+        Offers nothing when the palette was opened over a pushed screen
+        (e.g. /dash): the command input is not reachable there, and running
+        a command would race the modal screen's synchronous reads of the
+        shared sqlite connection.
+        """
+        app = self.app
+        if not isinstance(app, PlaylistInteractiveApp):
+            return None
+        stack = app.screen_stack
+        if stack and self.screen is not stack[0]:
+            return None
+        return app
+
+    @staticmethod
+    def _callback(app: "PlaylistInteractiveApp", entry: PaletteCommand) -> Callable[[], None]:
+        """Pick the palette action for one command (insert vs submit)."""
+        if entry.needs_argument:
+            return partial(app._palette_insert, entry.name)
+        return partial(app._palette_submit, entry.name)
+
+    async def search(self, query: str) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        matcher = self.matcher(query)
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            score = matcher.match(display)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(display),
+                    self._callback(app, entry),
+                    text=display,
+                    help=entry.help,
+                )
+
+    async def discover(self) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            yield DiscoveryHit(display, self._callback(app, entry), help=entry.help)
+
+
 class UILogHandler(logging.Handler):
     def __init__(self, app: "PlaylistInteractiveApp") -> None:
         super().__init__()
@@ -171,6 +247,16 @@ class UILogHandler(logging.Handler):
             style = "white"
             if record.levelno >= logging.ERROR:
                 style = "red"
+                # Error-aware completion: count ERROR+ records (never WARNING)
+                # against the currently running command. Thread-safety note:
+                # emit() runs on whichever thread logged (usually the command
+                # worker); the reset happens on the app thread in _run_command
+                # BEFORE the worker starts, and the read happens on the worker
+                # thread in _execute_command AFTER dispatch returns. The
+                # one-command-at-a-time `status` gate means those never
+                # overlap, and the int increment itself is GIL-atomic — no
+                # lock needed.
+                self.app._command_error_count += 1
             elif record.levelno >= logging.WARNING:
                 style = "yellow"
             elif record.levelno >= logging.INFO:
@@ -228,6 +314,10 @@ class PlaylistInteractiveApp(App):
         ("ctrl+l", "clear_log", "Clear output"),
     ]
 
+    # ctrl+p command palette: the stock providers plus the tunr command
+    # inventory (see TunrCommandProvider above).
+    COMMANDS = App.COMMANDS | {TunrCommandProvider}
+
     # Status sentinels are lowercase on purpose — the top bar renders them
     # verbatim, and the chrome follows TE's lowercase convention.
     status = reactive("idle")
@@ -239,6 +329,7 @@ class PlaylistInteractiveApp(App):
         self.parser = parser
         self._history_path = self._resolve_history_path()
         self._history: List[str] = self._load_history()
+        self._suggester = self._build_suggester()
         self._history_index: Optional[int] = None
         self._history_prefix: str = ""
         self._navigating = False
@@ -254,11 +345,22 @@ class PlaylistInteractiveApp(App):
         self._spinner_timer = None
         self._run_started: Optional[float] = None
         self._last_run_note: str = ""
+        # ERROR-level log records seen since the current command started
+        # (incremented by UILogHandler.emit — see the thread-safety note there).
+        self._command_error_count = 0
+        # Latest pipeline stage string ("extract 87/120", "providers 3/10")
+        # rendered live in the top bar while a command runs.
+        self._stage: str = ""
         self._app_thread_id: Optional[int] = None
         # Background listen-sync: warn once, then stay quiet on repeat failures.
         self._auto_sync_warned = False
         # Log the "no cached token" skip once per session, not every interval.
         self._auto_sync_token_warned = False
+        # Set after an insufficient-scope (403) failure: retrying with the same
+        # stale token can never succeed and burns the busy slot each interval,
+        # so auto-sync stands down until a cached token granting all required
+        # scopes appears (e.g. after /auth-reset --yes + re-auth).
+        self._auto_sync_scope_blocked = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="top_bar")
@@ -266,7 +368,11 @@ class PlaylistInteractiveApp(App):
             yield Static(id="search_preview")
             yield RichLog(id="output", highlight=False, markup=False, wrap=True, min_width=20)
             yield Static(id="setup_screen")
-        yield Input(placeholder="type /help for commands", id="command_input")
+        yield Input(
+            placeholder="type /help for commands",
+            id="command_input",
+            suggester=self._suggester,
+        )
 
     def on_mount(self) -> None:
         # Theme plumbing first: register the OP-1 palette and switch to it so
@@ -278,6 +384,7 @@ class PlaylistInteractiveApp(App):
         self._mounted = True
         set_output_sink(self._emit_renderable)
         set_preview_sink(self._emit_preview)
+        set_status_sink(self._emit_status)
         configure_logging(handler=UILogHandler(self))
         self._refresh_env_status()
         self._update_top_bar()
@@ -293,6 +400,7 @@ class PlaylistInteractiveApp(App):
         self._mounted = False
         set_output_sink(None)
         set_preview_sink(None)
+        set_status_sink(None)
 
     def on_resize(self) -> None:
         self._update_top_bar()
@@ -355,6 +463,18 @@ class PlaylistInteractiveApp(App):
             self.append_log(Text(f"> {raw}", style="bold"))
             self._handle_pending_input(raw)
             return
+        self._submit_text(raw)
+
+    def _submit_text(self, raw: str) -> None:
+        """Submit command text exactly as if it had been typed and entered.
+
+        Single choke point shared by the input widget and the command
+        palette: the setup-mode gate in _handle_command and the idle gate in
+        _run_command both apply downstream, unchanged.
+        """
+        raw = raw.strip()
+        if not raw:
+            return
         if self._pending_action and raw.startswith("/"):
             # A slash command cancels the armed wizard so stray text typed
             # later is never silently consumed as a wizard answer.
@@ -400,6 +520,16 @@ class PlaylistInteractiveApp(App):
 
     def _emit_renderable(self, renderable) -> None:
         self._dispatch_ui(self.append_log, renderable)
+
+    def _emit_status(self, stage: Optional[str]) -> None:
+        """ui.set_status_sink handler: stage strings from the pipeline worker."""
+        self._dispatch_ui(self._set_stage, stage)
+
+    def _set_stage(self, stage: Optional[str]) -> None:
+        self._stage = stage or ""
+        # The 0.2s spinner tick re-renders the bar anyway; this direct update
+        # just makes the new stage visible immediately (and in tests).
+        self._update_top_bar()
 
     @staticmethod
     def _resolve_history_path() -> Path:
@@ -588,6 +718,11 @@ class PlaylistInteractiveApp(App):
         if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
+        # Fresh error window + stage for this command. App-thread writes; the
+        # handler's worker-thread increments cannot overlap because the worker
+        # has not started yet and the `status` gate above serializes commands.
+        self._command_error_count = 0
+        self._stage = ""
         self._run_started = time.monotonic()
         self.status = f"running /{command}"
         self.run_worker(lambda: self._execute_command(command, args), thread=True)
@@ -605,6 +740,23 @@ class PlaylistInteractiveApp(App):
                         style="red",
                     ),
                 )
+            elif self._command_error_count:
+                # rc==0 but ERROR-level records fired mid-run: the command
+                # succeeded only nominally (e.g. partial failures that still
+                # return 0). Render the honest red line. This branch is
+                # rc==0-only, so it can never double-print with the rc!=0
+                # line above.
+                failed = True
+                count = self._command_error_count
+                noun = "error" if count == 1 else "errors"
+                self.call_from_thread(
+                    self.append_log,
+                    Text(
+                        f"/{command} exited with errors ({count} {noun} logged) "
+                        "— run /debug errors for details.",
+                        style="red",
+                    ),
+                )
         except Exception as exc:
             failed = True
             logger.exception("Command failed: /%s", command)
@@ -618,7 +770,7 @@ class PlaylistInteractiveApp(App):
             )
         finally:
             self._notify_command_result(command, failed)
-            self.call_from_thread(self._post_command, command)
+            self.call_from_thread(self._post_command, command, failed)
 
     def _notify_command_result(self, command: str, failed: bool) -> None:
         """Emit at most one toast per command: error on failure, info when slow."""
@@ -637,7 +789,9 @@ class PlaylistInteractiveApp(App):
             # Toasts are best-effort; never let them break command teardown.
             logger.debug("Toast notification failed for /%s", command, exc_info=True)
 
-    def _post_command(self, command: str) -> None:
+    # `failed` defaults to False because several tests (and the wizard paths)
+    # call _post_command directly with just the command name.
+    def _post_command(self, command: str, failed: bool = False) -> None:
         # Dismiss the transient preview pane — unless the command flagged that
         # the preview is the only copy of its results (SEARCH_FINAL_TABLE_MODE=none
         # writes no scrollback table, so clearing would lose them).
@@ -646,7 +800,10 @@ class PlaylistInteractiveApp(App):
         if self._run_started is not None:
             elapsed = self._format_elapsed(time.monotonic() - self._run_started)
             self._last_run_note = f"last: /{command} {elapsed}"
-            self.append_log(Text(f"/{command} finished in {elapsed}", style="dim"))
+            if not failed:
+                # A failed command already rendered its red completion line in
+                # _execute_command — the dim "finished" line would contradict it.
+                self.append_log(Text(f"/{command} finished in {elapsed}", style="dim"))
         if (
             command == "search"
             and self.cli.last_search_results
@@ -657,6 +814,7 @@ class PlaylistInteractiveApp(App):
 
     def _set_idle(self) -> None:
         self._run_started = None
+        self._stage = ""
         self.status = "idle"
 
     # ------------------------------------------------------------------
@@ -697,6 +855,16 @@ class PlaylistInteractiveApp(App):
             return
         if len(self.screen_stack) > 1:
             return  # a modal screen (/dash) is reading the shared connection
+        if self._auto_sync_scope_blocked:
+            # Stand down after an insufficient-scope failure — but self-clear
+            # the moment a cached token granting every required scope appears
+            # (the user ran /auth-reset --yes and re-authorized). A live client
+            # picks a re-cached token up automatically, so resuming is safe.
+            token_info = get_cached_token_info()
+            if token_info is None or missing_scopes(token_info.get("scope")):
+                return
+            self._auto_sync_scope_blocked = False
+            logger.info("Auto-sync resuming: cached token now grants the required scopes.")
         if getattr(self.cli, "_spotify", None) is None and not get_cached_token_info():
             # No cached token: touching cli.spotify would launch the BLOCKING
             # interactive OAuth flow from a background worker (surprise
@@ -712,7 +880,7 @@ class PlaylistInteractiveApp(App):
     def _auto_sync_worker(self) -> None:
         try:
             self.cli.sync_listen_history(quiet=True)
-        except Exception:
+        except Exception as exc:
             # A failure mid-write would leave an open transaction on the
             # long-lived shared connection — the next unrelated command's
             # commit would silently persist the partial sync. Roll it back
@@ -721,7 +889,15 @@ class PlaylistInteractiveApp(App):
                 self.cli.repos.conn.rollback()
             except Exception:
                 logger.debug("Rollback after failed auto-sync failed.", exc_info=True)
-            if not self._auto_sync_warned:
+            hint = scope_error_hint(exc)
+            if hint is not None:
+                # A stale-scope token can never succeed on retry: log the
+                # actionable hint once and stand down (the blocked flag is
+                # self-clearing — _maybe_auto_sync resumes when a cached token
+                # with the required scopes appears).
+                self._auto_sync_scope_blocked = True
+                logger.warning("Background listen-sync blocked by a missing scope. %s", hint)
+            elif not self._auto_sync_warned:
                 self._auto_sync_warned = True
                 logger.warning(
                     "Background listen-sync failed; retrying quietly each interval.",
@@ -833,11 +1009,109 @@ class PlaylistInteractiveApp(App):
     def _meta_command_names() -> List[str]:
         return [name for name in META_COMMAND_HELP if name != "?"]
 
+    def _build_suggester(self) -> TunrSuggester:
+        """Assemble the ghost-text suggester from the parser + meta inventory.
+
+        History is handed over as a provider callable because
+        ``_append_history`` REBINDS ``self._history`` on truncation. Note that
+        history navigation (`_set_input_value`) also writes recalled lines
+        into the Input, which triggers the suggester on them — deliberate:
+        a recalled line may show a longer, more recent line as ghost text,
+        but never suggests itself (pinned by tests).
+        """
+        command_names = [name for name, _ in self._command_summaries()]
+        flag_map = {}
+        for name in command_names:
+            sub = self._find_subparser(name)
+            if sub is not None:
+                flag_map[name] = [
+                    option for action in sub._actions for option in action.option_strings
+                ]
+        return TunrSuggester(
+            commands=command_names + self._meta_command_names(),
+            flags=flag_map,
+            history=lambda: self._history,
+        )
+
     def _find_subparser(self, name: str) -> Optional[argparse.ArgumentParser]:
         for action in self.parser._actions:
             if isinstance(action, argparse._SubParsersAction):
                 return action.choices.get(name)
         return None
+
+    # ------------------------------------------------------------------
+    # Command palette (ctrl+p)
+    # ------------------------------------------------------------------
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Stock system commands minus the theme switcher.
+
+        The default "Theme" entry would knock the session off the OP-1
+        palette that the App CSS and the Rich-side twin in ui.py both assume.
+        Filter by title so this stays correct regardless of the order the
+        upstream commands are yielded in.
+        """
+        for command in super().get_system_commands(screen):
+            if "theme" in command.title.lower():
+                continue
+            yield command
+
+    @staticmethod
+    def _subparser_needs_argument(sub: argparse.ArgumentParser) -> bool:
+        """True when a command takes ANY positional or required option.
+
+        Safest-default classification for the palette: even an optional
+        positional (nargs='?') counts, because it is often effectively
+        required (e.g. /backup <name>). Only provably no-arg commands are
+        submitted directly; everything else is preloaded into the input.
+        """
+        for action in sub._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if not action.option_strings:
+                return True  # positional, even an optional one
+            if action.required:
+                return True
+        return False
+
+    def _palette_commands(self) -> List[PaletteCommand]:
+        """Palette inventory: advertised registry commands + meta commands."""
+        commands: List[PaletteCommand] = []
+        seen = set()
+        for name, help_text in self._command_summaries():
+            seen.add(name)
+            sub = self._find_subparser(name)
+            needs_argument = sub is None or self._subparser_needs_argument(sub)
+            commands.append(PaletteCommand(name, help_text, needs_argument))
+        for name in self._meta_command_names():
+            if name in seen:
+                continue
+            # Meta commands are all callable with no arguments.
+            commands.append(PaletteCommand(name, META_COMMAND_HELP[name], False))
+        return commands
+
+    def _palette_submit(self, name: str) -> None:
+        """Palette callback for a provably no-arg command.
+
+        Submits through _submit_text so the setup-mode and busy gates apply
+        exactly as they do for typed input.
+        """
+        self._submit_text(f"/{name}")
+
+    def _palette_insert(self, name: str) -> None:
+        """Palette callback for an arg-taking command.
+
+        Preloads ``/name `` into the input and focuses it so the user can
+        finish the arguments; nothing is submitted or dispatched.
+        """
+        self._write_input(f"/{name} ")
+        self._focus_input()
+
+    def _focus_input(self) -> None:
+        try:
+            self.query_one(Input).focus()
+        except Exception:
+            logger.debug("Could not focus the command input", exc_info=True)
 
     def _show_command_help(self, raw_name: str) -> None:
         name = raw_name.strip().lstrip("/").strip()
@@ -886,6 +1160,9 @@ class PlaylistInteractiveApp(App):
         if max_status_width < 8:
             return Text(label_text, style=SUBSECTION_STYLE)
         status_label = self.status
+        if self._stage and self.status != "idle":
+            # Live stage readout, e.g. "running /search · extract 87/120".
+            status_label = f"{status_label} · {self._stage}"
         if self._spinner_timer is not None:
             status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
         if self.status != "idle" and self._run_started is not None:

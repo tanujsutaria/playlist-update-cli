@@ -25,6 +25,7 @@ console = Console()
 _stderr_console = Console(stderr=True)
 _output_sink: Optional[Callable[[RenderableType], None]] = None
 _preview_sink: Optional[Callable[[Optional[RenderableType]], None]] = None
+_status_sink: Optional[Callable[[Optional[str]], None]] = None
 _json_mode: bool = False
 
 # --- ink: the tunr visual language (OP-1 edition) -----------------------------
@@ -100,6 +101,28 @@ def set_preview_sink(sink: Optional[Callable[[Optional[RenderableType]], None]])
     """Route preview renderables to a dedicated sink (optional)."""
     global _preview_sink
     _preview_sink = sink
+
+
+def set_status_sink(sink: Optional[Callable[[Optional[str]], None]]) -> None:
+    """Route short live-status strings (e.g. "extract 87/120") to a sink.
+
+    This is deliberately a pure string channel — no Rich renderables, no
+    styling. The consumer (the TUI top bar today) owns all presentation, so
+    the bar can be restyled later without touching this plumbing.
+    """
+    global _status_sink
+    _status_sink = sink
+
+
+def emit_status(stage: Optional[str]) -> None:
+    """Send a stage string to the status sink; ``None`` clears it.
+
+    Silently a no-op when no sink is installed (plain CLI / --json runs):
+    stage information still reaches stdout via the scrollback "Stage:" lines,
+    so nothing is lost outside the TUI.
+    """
+    if _status_sink:
+        _status_sink(stage)
 
 
 def _emit(renderable: Union[RenderableType, str]) -> None:

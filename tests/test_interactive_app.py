@@ -737,6 +737,99 @@ class TestRcSurfacing:
         assert app.notifications == [("/stats finished in 11s", "information")]
 
 
+# ============================================================================
+# Error-aware completion: ERROR-level records during an rc==0 command flip the
+# completion line from the dim "finished" to the red "exited with errors".
+# ============================================================================
+
+
+class TestErrorAwareCompletion:
+    def _worker_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = WorkerApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.cli.last_search_results = None
+        return app
+
+    def test_error_record_increments_counter_warning_does_not(self, monkeypatch):
+        import logging as _logging
+
+        from interactive_app import UILogHandler
+
+        app = _make_app(monkeypatch)
+        handler = UILogHandler(app)
+        warn = _logging.LogRecord("t", _logging.WARNING, __file__, 1, "meh", None, None)
+        err = _logging.LogRecord("t", _logging.ERROR, __file__, 1, "boom", None, None)
+        handler.emit(warn)
+        assert app._command_error_count == 0
+        handler.emit(err)
+        handler.emit(err)
+        assert app._command_error_count == 2
+
+    def test_run_command_resets_counter_and_stage(self, monkeypatch):
+        app = self._worker_app(monkeypatch)
+        app._command_error_count = 3
+        app._stage = "stale stage"
+        workers = []
+        monkeypatch.setattr(
+            app, "run_worker", lambda fn, thread=True: workers.append(fn), raising=False
+        )
+        PlaylistInteractiveApp._run_command(app, "stats", object())
+        assert app._command_error_count == 0
+        assert app._stage == ""
+        assert app.status == "running /stats"
+        assert len(workers) == 1
+
+    def test_zero_rc_with_errors_red_line_toast_no_finished_line(self, monkeypatch):
+        import time as _time
+
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 1  # a logger.error fired mid-command
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._run_started = _time.monotonic()
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert "/stats exited with errors (1 error logged)" in text
+        assert "/debug errors" in text
+        assert ("/stats exited with errors", "error") in app.notifications
+        assert "finished in" not in text  # the dim success line is suppressed
+
+    def test_zero_rc_with_multiple_errors_pluralizes(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 2
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._execute_command("stats", object())
+        assert "(2 errors logged)" in _logged_text(app)
+
+    def test_nonzero_rc_with_errors_no_double_print(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 2
+            return 1
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert text.count("exited with errors") == 1
+        assert len(app.notifications) == 1
+
+
 class TestPostCommandPreviewDismissal:
     def test_post_command_clears_preview(self, monkeypatch):
         import ui
@@ -835,6 +928,108 @@ class TestCommandDuration:
         app._post_command("stats")
         assert "finished in" not in _logged_text(app)
         assert app._last_run_note == ""
+
+    def test_post_command_failed_suppresses_finished_line(self, monkeypatch):
+        """failed=True skips the dim line (the red one already rendered) but
+        still records the last-run note and returns to idle."""
+        import time as _time
+
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app._run_started = _time.monotonic() - 4.2
+        app._post_command("stats", failed=True)
+        assert "finished in" not in _logged_text(app)
+        assert app._last_run_note == "last: /stats 4s"
+        assert app._run_started is None
+        assert app.status == "idle"
+
+
+# ============================================================================
+# Live stage in the top bar: ui status sink -> _set_stage -> _render_top_bar
+# ============================================================================
+
+
+class SizedApp(DummyApp):
+    """DummyApp with a fixed size so _render_top_bar has room to render."""
+
+    @property
+    def size(self):
+        from textual.geometry import Size
+
+        return Size(120, 40)
+
+
+def _render_to_text(renderable, width: int = 120) -> str:
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, width=width).print(renderable)
+    return buf.getvalue()
+
+
+class TestStageInTopBar:
+    def _sized_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = SizedApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_emit_status_sets_stage_via_dispatch(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app._emit_status("extract 87/120")
+        assert app._stage == "extract 87/120"
+        app._emit_status(None)  # None clears
+        assert app._stage == ""
+
+    def test_stage_rendered_while_running(self, monkeypatch):
+        import time as _time
+
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        app._run_started = _time.monotonic()
+        app._set_stage("extract 87/120")
+        text = _render_to_text(app._render_top_bar())
+        assert "running /search · extract 87/120" in text
+
+    def test_stage_hidden_when_idle(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app._stage = "extract 87/120"  # stale stage must never show at idle
+        text = _render_to_text(app._render_top_bar())
+        assert "extract 87/120" not in text
+
+    def test_no_stage_renders_plain_running_label(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        text = _render_to_text(app._render_top_bar())
+        assert "running /search" in text
+        assert "·" not in text  # no stray separator without a stage
+
+    def test_set_idle_clears_stage(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        app._set_stage("score 25/50")
+        app._set_idle()
+        assert app._stage == ""
+
+    def test_status_sink_registered_and_cleared_with_app_lifecycle(self, monkeypatch):
+        """on_mount installs ui's status sink; on_shutdown clears it (same
+        lifecycle as the output/preview sinks)."""
+        import ui
+
+        app = self._sized_app(monkeypatch)
+        # Simulate the shutdown half directly (mount needs a live Textual app).
+        ui.set_status_sink(app._emit_status)
+        try:
+            ui.emit_status("providers 3/10")
+            assert app._stage == "providers 3/10"
+            app.on_shutdown()
+            ui.emit_status("providers 4/10")
+            assert app._stage == "providers 3/10"  # sink uninstalled: unchanged
+        finally:
+            ui.set_status_sink(None)
 
 
 class _SubmitEvent:
@@ -1251,3 +1446,485 @@ class TestApplySearchResultsParametrized:
         app._apply_search_results(mode="db", track_ids=[])
         assert app.cli.marked == []
         assert "No search results available" in _logged_text(app)
+
+
+# ============================================================================
+# Ghost-text autocomplete (suggester wiring + Pilot end-to-end)
+# ============================================================================
+
+
+class TestSuggesterWiring:
+    def test_compose_input_carries_the_suggester(self, monkeypatch):
+        from textual.widgets import Input
+
+        from completions import TunrSuggester
+
+        app = _make_app(monkeypatch)
+        widgets = _compose_widgets(app)
+        command_input = next(w for w in widgets if isinstance(w, Input))
+        assert command_input.suggester is app._suggester
+        assert isinstance(app._suggester, TunrSuggester)
+
+    def test_inventory_covers_subcommands_meta_and_flags(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        suggester = app._suggester
+        assert "update" in suggester._commands
+        assert "help" in suggester._commands  # meta command
+        assert "interactive" not in suggester._commands  # hidden in the UI
+        assert "--fresh-days" in suggester._flags["update"]
+        assert "--playlist" in suggester._flags["stats"]
+
+    def test_history_provider_follows_list_rebind(self, monkeypatch):
+        """_append_history REBINDS self._history on truncation; the suggester
+        must keep seeing the live list, not a stale captured reference."""
+        app = _make_app(monkeypatch)
+        app._history = ["/stats --json"]  # rebind, like the truncation path
+        assert app._suggester._history() == ["/stats --json"]
+
+    def test_recalled_history_line_gets_no_self_suggestion(self, monkeypatch):
+        """History navigation writes recalled lines into the Input, which
+        triggers the suggester. Deliberate: the recalled line itself is never
+        suggested (only a longer, more recent line may ghost past it)."""
+        import asyncio
+
+        app = _make_history_app(monkeypatch, ["/stats"])
+        app._history_prev()  # recalls "/stats" into the input
+        recalled = app.input_value
+        try:
+            suggestion = asyncio.run(app._suggester.get_suggestion(recalled))
+        finally:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        assert suggestion is None
+
+
+class TestSuggesterPilot:
+    def test_typing_ghosts_and_right_arrow_accepts(self, monkeypatch):
+        import asyncio
+        import logging
+
+        from textual.widgets import Input
+
+        import ui
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        # Belt and braces: disable the auto-sync timer so the Pilot app never
+        # schedules background work during the test.
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")
+        app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+
+        # on_mount's configure_logging replaces the root handlers AND raises
+        # the root level to INFO; restore both afterwards so later tests log
+        # normally (a leaked INFO level makes caplog-based tests see records
+        # they never see on a clean run).
+        root_logger = logging.getLogger()
+        saved_handlers = list(root_logger.handlers)
+        saved_level = root_logger.level
+
+        async def drive():
+            async with app.run_test(size=(90, 30)) as pilot:
+                command_input = app.query_one(Input)
+                await pilot.press(*"/up")
+                await pilot.pause()  # let the suggester worker deliver
+                assert command_input._suggestion == "/update"
+                await pilot.press("right")  # cursor at end -> accept ghost
+                assert command_input.value == "/update"
+
+        try:
+            asyncio.run(drive())
+        finally:
+            # py3.9: restore a current event loop after asyncio.run (repo
+            # pattern, see tests/test_dashboard.py TestPilotSmoke).
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            root_logger.handlers = saved_handlers
+            root_logger.setLevel(saved_level)
+            # on_mount installed the app as the global ui sinks; Textual 8
+            # never fires on_shutdown under run_test, so drop them here or
+            # every later ui-emitting test talks to a dead app.
+            ui.set_output_sink(None)
+            ui.set_preview_sink(None)
+
+
+# ctrl+p command palette: inventory, classification, callbacks, curation
+# ============================================================================
+
+
+def _run_async(coro):
+    """asyncio.run + event-loop restoration (py3.9 leaves none behind)."""
+    import asyncio
+
+    try:
+        return asyncio.run(coro)
+    finally:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def _palette_by_name(app):
+    return {entry.name: entry for entry in app._palette_commands()}
+
+
+class TestPaletteInventory:
+    def test_inventory_covers_registry_and_meta(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        names = {entry.name for entry in app._palette_commands()}
+        registry = {name for name, _ in app._command_summaries()}
+        meta = set(app._meta_command_names())
+        assert names == registry | meta
+        assert len(names) == len(app._palette_commands())  # no duplicates
+
+    def test_every_entry_has_help(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        for entry in app._palette_commands():
+            assert entry.help, f"/{entry.name} has no one-liner"
+
+    def test_hidden_commands_stay_hidden(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        names = {entry.name for entry in app._palette_commands()}
+        for hidden in ("interactive", "rotate-played", "?"):
+            assert hidden not in names
+
+    def test_key_commands_present(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        names = {entry.name for entry in app._palette_commands()}
+        assert {"update", "search", "backup", "dash", "help", "quit"} <= names
+
+
+class TestPaletteClassification:
+    def test_positional_commands_insert(self, monkeypatch):
+        by_name = _palette_by_name(_make_app(monkeypatch))
+        for name in ("update", "view", "sync", "rotate", "search", "find", "import-history"):
+            assert by_name[name].needs_argument, f"/{name} should preload into the input"
+
+    def test_optional_positional_still_inserts(self, monkeypatch):
+        """Safest default: /backup's name is nargs='?' but effectively wanted."""
+        by_name = _palette_by_name(_make_app(monkeypatch))
+        for name in ("backup", "ingest", "restore-previous-rotation"):
+            assert by_name[name].needs_argument
+
+    def test_no_arg_registry_commands_submit(self, monkeypatch):
+        by_name = _palette_by_name(_make_app(monkeypatch))
+        for name in (
+            "stats",
+            "profile",
+            "taste",
+            "clean",
+            "undo",
+            "enrich",
+            "sonic",
+            "listen-sync",
+            "pull",
+            "list-backups",
+            "auth-status",
+            "auth-refresh",
+        ):
+            assert not by_name[name].needs_argument, f"/{name} is provably no-arg"
+
+    def test_meta_commands_submit(self, monkeypatch):
+        by_name = _palette_by_name(_make_app(monkeypatch))
+        for name in ("help", "dash", "clear", "quit", "env", "debug", "expand"):
+            assert not by_name[name].needs_argument
+
+
+class PaletteApp(HistoryApp):
+    """HistoryApp (input seams) plus a recorded _focus_input."""
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.focus_calls = 0
+
+    def _focus_input(self) -> None:
+        self.focus_calls += 1
+
+
+def _make_palette_app(monkeypatch, with_spotify=True):
+    if with_spotify:
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+    else:
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.delenv(key, raising=False)
+    app = PaletteApp(cli=PlaylistCLI(), parser=setup_parsers())
+    app._refresh_env_status()
+    return app
+
+
+class TestPaletteCallbacks:
+    def test_submit_routes_through_command_path(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._palette_submit("stats")
+        assert app.commands == ["stats"]
+        assert "> /stats" in _logged_text(app)
+
+    def test_submit_records_history(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._palette_submit("stats")
+        assert app._history == ["/stats"]
+
+    def test_submit_meta_command(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._palette_submit("quit")
+        assert app._quit_called is True
+
+    def test_submit_respects_setup_gate(self, monkeypatch):
+        app = _make_app(monkeypatch, with_spotify=False)
+        app._palette_submit("auth-status")  # not in the no-Spotify allowlist
+        assert app.commands == []
+        assert "Spotify keys missing" in _logged_text(app)
+
+    def test_submit_allowed_without_spotify(self, monkeypatch):
+        app = _make_app(monkeypatch, with_spotify=False)
+        app._palette_submit("stats")
+        assert app.commands == ["stats"]
+
+    def test_submit_dismisses_armed_wizard(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_track_ids = ["artist|||song"]
+        app.cli.last_search_query = "indie"
+        app._prompt_search_followup()
+        app._palette_submit("stats")
+        assert app._pending_action is None
+        assert "Search follow-up dismissed." in _logged_text(app)
+        assert "stats" in app.commands
+
+    def test_submit_respects_busy_gate(self, monkeypatch):
+        class GateApp(DummyApp):
+            _run_command = PlaylistInteractiveApp._run_command
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = GateApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.status = "running /search"
+        app.run_worker = lambda *a, **k: pytest.fail("worker must not start while busy")
+        app._palette_submit("stats")
+        assert "Another command is already running." in _logged_text(app)
+
+    def test_insert_preloads_input_without_dispatch(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        app._palette_insert("update")
+        assert app.input_value == "/update "
+        assert app.focus_calls == 1
+        assert app.commands == []
+        assert app._history == []
+        assert app.logged == []
+
+
+class _FakeScreen:
+    """Bare screen stand-in: Provider only needs .app off it."""
+
+    def __init__(self, app):
+        self.app = app
+
+
+class _StackedPaletteApp(PaletteApp):
+    """PaletteApp with a controllable screen stack for provider guards."""
+
+    fake_stack = ()
+
+    @property
+    def screen_stack(self):
+        return list(self.fake_stack)
+
+
+def _provider_for(app, screen=None):
+    from interactive_app import TunrCommandProvider
+
+    return TunrCommandProvider(screen if screen is not None else _FakeScreen(app))
+
+
+class TestPaletteProvider:
+    def test_search_yields_matching_hit(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        provider = _provider_for(app)
+
+        async def collect():
+            return [hit async for hit in provider.search("update")]
+
+        hits = _run_async(collect())
+        assert any(hit.text == "/update" for hit in hits)
+        # Ranked hits carry the command's one-liner as help text.
+        update_hit = next(hit for hit in hits if hit.text == "/update")
+        assert update_hit.help
+
+    def test_search_no_match_yields_nothing(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        provider = _provider_for(app)
+
+        async def collect():
+            return [hit async for hit in provider.search("zzzzzqqqqq")]
+
+        assert _run_async(collect()) == []
+
+    def test_discover_lists_full_inventory(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        provider = _provider_for(app)
+
+        async def collect():
+            return [hit async for hit in provider.discover()]
+
+        hits = _run_async(collect())
+        assert {hit.text for hit in hits} == {f"/{entry.name}" for entry in app._palette_commands()}
+
+    def test_hit_callback_inserts_arg_command(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        provider = _provider_for(app)
+
+        async def collect():
+            return [hit async for hit in provider.search("update")]
+
+        hits = _run_async(collect())
+        next(hit for hit in hits if hit.text == "/update").command()
+        assert app.input_value == "/update "
+        assert app.commands == []
+
+    def test_hit_callback_submits_no_arg_command(self, monkeypatch):
+        app = _make_palette_app(monkeypatch)
+        provider = _provider_for(app)
+
+        async def collect():
+            return [hit async for hit in provider.search("stats")]
+
+        hits = _run_async(collect())
+        next(hit for hit in hits if hit.text == "/stats").command()
+        assert app.commands == ["stats"]
+        assert app.input_value == ""
+
+    def test_provider_offers_nothing_over_pushed_screen(self, monkeypatch):
+        """Opened over /dash the input is unreachable and commands would race
+        the modal's DB reads: yield nothing (system commands still show)."""
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _StackedPaletteApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        base, modal = _FakeScreen(app), _FakeScreen(app)
+        app.fake_stack = (base, modal)
+        provider = _provider_for(app, screen=modal)
+
+        async def collect():
+            searched = [hit async for hit in provider.search("update")]
+            discovered = [hit async for hit in provider.discover()]
+            return searched, discovered
+
+        searched, discovered = _run_async(collect())
+        assert searched == []
+        assert discovered == []
+
+    def test_provider_active_on_base_screen(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _StackedPaletteApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        base = _FakeScreen(app)
+        app.fake_stack = (base,)
+        provider = _provider_for(app, screen=base)
+
+        async def collect():
+            return [hit async for hit in provider.search("update")]
+
+        assert _run_async(collect())
+
+
+class TestSystemCommandsCuration:
+    def _titles(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = _make_app(monkeypatch)
+        screen = SimpleNamespace(query=lambda selector: [], maximized=None, focused=None)
+        return [command.title for command in app.get_system_commands(screen)]
+
+    def test_theme_switcher_removed(self, monkeypatch):
+        titles = self._titles(monkeypatch)
+        assert all("theme" not in title.lower() for title in titles)
+
+    def test_quit_keys_screenshot_kept(self, monkeypatch):
+        titles = self._titles(monkeypatch)
+        assert {"Quit", "Keys", "Screenshot"} <= set(titles)
+
+    def test_provider_registered_on_app(self):
+        from interactive_app import TunrCommandProvider
+
+        assert TunrCommandProvider in PlaylistInteractiveApp.COMMANDS
+        # The stock providers (system commands) are kept, not replaced.
+        assert PlaylistInteractiveApp.COMMANDS > {TunrCommandProvider}
+
+
+class TestSubmitTextRegression:
+    """The on_input_submitted -> _submit_text refactor must not change the
+    typed-input path: meta routing, gating, and history semantics are pinned
+    elsewhere; these cover the seam itself."""
+
+    def test_submit_text_strips_and_ignores_empty(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app._submit_text("   ")
+        assert app.commands == []
+        assert app.logged == []
+        assert app._history == []
+
+    def test_on_input_submitted_delegates_to_submit_text(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        seen = []
+        app._submit_text = seen.append
+        app.on_input_submitted(_SubmitEvent("/stats"))
+        assert seen == ["/stats"]
+
+    def test_pending_non_slash_bypasses_submit_text(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.last_search_track_ids = ["artist|||song"]
+        app.cli.last_search_query = "indie"
+        app._prompt_search_followup()
+        app._submit_text = lambda raw: pytest.fail("wizard answers must not submit")
+        app.on_input_submitted(_SubmitEvent("yes"))
+        assert app._pending_action == "search_action"
+
+    def test_submit_text_resets_history_navigation(self, monkeypatch):
+        app = _make_history_app(monkeypatch, ["/stats"])
+        app._history_prev()
+        assert app._navigating is True
+        app._submit_text("/env")
+        assert app._navigating is False
+        assert app._nav_placed_value is None
+        assert app._history_prefix == ""
+        assert app._history_index is None
+
+
+# ---------------------------------------------------------------------------
+# Pilot smoke: ctrl+p opens the palette on the real app, escape closes it
+# ---------------------------------------------------------------------------
+
+
+class TestPaletteSmoke:
+    def test_ctrl_p_opens_and_escape_closes(self, monkeypatch):
+        import logging as _logging
+
+        from textual.command import CommandPalette
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+                assert not CommandPalette.is_open(app)
+                await pilot.press("ctrl+p")
+                await pilot.pause()
+                assert CommandPalette.is_open(app)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not CommandPalette.is_open(app)
+
+        # on_mount runs configure_logging (replaces root handlers, sets the
+        # root level to INFO) and points the global ui sinks at this app;
+        # undo all of it afterwards so later tests log and emit normally.
+        import ui as _ui
+
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _run_async(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)

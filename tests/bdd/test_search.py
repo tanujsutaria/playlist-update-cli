@@ -124,7 +124,7 @@ def _provider_returns_canned(monkeypatch: pytest.MonkeyPatch, provider_guard, st
     ]
     captured = _canned_provider_run(canned)
 
-    def _fake_run_providers(query: str, expanded: bool = False) -> ProviderRun:
+    def _fake_run_providers(query: str, expanded: bool = False, on_progress=None) -> ProviderRun:
         state.setdefault("provider_query", query)
         state["provider_calls"] = state.get("provider_calls", 0) + 1
         return captured
@@ -138,7 +138,7 @@ def _provider_returns_canned(monkeypatch: pytest.MonkeyPatch, provider_guard, st
 def _provider_returns_empty(monkeypatch: pytest.MonkeyPatch, state):
     empty = _canned_provider_run([])
 
-    def _fake_run_providers(query: str, expanded: bool = False) -> ProviderRun:
+    def _fake_run_providers(query: str, expanded: bool = False, on_progress=None) -> ProviderRun:
         state["provider_calls"] = state.get("provider_calls", 0) + 1
         return empty
 

@@ -18,8 +18,17 @@ import interactive_app
 from arg_parse import setup_parsers
 from interactive_app import SPOTIFY_REQUIRED_KEYS, PlaylistInteractiveApp
 from main import PlaylistCLI
+from spotify_manager import SPOTIFY_SCOPES
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
+
+
+class _ScopeError(Exception):
+    """Mimics spotipy's insufficient-scope SpotifyException (403 + 'scope')."""
+
+    def __init__(self) -> None:
+        super().__init__("http status: 403, code:-1 - Insufficient client scope")
+        self.http_status = 403
 
 
 @pytest.fixture(autouse=True)
@@ -245,6 +254,76 @@ class TestFailureNoise:
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
         assert app._auto_sync_warned is True
+        # A generic failure keeps retrying — only scope errors stand down.
+        assert app._auto_sync_scope_blocked is False
         # The gate is still released after every failure.
         assert app.status == "idle"
         assert app.cli.sync_listen_history.call_count == 2
+
+
+class TestScopeBlock:
+    """A 403 insufficient-scope failure can never succeed on retry: log the
+    actionable hint once, stop burning the busy slot, and resume only when a
+    cached token granting every required scope appears."""
+
+    def test_scope_failure_logs_hint_once_and_stops_retrying(self, monkeypatch, caplog):
+        app = _make_app(monkeypatch)
+        app.cli.sync_listen_history.side_effect = _ScopeError()
+
+        with caplog.at_level(logging.WARNING, logger="interactive_app"):
+            app._maybe_auto_sync()  # fails on scope -> hint + blocked
+            app._maybe_auto_sync()  # blocked: no attempt, no new log
+            app._maybe_auto_sync()
+
+        assert app.cli.sync_listen_history.call_count == 1
+        assert len(app.started_workers) == 1  # busy slot burned exactly once
+        assert app._auto_sync_scope_blocked is True
+        assert app.status == "idle"  # gate released after the failure
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "/auth-reset" in warnings[0].getMessage()  # the actionable hint
+
+    def test_block_survives_a_token_that_still_lacks_scopes(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.cli.sync_listen_history.side_effect = _ScopeError()
+        app._maybe_auto_sync()
+        assert app._auto_sync_scope_blocked is True
+
+        # A cached token exists but still lacks the listening scopes (the user
+        # has not re-authorized yet): stay blocked.
+        monkeypatch.setattr(
+            interactive_app,
+            "get_cached_token_info",
+            lambda: {"access_token": "stale", "scope": "playlist-read-private"},
+        )
+        app._maybe_auto_sync()
+        assert app._auto_sync_scope_blocked is True
+        assert app.cli.sync_listen_history.call_count == 1
+
+    def test_block_self_clears_when_full_scope_token_appears(self, monkeypatch, caplog):
+        """The exact re-auth sequence: blocked -> /auth-reset --yes + consent
+        writes a full-scope token -> the next tick resumes syncing."""
+        app = _make_app(monkeypatch)
+        app.cli.sync_listen_history.side_effect = _ScopeError()
+        app._maybe_auto_sync()
+        assert app._auto_sync_scope_blocked is True
+
+        # /auth-reset --yes deleted the token; nothing cached yet: stay blocked.
+        monkeypatch.setattr(interactive_app, "get_cached_token_info", lambda: None)
+        app._maybe_auto_sync()
+        assert app.cli.sync_listen_history.call_count == 1
+
+        # The user re-authorized: a cached token with every required scope.
+        app.cli.sync_listen_history.side_effect = None
+        monkeypatch.setattr(
+            interactive_app,
+            "get_cached_token_info",
+            lambda: {"access_token": "fresh", "scope": " ".join(SPOTIFY_SCOPES)},
+        )
+        with caplog.at_level(logging.INFO, logger="interactive_app"):
+            app._maybe_auto_sync()
+
+        assert app._auto_sync_scope_blocked is False
+        assert app.cli.sync_listen_history.call_count == 2
+        assert app.status == "idle"
+        assert any("resuming" in r.message for r in caplog.records)
