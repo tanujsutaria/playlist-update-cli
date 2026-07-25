@@ -110,6 +110,17 @@ To broaden the last search (expanded source policy):
 /expand
 ```
 
+To browse the last /search or /find results in a cursorable table (alias `/browse`):
+```bash
+/results
+```
+Inside the browser: ↑/↓ moves, `enter` inspects a row (db context, sources,
+listens), `o` opens the track in Spotify, `space` toggles per-row selection,
+`a` marks the selected rows accepted in the db, `p` adds them to a playlist
+(name prompt stays inside the screen), `esc` closes. With nothing selected,
+`a`/`p` act on the cursor row. After /find the browser shows the taste-ranked
+order; after /search, the relevance order.
+
 ### Playlist operations
 ```bash
 /update "My Playlist" --count 10 --fresh-days 30

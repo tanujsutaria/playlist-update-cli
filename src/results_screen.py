@@ -1,0 +1,471 @@
+"""The /results browser: a cursorable DataTable over the last /search or /find.
+
+Three layers, deliberately separable (same doctrine as dashboard.py):
+
+* **Pure row logic** (`results_for_browse`, `rows_for_table`, `track_id_of`)
+  are plain functions over the cached result dicts — no Textual, no Rich
+  emission — so the table contents are unit-testable without a running app.
+  A follow-up viz pass can restyle the widget without touching these.
+* **ResultsAction** is the screen's dismissal payload: the app-side callback
+  (interactive_app._open_results) routes it into the existing apply worker.
+  The screen itself NEVER runs workers — while it is pushed it holds the
+  app-thread read contract on the shared sqlite connection (the same
+  serialized-use contract DashboardScreen documents), so all writes happen
+  after dismissal, back on the app's worker machinery.
+* **ResultsScreen** owns the chrome: the DataTable (row cursor), a detail
+  readout fed by ``cli.debug_track`` (synchronous app-thread read), per-row
+  selection markers, and an in-screen playlist-name prompt — the prompt never
+  round-trips through the main app's Input or its ``_pending_action`` wizard.
+
+Ordering: when the last discovery command was /find, ``cli.last_find_ranked``
+holds the taste-ranked rows (a fresh /search clears it), and the browser shows
+that order — the screen mirrors whatever table the user just saw. Otherwise it
+shows ``last_search_results`` in relevance order.
+"""
+
+from __future__ import annotations
+
+import logging
+import webbrowser
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
+from textual.coordinate import Coordinate
+from textual.screen import Screen
+from textual.widgets import DataTable, Input, Static
+
+from ui import ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_WHITE, CAPTION_STYLE
+
+logger = logging.getLogger(__name__)
+
+# A cached result row (from cli.last_search_results / cli.last_find_ranked).
+ResultItem = Mapping[str, Any]
+
+# Field truncation for the table: long titles/artists must not blow up column
+# widths (the DataTable does not soft-wrap cells).
+MAX_FIELD_CHARS = 40
+
+SELECT_MARK = "✓"
+
+
+@dataclass
+class ResultsAction:
+    """What the user asked the app to do with a subset of rows.
+
+    ``mode`` mirrors the existing apply path: "db" marks the tracks accepted,
+    "playlist" adds them to ``playlist_name``.
+    """
+
+    mode: str
+    track_ids: List[str] = field(default_factory=list)
+    playlist_name: Optional[str] = None
+
+
+def results_for_browse(cli: Any) -> List[Dict[str, Any]]:
+    """The rows /results shows, in the order the user last saw them.
+
+    ``last_find_ranked`` is set by /find (after taste re-ranking) and cleared
+    by every fresh /search, so its presence means the most recent discovery
+    command was /find — show the taste-ranked order. Otherwise fall back to
+    the relevance-ordered ``last_search_results``.
+    """
+    ranked = getattr(cli, "last_find_ranked", None)
+    if ranked:
+        return [dict(item) for item in ranked]
+    return [dict(item) for item in (getattr(cli, "last_search_results", None) or [])]
+
+
+def track_id_of(item: ResultItem) -> str:
+    """The cached row's track id, rebuilt from song/artist when absent."""
+    track_id = item.get("track_id")
+    if track_id:
+        return str(track_id)
+    song = str(item.get("song") or item.get("name") or "").strip()
+    artist = str(item.get("artist") or "").strip()
+    if song and artist:
+        return f"{artist.lower()}|||{song.lower()}"
+    return ""
+
+
+def _clip(value: object, limit: int = MAX_FIELD_CHARS) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
+
+
+def _fmt_score(item: ResultItem) -> str:
+    """Score column: /search rows carry ``score``; /find rows carry ``blended``."""
+    for key in ("score", "blended"):
+        value = item.get(key)
+        if isinstance(value, (int, float)):
+            return f"{float(value):.3f}"
+    return "—"
+
+
+def _fmt_metric(value: object) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.2f}" if not float(value).is_integer() else str(int(value))
+    return _clip(value, 16)
+
+
+def metric_names(results: Sequence[ResultItem]) -> List[str]:
+    """The union of metric keys across rows, in first-seen order."""
+    names: List[str] = []
+    for item in results:
+        metrics = item.get("metrics") or {}
+        if isinstance(metrics, Mapping):
+            for key in metrics:
+                if key not in names:
+                    names.append(str(key))
+    return names
+
+
+def rows_for_table(results: Sequence[ResultItem]) -> Tuple[List[str], List[List[str]]]:
+    """(headers, rows) for the browser table — pure, offline, no widgets.
+
+    Handles empty input, rows with missing metrics (blank cells), and long
+    fields (clipped). The selection-marker column is screen chrome and is NOT
+    part of this contract.
+    """
+    if not results:
+        return [], []
+    metrics = metric_names(results)
+    headers = ["#", "song", "artist", "year", "score"] + metrics
+    rows: List[List[str]] = []
+    for index, item in enumerate(results, 1):
+        row = [
+            str(index),
+            _clip(item.get("song") or item.get("name") or ""),
+            _clip(item.get("artist") or ""),
+            str(item.get("year") or "—"),
+            _fmt_score(item),
+        ]
+        item_metrics = item.get("metrics") or {}
+        if not isinstance(item_metrics, Mapping):
+            item_metrics = {}
+        row.extend(_fmt_metric(item_metrics.get(name)) for name in metrics)
+        rows.append(row)
+    return headers, rows
+
+
+def spotify_url_for_item(item: ResultItem) -> str:
+    """A clickable URL from the cached row itself (no db, no network)."""
+    url = str(item.get("spotify_url") or "")
+    if url:
+        return url
+    uri = str(item.get("spotify_uri") or "")
+    if uri.startswith("http"):
+        return uri
+    if uri.startswith("spotify:track:"):
+        tail = uri.split(":")[-1]
+        if tail:
+            return f"https://open.spotify.com/track/{tail}"
+    return ""
+
+
+class ResultsScreen(Screen[Optional[ResultsAction]]):
+    """Row-level browser over the cached results: ↑/↓ cursor, enter inspect,
+    space select, o open in Spotify, a accept selected, p playlist selected,
+    esc/q close. All reads run synchronously on the app thread (the pushed
+    screen holds the serialized-connection contract); the dismissal payload
+    carries the write intent back to the app, which owns the workers.
+    """
+
+    DEFAULT_CSS = """
+    ResultsScreen {
+        background: $background;
+        color: $foreground;
+        layout: vertical;
+    }
+    ResultsScreen #results_top {
+        height: 1;
+        padding: 0 2;
+        background: $surface;
+    }
+    ResultsScreen #results_table {
+        height: 1fr;
+        margin: 0 1;
+    }
+    ResultsScreen #results_detail {
+        height: 4;
+        padding: 0 2;
+    }
+    ResultsScreen #results_prompt {
+        display: none;
+        margin: 0 2;
+    }
+    ResultsScreen #results_footer {
+        height: 1;
+        padding: 0 2;
+        background: $surface;
+    }
+    """
+
+    BINDINGS: ClassVar[List[BindingType]] = [
+        Binding("escape", "close", "close", show=False),
+        Binding("q", "close", "close", show=False),
+        Binding("space", "toggle_select", "select", show=False),
+        Binding("o", "open_spotify", "open in spotify", show=False),
+        Binding("a", "accept_selected", "accept selected", show=False),
+        Binding("p", "playlist_selected", "add to playlist", show=False),
+    ]
+
+    def __init__(self, cli: Any) -> None:
+        super().__init__()
+        self.cli = cli
+        self.results: List[Dict[str, Any]] = results_for_browse(cli)
+        self.selected: Set[int] = set()
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="results_top")
+        yield DataTable(id="results_table")
+        yield Static(id="results_detail")
+        yield Input(placeholder="playlist name — enter to add, esc to cancel", id="results_prompt")
+        yield Static(id="results_footer")
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        headers, rows = rows_for_table(self.results)
+        if rows:
+            table.add_column(" ", key="_selected")
+            for header in headers:
+                table.add_column(header)
+            for index, row in enumerate(rows):
+                table.add_row(" ", *row, key=str(index))
+        self.query_one("#results_top", Static).update(self._render_top())
+        self.query_one("#results_footer", Static).update(self._render_footer())
+        if self.results:
+            self._show_detail(0)
+            table.focus()
+        else:
+            self._set_status(
+                Text("no cached results — run /search or /find first", style="dim"),
+            )
+
+    # ------------------------------------------------------------------
+    # Chrome
+    # ------------------------------------------------------------------
+
+    def _render_top(self) -> Text:
+        line = Text()
+        line.append("tunr results", style=f"bold {ACCENT_WHITE}")
+        line.append("  ")
+        query = str(getattr(self.cli, "last_search_query", None) or "")
+        if query:
+            line.append(_clip(query, 60), style=ACCENT_BLUE)
+            line.append("  ")
+        ranked = bool(getattr(self.cli, "last_find_ranked", None))
+        order = "taste-ranked (/find)" if ranked else "relevance (/search)"
+        line.append(f"{len(self.results)} rows · {order}", style="dim")
+        return line
+
+    def _render_footer(self) -> Text:
+        footer = Text(
+            "↑/↓ move · enter inspect · space select · o spotify"
+            " · a accept · p playlist · esc close",
+            style="dim",
+        )
+        if self.selected:
+            footer.append(" · ", style="dim")
+            footer.append(f"{len(self.selected)} selected", style=ACCENT_GREEN)
+        return footer
+
+    def _set_status(self, message: Text) -> None:
+        self.query_one("#results_detail", Static).update(message)
+
+    # ------------------------------------------------------------------
+    # Cursor + inspection (app-thread db reads; no workers here)
+    # ------------------------------------------------------------------
+
+    def _cursor_index(self) -> Optional[int]:
+        if not self.results:
+            return None
+        table = self.query_one(DataTable)
+        index = table.cursor_row
+        if 0 <= index < len(self.results):
+            return index
+        return None
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a row → inspect it via cli.debug_track's payload."""
+        index = self._cursor_index()
+        if index is not None:
+            self._show_detail(index, inspect=True)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        index = self._cursor_index()
+        if index is not None:
+            self._show_detail(index)
+
+    def _show_detail(self, index: int, inspect: bool = False) -> None:
+        item = self.results[index]
+        readout = Text()
+        song = str(item.get("song") or item.get("name") or "")
+        artist = str(item.get("artist") or "")
+        readout.append(_clip(f"{song} — {artist}", 70), style=f"bold {ACCENT_WHITE}")
+        readout.append("  ")
+        readout.append(_fmt_score(item), style=f"bold {ACCENT_ORANGE}")
+        providers = item.get("providers") or []
+        if providers:
+            readout.append(" · ", style="dim")
+            readout.append(", ".join(str(p) for p in providers), style="dim")
+        if inspect:
+            readout.append("\n")
+            readout.append_text(self._inspect_line(track_id_of(item)))
+        readout.append("\n")
+        readout.append(
+            f"track {track_id_of(item) or 'unknown'}",
+            style=CAPTION_STYLE,
+        )
+        self._set_status(readout)
+
+    def _inspect_line(self, track_id: str) -> Text:
+        """One dense line from cli.debug_track (synchronous app-thread read)."""
+        payload: Optional[Mapping[str, Any]] = None
+        if track_id:
+            try:
+                payload = self.cli.debug_track(track_id)
+            except Exception:
+                logger.debug("debug_track failed for %s", track_id, exc_info=True)
+        if not payload:
+            return Text("not in the local db yet — accept it to store it", style="dim")
+        track = payload.get("track") or {}
+        context = payload.get("context") or {}
+        line = Text()
+        line.append(f"status {track.get('status') or 'cached'}", style=ACCENT_GREEN)
+        line.append(" · ", style="dim")
+        line.append(
+            f"spotify {'yes' if track.get('spotify_id') else 'no'}",
+            style="dim",
+        )
+        line.append(" · ", style="dim")
+        ratio = context.get("strict_ratio") if isinstance(context, Mapping) else None
+        strict = f"{float(ratio):.2f}" if isinstance(ratio, (int, float)) else "—"
+        line.append(f"strict {strict}", style="dim")
+        line.append(" · ", style="dim")
+        line.append(f"{len(payload.get('sources') or [])} sources", style="dim")
+        line.append(" · ", style="dim")
+        line.append(f"{len(payload.get('listens') or [])} listens", style="dim")
+        return line
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def action_toggle_select(self) -> None:
+        index = self._cursor_index()
+        if index is None:
+            return
+        if index in self.selected:
+            self.selected.discard(index)
+            marker = " "
+        else:
+            self.selected.add(index)
+            marker = SELECT_MARK
+        table = self.query_one(DataTable)
+        table.update_cell_at(Coordinate(index, 0), Text(marker, style=ACCENT_GREEN))
+        self.query_one("#results_footer", Static).update(self._render_footer())
+
+    def _effective_ids(self) -> List[str]:
+        """The track ids an action applies to: the selected subset, or the
+        cursor row when nothing is selected (single-row acceptance)."""
+        indexes = sorted(self.selected)
+        if not indexes:
+            cursor = self._cursor_index()
+            indexes = [cursor] if cursor is not None else []
+        ids = [track_id_of(self.results[i]) for i in indexes]
+        return [track_id for track_id in ids if track_id]
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def action_open_spotify(self) -> None:
+        index = self._cursor_index()
+        if index is None:
+            return
+        item = self.results[index]
+        url = spotify_url_for_item(item)
+        if not url:
+            # Cached rows usually carry no URL (attaching one is a network
+            # step) — fall back to the local db record, never the network.
+            track_id = track_id_of(item)
+            lookup = getattr(self.cli, "spotify_url_for_track", None)
+            if track_id and callable(lookup):
+                try:
+                    url = lookup(track_id) or ""
+                except Exception:
+                    logger.debug("spotify url lookup failed for %s", track_id, exc_info=True)
+                    url = ""
+        if not url:
+            self._set_status(
+                Text(
+                    "no spotify link cached for this row — accept it to a playlist to resolve one",
+                    style="yellow",
+                )
+            )
+            return
+        self._open_url(url)
+        self._set_status(Text(f"opened {url}", style="dim"))
+
+    def _open_url(self, url: str) -> None:
+        """Thin OS seam (tests override): hand the URL to the default browser."""
+        try:
+            webbrowser.open(url)
+        except Exception:
+            logger.debug("Could not open browser for %s", url, exc_info=True)
+
+    def action_accept_selected(self) -> None:
+        ids = self._effective_ids()
+        if not ids:
+            self._set_status(Text("nothing to accept — select rows with space", style="yellow"))
+            return
+        self.dismiss(ResultsAction(mode="db", track_ids=ids))
+
+    def action_playlist_selected(self) -> None:
+        ids = self._effective_ids()
+        if not ids:
+            self._set_status(Text("nothing to add — select rows with space", style="yellow"))
+            return
+        prompt = self.query_one("#results_prompt", Input)
+        prompt.display = True
+        prompt.value = ""
+        prompt.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        name = event.value.strip()
+        if not name:
+            self._set_status(Text("enter a playlist name (esc cancels)", style="yellow"))
+            return
+        ids = self._effective_ids()
+        if not ids:
+            self._hide_prompt()
+            self._set_status(Text("nothing to add — select rows with space", style="yellow"))
+            return
+        self.dismiss(ResultsAction(mode="playlist", track_ids=ids, playlist_name=name))
+
+    def _hide_prompt(self) -> None:
+        prompt = self.query_one("#results_prompt", Input)
+        prompt.display = False
+        if self.results:
+            self.query_one(DataTable).focus()
+
+    def action_close(self) -> None:
+        prompt = self.query_one("#results_prompt", Input)
+        if prompt.display:
+            # Esc while naming a playlist cancels the prompt, not the screen.
+            self._hide_prompt()
+            return
+        self.dismiss(None)

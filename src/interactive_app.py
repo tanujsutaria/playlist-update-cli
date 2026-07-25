@@ -28,6 +28,7 @@ from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_mes
 from completions import TunrSuggester
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
+from results_screen import ResultsAction, ResultsScreen, results_for_browse
 from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
 from ui import (
     ACCENT_BLUE,
@@ -138,7 +139,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "restore-previous-rotation",
         ],
     ),
-    ("Discover", ["find", "search"]),
+    ("Discover", ["find", "search", "results"]),
     ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups"]),
 ]
 HELP_LEGACY = {"import"}
@@ -157,6 +158,8 @@ META_COMMAND_HELP = {
     "search-more": "Expand the last search",
     "dash": "Open the interactive dashboard (taste · stats · plays)",
     "dashboard": "Open the interactive dashboard (taste · stats · plays)",
+    "results": "Browse the last /search or /find results (enter=inspect, space=select, a/p=apply)",
+    "browse": "Browse the last /search or /find results (enter=inspect, space=select, a/p=apply)",
     "clear": "Clear the output pane",
     "cls": "Clear the output pane",
     "quit": "Exit the app",
@@ -664,6 +667,9 @@ class PlaylistInteractiveApp(App):
             return
         if text in ("dash", "dashboard"):
             self._open_dashboard()
+            return
+        if text in ("results", "browse"):
+            self._open_results()
             return
         if text in ("clear", "cls"):
             self.action_clear_log()
@@ -1611,11 +1617,23 @@ class PlaylistInteractiveApp(App):
             self._apply_search_results(mode=mode, playlist_name=raw.strip())
             return
 
-    def _apply_search_results(self, mode: str, playlist_name: Optional[str] = None) -> None:
+    def _apply_search_results(
+        self,
+        mode: str,
+        playlist_name: Optional[str] = None,
+        track_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Route accepted tracks into the existing mark/playlist worker.
+
+        Two callers: the typed wizard (track_ids=None → the pending payload's
+        full result set) and the /results browser's dismiss callback (an
+        explicit row-level subset).
+        """
         if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
-        track_ids = self._pending_payload.get("track_ids") or []
+        if track_ids is None:
+            track_ids = self._pending_payload.get("track_ids") or []
         if not track_ids:
             self.append_log(Text("No search results available.", style="yellow"))
             self._clear_pending()
@@ -1655,6 +1673,41 @@ class PlaylistInteractiveApp(App):
                 logger.debug("Could not refocus input after dashboard close", exc_info=True)
 
         self.push_screen(DashboardScreen(self.cli), callback=_refocus)
+
+    def _open_results(self) -> None:
+        """Push the /results browser; refocus the input and route any
+        row-level action into the apply worker when it closes.
+
+        Gated on the same `status` check as `_run_command` (and /dash): the
+        screen reads the shared sqlite connection synchronously on the app
+        thread (debug_track, spotify_url_for_track), so it must not open
+        while a worker (command or auto-sync) is mid-write. Auto-sync itself
+        bails while any screen is pushed (`screen_stack > 1`), so the
+        contract holds for the screen's whole lifetime. Writes happen only
+        AFTER dismissal, via the existing _apply_search_results worker.
+        """
+        if self.status != "idle":
+            self.append_log(Text("Another command is already running.", style="yellow"))
+            return
+        if not results_for_browse(self.cli):
+            self.append_log(
+                Text("No cached results to browse. Run /search or /find first.", style="yellow")
+            )
+            return
+
+        def _on_close(action: Optional[ResultsAction] = None) -> None:
+            try:
+                self.query_one(Input).focus()
+            except Exception:
+                logger.debug("Could not refocus input after results close", exc_info=True)
+            if action is not None and action.track_ids:
+                self._apply_search_results(
+                    mode=action.mode,
+                    playlist_name=action.playlist_name,
+                    track_ids=action.track_ids,
+                )
+
+        self.push_screen(ResultsScreen(self.cli), callback=_on_close)
 
     def _expand_search(self) -> None:
         if self._setup_mode:

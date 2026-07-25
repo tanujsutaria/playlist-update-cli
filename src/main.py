@@ -236,6 +236,10 @@ class PlaylistCLI:
         self.last_search_track_ids = None
         self.last_search_cached = False
         self.last_search_handled = False
+        # /find's taste-ranked rows (the order the user saw). A fresh /search
+        # clears this, so its presence means the last discovery command was
+        # /find — the /results browser mirrors that order.
+        self.last_find_ranked = None
         # True only when SEARCH_FINAL_TABLE_MODE=none left the transient
         # preview as the sole copy of the results; the TUI then keeps it.
         self.last_search_preview_persist = False
@@ -319,6 +323,7 @@ class PlaylistCLI:
         # True once a /search invocation already handled its own follow-up
         # (via --to/--save), so the interactive UI skips the modal prompts.
         self.last_search_handled = False
+        self.last_find_ranked = None
         self.last_search_preview_persist = False
 
     def _get_rotation_manager(self, playlist_name: str) -> RotationManager:
@@ -2893,6 +2898,10 @@ class PlaylistCLI:
         self.last_search_policy = {"path": "nextgen", "expanded": expanded}
         self.last_search_run_id = run_id
         self.last_search_track_ids = [item.track_id for item in results]
+        # A fresh search invalidates any earlier /find ranking; _handle_find
+        # re-sets this AFTER calling search_songs, so non-None always means
+        # "the most recent discovery command was /find".
+        self.last_find_ranked = None
         # A fresh search re-arms the interactive follow-up; the handler flips
         # this back on if --to/--save already dealt with the results.
         self.last_search_handled = False
@@ -3581,6 +3590,33 @@ class PlaylistCLI:
             if track_id:
                 return f"https://open.spotify.com/track/{track_id}"
         return uri
+
+    def spotify_url_for_track(self, track_id: str) -> str:
+        """Offline Spotify URL for a cached track: tracks.spotify_id → URL.
+
+        Cached search rows usually carry no spotify_url (attaching one is a
+        network step — _attach_spotify_urls); this is the local-db fallback
+        the /results browser uses for 'open in Spotify'. Never touches the
+        network; returns "" when the track has no stored Spotify identity.
+        """
+        if not track_id:
+            return ""
+        try:
+            record = self.repos.tracks.get(track_id)
+        except Exception as exc:
+            logger.debug("spotify_url_for_track lookup failed for %s: %s", track_id, exc)
+            return ""
+        raw = (record or {}).get("spotify_id") or ""
+        if not raw:
+            return ""
+        url = self._spotify_url_from_uri(raw)
+        if url == raw and not raw.startswith("http"):
+            # Bare Spotify track id (no scheme/URI prefix) — build the URL
+            # directly; anything else unrecognized is not a usable link.
+            if ":" not in raw and "/" not in raw:
+                return f"https://open.spotify.com/track/{raw}"
+            return ""
+        return url
 
     def _obscurity_mode(self) -> str:
         mode = (os.getenv("OBSCURITY_VALIDATION_MODE") or "strict").lower()
@@ -4629,6 +4665,9 @@ def _handle_find(cli: "PlaylistCLI", args: Any) -> int:
     finally:
         if not want_json:
             set_json_mode(False)
+    # Persist the taste-ranked order (search_songs above just cleared it):
+    # /results uses this so the browser mirrors the table /find rendered.
+    cli.last_find_ranked = ranked or None
 
     def _chosen_ids() -> List[str]:
         ids = [r["track_id"] for r in ranked if r.get("track_id")]

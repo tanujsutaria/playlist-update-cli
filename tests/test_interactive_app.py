@@ -1318,6 +1318,136 @@ class TestQuitExcludedFromHistory:
         assert app._history == ["/stats"]
 
 
+# ---------------------------------------------------------------------------
+# /results browser: open gating + the parametrized apply path
+# ---------------------------------------------------------------------------
+
+
+class TestOpenResults:
+    """_open_results (the real method, push_screen stubbed for headless runs)."""
+
+    def _app(self, monkeypatch):
+        app = _make_app(monkeypatch)
+        app.pushed = []
+        app.push_screen = lambda screen, callback=None: app.pushed.append((screen, callback))
+        return app
+
+    def test_no_cached_results_shows_message_not_empty_table(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.cli.last_search_results = None
+        app.cli.last_find_ranked = None
+        app._handle_command("/results")
+        assert app.pushed == []
+        assert "No cached results to browse" in _logged_text(app)
+
+    def test_busy_status_blocks_open(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.cli.last_search_results = [{"song": "A", "artist": "B", "track_id": "b|||a"}]
+        app.status = "running /stats"
+        app._handle_command("/results")
+        assert app.pushed == []
+        assert "Another command is already running" in _logged_text(app)
+
+    def test_cached_results_push_results_screen(self, monkeypatch):
+        from results_screen import ResultsScreen
+
+        app = self._app(monkeypatch)
+        app.cli.last_search_results = [{"song": "A", "artist": "B", "track_id": "b|||a"}]
+        app._handle_command("/browse")
+        assert len(app.pushed) == 1
+        assert isinstance(app.pushed[0][0], ResultsScreen)
+
+    def test_dismiss_action_routes_subset_into_apply(self, monkeypatch):
+        from results_screen import ResultsAction
+
+        app = self._app(monkeypatch)
+        app.cli.last_search_results = [
+            {"song": "A", "artist": "B", "track_id": "b|||a"},
+            {"song": "C", "artist": "D", "track_id": "d|||c"},
+        ]
+        applied = []
+        app._apply_search_results = lambda mode, playlist_name=None, track_ids=None: applied.append(
+            (mode, playlist_name, track_ids)
+        )
+        app._handle_command("/results")
+        _screen, callback = app.pushed[0]
+        callback(ResultsAction(mode="playlist", track_ids=["d|||c"], playlist_name="mix"))
+        assert applied == [("playlist", "mix", ["d|||c"])]
+
+    def test_dismiss_none_applies_nothing(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.cli.last_search_results = [{"song": "A", "artist": "B", "track_id": "b|||a"}]
+        applied = []
+        app._apply_search_results = lambda mode, playlist_name=None, track_ids=None: applied.append(
+            mode
+        )
+        app._handle_command("/results")
+        _screen, callback = app.pushed[0]
+        callback(None)
+        assert applied == []
+
+
+class _ApplyWorkerApp(DummyApp):
+    """Runs _apply_search_results' worker synchronously (headless)."""
+
+    def run_worker(self, fn, thread=False):
+        fn()
+
+    def call_from_thread(self, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+
+class _RecordingCli:
+    def __init__(self):
+        self.marked = []
+        self.playlist_writes = []
+        self.last_search_results = None
+        self.last_find_ranked = None
+        self.last_search_query = None
+
+    def mark_search_tracks(self, track_ids, status="accepted"):
+        self.marked.append((list(track_ids), status))
+
+    def add_search_to_playlist(self, playlist_name, track_ids):
+        self.playlist_writes.append((playlist_name, list(track_ids)))
+
+
+class TestApplySearchResultsParametrized:
+    """The refactor: explicit track_ids bypass the wizard's pending payload."""
+
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _ApplyWorkerApp(cli=_RecordingCli(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_explicit_track_ids_bypass_pending_payload(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._pending_payload = {"track_ids": ["wizard|||row"]}
+        app._apply_search_results(mode="db", track_ids=["picked|||row"])
+        assert app.cli.marked == [(["picked|||row"], "accepted")]
+        assert app.status == "idle"  # worker completed and reset
+
+    def test_wizard_path_still_uses_pending_payload(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._pending_payload = {"track_ids": ["wizard|||row"]}
+        app._apply_search_results(mode="db")
+        assert app.cli.marked == [(["wizard|||row"], "accepted")]
+
+    def test_playlist_mode_routes_subset_to_playlist(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._apply_search_results(mode="playlist", playlist_name="mix", track_ids=["picked|||row"])
+        assert app.cli.playlist_writes == [("mix", ["picked|||row"])]
+        assert app.cli.marked == []
+
+    def test_empty_explicit_ids_logs_message(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._apply_search_results(mode="db", track_ids=[])
+        assert app.cli.marked == []
+        assert "No search results available" in _logged_text(app)
+
+
 # ============================================================================
 # Ghost-text autocomplete (suggester wiring + Pilot end-to-end)
 # ============================================================================
