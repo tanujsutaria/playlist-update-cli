@@ -157,9 +157,17 @@ To broaden the last search (expanded source policy):
 ```bash
 /auth-status
 /auth-refresh
+/auth-reset --yes
 /clean
 /clean --dry-run
 ```
+
+`/auth-status` diffs the cached token's scopes against what the app needs and
+prints a verdict (e.g. `missing scopes: user-read-recently-played -> run
+/auth-reset`). `/auth-reset --yes` deletes only the cached token file so the
+next Spotify command re-opens the consent screen; bare `/auth-reset` just
+explains what it would do. Background listen-sync stops retrying after a
+missing-scope (403) failure and resumes automatically once you re-authorize.
 
 ### Help and exit
 ```bash

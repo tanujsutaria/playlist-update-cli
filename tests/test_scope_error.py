@@ -65,6 +65,12 @@ class TestScopes:
 
 
 class TestScopeErrorHint:
+    def test_hint_points_at_auth_reset_not_manual_delete(self):
+        """The hint and /auth-reset must give the SAME advice — no more
+        'delete the token file yourself' instructions anywhere."""
+        assert "/auth-reset" in SCOPE_REAUTH_HINT
+        assert ".spotify_cache" not in SCOPE_REAUTH_HINT
+
     def test_403_with_scope_message_returns_hint(self):
         exc = _FakeSpotifyException(403, "http status: 403, code:-1 - Insufficient client scope")
         assert scope_error_hint(exc) == SCOPE_REAUTH_HINT
