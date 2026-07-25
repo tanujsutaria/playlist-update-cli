@@ -40,6 +40,7 @@ class TestSetupParsers:
             "diff",
             "auth-status",
             "auth-refresh",
+            "auth-reset",
             "search",
             "find",
             "undo",
@@ -59,6 +60,23 @@ class TestSetupParsers:
             if hasattr(action, "choices") and action.choices:
                 for cmd in expected_commands:
                     assert cmd in action.choices, f"Command '{cmd}' not found in parser"
+
+
+class TestAuthResetCommand:
+    """Tests for auth-reset command parsing"""
+
+    def test_parse_auth_reset_defaults_unconfirmed(self):
+        """Bare auth-reset parses with yes=False (nothing gets deleted)."""
+        parser = setup_parsers()
+        args = parser.parse_args(["auth-reset"])
+        assert args.command == "auth-reset"
+        assert args.yes is False
+
+    def test_parse_auth_reset_with_yes(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["auth-reset", "--yes"])
+        assert args.command == "auth-reset"
+        assert args.yes is True
 
 
 class TestImportCommand:

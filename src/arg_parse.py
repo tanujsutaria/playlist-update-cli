@@ -496,6 +496,15 @@ def setup_parsers(
     # Auth commands
     subparsers.add_parser("auth-status", help="Show Spotify auth token status")
     subparsers.add_parser("auth-refresh", help="Refresh Spotify auth token if possible")
+    auth_reset_parser = subparsers.add_parser(
+        "auth-reset",
+        help="Delete the cached Spotify token so the next command re-opens consent",
+    )
+    auth_reset_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the reset (without this flag nothing is deleted)",
+    )
 
     # Interactive UI
     subparsers.add_parser("interactive", help="Launch the interactive UI")

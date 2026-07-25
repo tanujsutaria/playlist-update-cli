@@ -1,5 +1,6 @@
 """
-Unit tests for auth-status and auth-refresh commands.
+Unit tests for auth-status, auth-refresh, and auth-reset commands, plus the
+spotify_manager token-reset/scope-diff helpers behind them.
 """
 
 from datetime import datetime
@@ -7,6 +8,8 @@ from datetime import datetime
 import pytest
 
 import main
+import spotify_manager
+from spotify_manager import SPOTIFY_SCOPES
 
 
 @pytest.fixture
@@ -52,6 +55,145 @@ def test_auth_status_with_token(monkeypatch, cli_no_init):
     assert ["Expires at", expected_expires] in rows
     assert ["Expires in (seconds)", 3600] in rows
     assert ["Scopes", "playlist-read-private"] in rows
+
+
+def _auth_status_rows(monkeypatch, cli, token_info):
+    """Run auth_status against a fake cached token, capturing the table rows."""
+    monkeypatch.setattr(main, "get_cached_token_info", lambda: token_info)
+    rows_holder = {}
+    monkeypatch.setattr(main, "section", lambda *a, **k: None)
+    monkeypatch.setattr(main, "key_value_table", lambda rows: rows_holder.update(rows=rows))
+    cli.auth_status()
+    return rows_holder.get("rows", [])
+
+
+def _verdict(rows):
+    verdicts = [value for label, value in rows if label == "Verdict"]
+    assert len(verdicts) == 1
+    return verdicts[0]
+
+
+def test_auth_status_verdict_full_scopes(monkeypatch, cli_no_init):
+    """A token granting every required scope gets a clean verdict."""
+    token_info = {"expires_in": 3600, "scope": " ".join(SPOTIFY_SCOPES)}
+    rows = _auth_status_rows(monkeypatch, cli_no_init, token_info)
+    verdict = _verdict(rows)
+    assert "missing scopes" not in verdict
+    assert "all required scopes" in verdict
+
+
+def test_auth_status_verdict_missing_scopes(monkeypatch, cli_no_init):
+    """A stale token missing the listening scopes names them + /auth-reset."""
+    granted = [s for s in SPOTIFY_SCOPES if not s.startswith("user-")]
+    token_info = {"expires_in": 3600, "scope": " ".join(granted)}
+    rows = _auth_status_rows(monkeypatch, cli_no_init, token_info)
+    verdict = _verdict(rows)
+    assert verdict.startswith("missing scopes: ")
+    assert "user-read-recently-played" in verdict
+    assert "user-top-read" in verdict
+    assert "run /auth-reset" in verdict
+
+
+def test_auth_status_verdict_token_without_scope_field(monkeypatch, cli_no_init):
+    """A token whose scope field is absent counts as missing everything."""
+    rows = _auth_status_rows(monkeypatch, cli_no_init, {"expires_in": 3600})
+    verdict = _verdict(rows)
+    assert "missing scopes" in verdict
+    for scope in SPOTIFY_SCOPES:
+        assert scope in verdict
+
+
+def test_auth_status_no_token_still_short_circuits(monkeypatch, cli_no_init):
+    """No cached token: no verdict row is fabricated, just the info line."""
+    monkeypatch.setattr(main, "get_cached_token_info", lambda: None)
+    calls = []
+    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+    tables = []
+    monkeypatch.setattr(main, "key_value_table", lambda rows: tables.append(rows))
+
+    cli_no_init.auth_status()
+
+    assert any("No cached Spotify token found" in c for c in calls)
+    assert tables == []
+
+
+class TestMissingScopes:
+    def test_full_scope_string_has_nothing_missing(self):
+        assert spotify_manager.missing_scopes(" ".join(SPOTIFY_SCOPES)) == []
+
+    def test_partial_scope_string_reports_the_gap(self):
+        missing = spotify_manager.missing_scopes("playlist-read-private user-library-read")
+        assert "user-read-recently-played" in missing
+        assert "user-top-read" in missing
+        assert "user-library-read" not in missing
+
+    def test_none_and_empty_mean_everything_missing(self):
+        assert spotify_manager.missing_scopes(None) == list(SPOTIFY_SCOPES)
+        assert spotify_manager.missing_scopes("") == list(SPOTIFY_SCOPES)
+
+    def test_extra_granted_scopes_are_fine(self):
+        scope = " ".join(SPOTIFY_SCOPES) + " user-read-email"
+        assert spotify_manager.missing_scopes(scope) == []
+
+
+class TestResetCachedToken:
+    """The reset helper deletes by path only — token contents are never read."""
+
+    def test_deletes_existing_token_file(self, monkeypatch, tmp_path):
+        token_path = tmp_path / ".spotify_token"
+        token_path.write_text("opaque")
+        monkeypatch.setattr(spotify_manager, "_token_cache_path", lambda: token_path)
+
+        assert spotify_manager.reset_cached_token() is True
+        assert not token_path.exists()
+
+    def test_no_file_returns_false(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            spotify_manager, "_token_cache_path", lambda: tmp_path / ".spotify_token"
+        )
+        assert spotify_manager.reset_cached_token() is False
+
+
+class TestAuthReset:
+    def test_bare_reset_warns_and_deletes_nothing(self, monkeypatch, cli_no_init):
+        deleted = []
+        monkeypatch.setattr(main, "reset_cached_token", lambda: deleted.append(True) or True)
+        warnings = []
+        monkeypatch.setattr(main, "warning", lambda msg: warnings.append(msg))
+        sentinel = object()
+        cli_no_init._spotify = sentinel
+
+        cli_no_init.auth_reset()
+
+        assert deleted == []
+        assert cli_no_init._spotify is sentinel  # client untouched without --yes
+        assert any("--yes" in w for w in warnings)
+
+    def test_yes_deletes_token_and_drops_client(self, monkeypatch, cli_no_init):
+        deleted = []
+        monkeypatch.setattr(main, "reset_cached_token", lambda: deleted.append(True) or True)
+        infos = []
+        monkeypatch.setattr(main, "info", lambda msg: infos.append(msg))
+        cli_no_init._spotify = object()  # live client with the old token
+
+        cli_no_init.auth_reset(yes=True)
+
+        assert deleted == [True]
+        # The in-memory client must be dropped too: a live client keeps using
+        # its old token until expiry, so "next command re-opens consent" would
+        # otherwise be false.
+        assert cli_no_init._spotify is None
+        assert any("consent" in msg for msg in infos)
+
+    def test_yes_with_no_token_is_graceful(self, monkeypatch, cli_no_init):
+        monkeypatch.setattr(main, "reset_cached_token", lambda: False)
+        infos = []
+        monkeypatch.setattr(main, "info", lambda msg: infos.append(msg))
+
+        cli_no_init.auth_reset(yes=True)
+
+        assert cli_no_init._spotify is None
+        assert any("No cached Spotify token" in msg for msg in infos)
 
 
 def test_auth_refresh_no_token(monkeypatch, cli_no_init):
