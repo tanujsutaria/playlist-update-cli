@@ -55,6 +55,12 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 
 ## Usage
 
+### Command palette (ctrl+p)
+Press `ctrl+p` to open a fuzzy-searchable palette of every slash command with its
+one-line help. Picking a command that takes arguments preloads `/cmd ` into the
+input for you to finish; commands with no arguments run immediately. The stock
+theme switcher is removed from the palette so the OP-1 theme stays put.
+
 ### Output styling
 The UI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 

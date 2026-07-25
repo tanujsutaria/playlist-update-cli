@@ -7,17 +7,20 @@ import os
 import shlex
 import threading
 import time
+from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, NamedTuple, Optional, Tuple
 
 from rich import box
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container
 from textual.reactive import reactive
+from textual.screen import Screen
 from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
 
@@ -159,6 +162,73 @@ META_COMMAND_HELP = {
 }
 
 
+class PaletteCommand(NamedTuple):
+    """One tunr command as surfaced in the ctrl+p command palette."""
+
+    name: str
+    help: str
+    needs_argument: bool
+
+
+class TunrCommandProvider(Provider):
+    """Command-palette provider for tunr slash commands (ctrl+p).
+
+    Fuzzy-searches every advertised registry command plus the TUI meta
+    commands, each with its one-line help. Selecting an arg-taking command
+    preloads ``/cmd `` into the input for the user to finish; a provably
+    no-arg command is submitted through the exact same path (and gates) as
+    typed input.
+    """
+
+    def _palette_app(self) -> "Optional[PlaylistInteractiveApp]":
+        """The tunr app, or None when the palette should offer nothing.
+
+        Offers nothing when the palette was opened over a pushed screen
+        (e.g. /dash): the command input is not reachable there, and running
+        a command would race the modal screen's synchronous reads of the
+        shared sqlite connection.
+        """
+        app = self.app
+        if not isinstance(app, PlaylistInteractiveApp):
+            return None
+        stack = app.screen_stack
+        if stack and self.screen is not stack[0]:
+            return None
+        return app
+
+    @staticmethod
+    def _callback(app: "PlaylistInteractiveApp", entry: PaletteCommand) -> Callable[[], None]:
+        """Pick the palette action for one command (insert vs submit)."""
+        if entry.needs_argument:
+            return partial(app._palette_insert, entry.name)
+        return partial(app._palette_submit, entry.name)
+
+    async def search(self, query: str) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        matcher = self.matcher(query)
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            score = matcher.match(display)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(display),
+                    self._callback(app, entry),
+                    text=display,
+                    help=entry.help,
+                )
+
+    async def discover(self) -> Hits:
+        app = self._palette_app()
+        if app is None:
+            return
+        for entry in app._palette_commands():
+            display = f"/{entry.name}"
+            yield DiscoveryHit(display, self._callback(app, entry), help=entry.help)
+
+
 class UILogHandler(logging.Handler):
     def __init__(self, app: "PlaylistInteractiveApp") -> None:
         super().__init__()
@@ -228,6 +298,10 @@ class PlaylistInteractiveApp(App):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_log", "Clear output"),
     ]
+
+    # ctrl+p command palette: the stock providers plus the tunr command
+    # inventory (see TunrCommandProvider above).
+    COMMANDS = App.COMMANDS | {TunrCommandProvider}
 
     # Status sentinels are lowercase on purpose — the top bar renders them
     # verbatim, and the chrome follows TE's lowercase convention.
@@ -360,6 +434,18 @@ class PlaylistInteractiveApp(App):
         if self._pending_action and not raw.startswith("/"):
             self.append_log(Text(f"> {raw}", style="bold"))
             self._handle_pending_input(raw)
+            return
+        self._submit_text(raw)
+
+    def _submit_text(self, raw: str) -> None:
+        """Submit command text exactly as if it had been typed and entered.
+
+        Single choke point shared by the input widget and the command
+        palette: the setup-mode gate in _handle_command and the idle gate in
+        _run_command both apply downstream, unchanged.
+        """
+        raw = raw.strip()
+        if not raw:
             return
         if self._pending_action and raw.startswith("/"):
             # A slash command cancels the armed wizard so stray text typed
@@ -859,6 +945,80 @@ class PlaylistInteractiveApp(App):
             if isinstance(action, argparse._SubParsersAction):
                 return action.choices.get(name)
         return None
+
+    # ------------------------------------------------------------------
+    # Command palette (ctrl+p)
+    # ------------------------------------------------------------------
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Stock system commands minus the theme switcher.
+
+        The default "Theme" entry would knock the session off the OP-1
+        palette that the App CSS and the Rich-side twin in ui.py both assume.
+        Filter by title so this stays correct regardless of the order the
+        upstream commands are yielded in.
+        """
+        for command in super().get_system_commands(screen):
+            if "theme" in command.title.lower():
+                continue
+            yield command
+
+    @staticmethod
+    def _subparser_needs_argument(sub: argparse.ArgumentParser) -> bool:
+        """True when a command takes ANY positional or required option.
+
+        Safest-default classification for the palette: even an optional
+        positional (nargs='?') counts, because it is often effectively
+        required (e.g. /backup <name>). Only provably no-arg commands are
+        submitted directly; everything else is preloaded into the input.
+        """
+        for action in sub._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if not action.option_strings:
+                return True  # positional, even an optional one
+            if action.required:
+                return True
+        return False
+
+    def _palette_commands(self) -> List[PaletteCommand]:
+        """Palette inventory: advertised registry commands + meta commands."""
+        commands: List[PaletteCommand] = []
+        seen = set()
+        for name, help_text in self._command_summaries():
+            seen.add(name)
+            sub = self._find_subparser(name)
+            needs_argument = sub is None or self._subparser_needs_argument(sub)
+            commands.append(PaletteCommand(name, help_text, needs_argument))
+        for name in self._meta_command_names():
+            if name in seen:
+                continue
+            # Meta commands are all callable with no arguments.
+            commands.append(PaletteCommand(name, META_COMMAND_HELP[name], False))
+        return commands
+
+    def _palette_submit(self, name: str) -> None:
+        """Palette callback for a provably no-arg command.
+
+        Submits through _submit_text so the setup-mode and busy gates apply
+        exactly as they do for typed input.
+        """
+        self._submit_text(f"/{name}")
+
+    def _palette_insert(self, name: str) -> None:
+        """Palette callback for an arg-taking command.
+
+        Preloads ``/name `` into the input and focuses it so the user can
+        finish the arguments; nothing is submitted or dispatched.
+        """
+        self._write_input(f"/{name} ")
+        self._focus_input()
+
+    def _focus_input(self) -> None:
+        try:
+            self.query_one(Input).focus()
+        except Exception:
+            logger.debug("Could not focus the command input", exc_info=True)
 
     def _show_command_help(self, raw_name: str) -> None:
         name = raw_name.strip().lstrip("/").strip()
