@@ -433,8 +433,10 @@ class SearchPipeline:
         if progress:
             progress("search")
 
-        # Placeholder for eventual provider-specific progress updates.
-        provider_run = run_providers(query=query, expanded=expanded)
+        # Provider-level progress ("providers k/N") flows through the same
+        # string channel as the coarse stage names — the caller's `progress`
+        # callback is handed straight down as run_providers' on_progress.
+        provider_run = run_providers(query=query, expanded=expanded, on_progress=progress)
         # Surface the run-level scalars now, before the `if not track_ids: return`
         # early-out at the end of extraction, so they're populated even when the
         # provider yields nothing usable.

@@ -737,6 +737,99 @@ class TestRcSurfacing:
         assert app.notifications == [("/stats finished in 11s", "information")]
 
 
+# ============================================================================
+# Error-aware completion: ERROR-level records during an rc==0 command flip the
+# completion line from the dim "finished" to the red "exited with errors".
+# ============================================================================
+
+
+class TestErrorAwareCompletion:
+    def _worker_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = WorkerApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.cli.last_search_results = None
+        return app
+
+    def test_error_record_increments_counter_warning_does_not(self, monkeypatch):
+        import logging as _logging
+
+        from interactive_app import UILogHandler
+
+        app = _make_app(monkeypatch)
+        handler = UILogHandler(app)
+        warn = _logging.LogRecord("t", _logging.WARNING, __file__, 1, "meh", None, None)
+        err = _logging.LogRecord("t", _logging.ERROR, __file__, 1, "boom", None, None)
+        handler.emit(warn)
+        assert app._command_error_count == 0
+        handler.emit(err)
+        handler.emit(err)
+        assert app._command_error_count == 2
+
+    def test_run_command_resets_counter_and_stage(self, monkeypatch):
+        app = self._worker_app(monkeypatch)
+        app._command_error_count = 3
+        app._stage = "stale stage"
+        workers = []
+        monkeypatch.setattr(
+            app, "run_worker", lambda fn, thread=True: workers.append(fn), raising=False
+        )
+        PlaylistInteractiveApp._run_command(app, "stats", object())
+        assert app._command_error_count == 0
+        assert app._stage == ""
+        assert app.status == "running /stats"
+        assert len(workers) == 1
+
+    def test_zero_rc_with_errors_red_line_toast_no_finished_line(self, monkeypatch):
+        import time as _time
+
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 1  # a logger.error fired mid-command
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._run_started = _time.monotonic()
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert "/stats exited with errors (1 error logged)" in text
+        assert "/debug errors" in text
+        assert ("/stats exited with errors", "error") in app.notifications
+        assert "finished in" not in text  # the dim success line is suppressed
+
+    def test_zero_rc_with_multiple_errors_pluralizes(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 2
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._execute_command("stats", object())
+        assert "(2 errors logged)" in _logged_text(app)
+
+    def test_nonzero_rc_with_errors_no_double_print(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+
+        def _dispatch(cli, cmd, args):
+            app._command_error_count += 2
+            return 1
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+        app._execute_command("stats", object())
+        text = _logged_text(app)
+        assert text.count("exited with errors") == 1
+        assert len(app.notifications) == 1
+
+
 class TestPostCommandPreviewDismissal:
     def test_post_command_clears_preview(self, monkeypatch):
         import ui
@@ -835,6 +928,108 @@ class TestCommandDuration:
         app._post_command("stats")
         assert "finished in" not in _logged_text(app)
         assert app._last_run_note == ""
+
+    def test_post_command_failed_suppresses_finished_line(self, monkeypatch):
+        """failed=True skips the dim line (the red one already rendered) but
+        still records the last-run note and returns to idle."""
+        import time as _time
+
+        app = _make_app(monkeypatch)
+        app.cli.last_search_results = None
+        app._run_started = _time.monotonic() - 4.2
+        app._post_command("stats", failed=True)
+        assert "finished in" not in _logged_text(app)
+        assert app._last_run_note == "last: /stats 4s"
+        assert app._run_started is None
+        assert app.status == "idle"
+
+
+# ============================================================================
+# Live stage in the top bar: ui status sink -> _set_stage -> _render_top_bar
+# ============================================================================
+
+
+class SizedApp(DummyApp):
+    """DummyApp with a fixed size so _render_top_bar has room to render."""
+
+    @property
+    def size(self):
+        from textual.geometry import Size
+
+        return Size(120, 40)
+
+
+def _render_to_text(renderable, width: int = 120) -> str:
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, width=width).print(renderable)
+    return buf.getvalue()
+
+
+class TestStageInTopBar:
+    def _sized_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = SizedApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_emit_status_sets_stage_via_dispatch(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app._emit_status("extract 87/120")
+        assert app._stage == "extract 87/120"
+        app._emit_status(None)  # None clears
+        assert app._stage == ""
+
+    def test_stage_rendered_while_running(self, monkeypatch):
+        import time as _time
+
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        app._run_started = _time.monotonic()
+        app._set_stage("extract 87/120")
+        text = _render_to_text(app._render_top_bar())
+        assert "running /search · extract 87/120" in text
+
+    def test_stage_hidden_when_idle(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app._stage = "extract 87/120"  # stale stage must never show at idle
+        text = _render_to_text(app._render_top_bar())
+        assert "extract 87/120" not in text
+
+    def test_no_stage_renders_plain_running_label(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        text = _render_to_text(app._render_top_bar())
+        assert "running /search" in text
+        assert "·" not in text  # no stray separator without a stage
+
+    def test_set_idle_clears_stage(self, monkeypatch):
+        app = self._sized_app(monkeypatch)
+        app.status = "running /search"
+        app._set_stage("score 25/50")
+        app._set_idle()
+        assert app._stage == ""
+
+    def test_status_sink_registered_and_cleared_with_app_lifecycle(self, monkeypatch):
+        """on_mount installs ui's status sink; on_shutdown clears it (same
+        lifecycle as the output/preview sinks)."""
+        import ui
+
+        app = self._sized_app(monkeypatch)
+        # Simulate the shutdown half directly (mount needs a live Textual app).
+        ui.set_status_sink(app._emit_status)
+        try:
+            ui.emit_status("providers 3/10")
+            assert app._stage == "providers 3/10"
+            app.on_shutdown()
+            ui.emit_status("providers 4/10")
+            assert app._stage == "providers 3/10"  # sink uninstalled: unchanged
+        finally:
+            ui.set_status_sink(None)
 
 
 class _SubmitEvent:

@@ -39,6 +39,7 @@ from ui import (
     section,
     set_output_sink,
     set_preview_sink,
+    set_status_sink,
     subsection,
     table,
     warning,
@@ -243,6 +244,16 @@ class UILogHandler(logging.Handler):
             style = "white"
             if record.levelno >= logging.ERROR:
                 style = "red"
+                # Error-aware completion: count ERROR+ records (never WARNING)
+                # against the currently running command. Thread-safety note:
+                # emit() runs on whichever thread logged (usually the command
+                # worker); the reset happens on the app thread in _run_command
+                # BEFORE the worker starts, and the read happens on the worker
+                # thread in _execute_command AFTER dispatch returns. The
+                # one-command-at-a-time `status` gate means those never
+                # overlap, and the int increment itself is GIL-atomic — no
+                # lock needed.
+                self.app._command_error_count += 1
             elif record.levelno >= logging.WARNING:
                 style = "yellow"
             elif record.levelno >= logging.INFO:
@@ -331,6 +342,12 @@ class PlaylistInteractiveApp(App):
         self._spinner_timer = None
         self._run_started: Optional[float] = None
         self._last_run_note: str = ""
+        # ERROR-level log records seen since the current command started
+        # (incremented by UILogHandler.emit — see the thread-safety note there).
+        self._command_error_count = 0
+        # Latest pipeline stage string ("extract 87/120", "providers 3/10")
+        # rendered live in the top bar while a command runs.
+        self._stage: str = ""
         self._app_thread_id: Optional[int] = None
         # Background listen-sync: warn once, then stay quiet on repeat failures.
         self._auto_sync_warned = False
@@ -364,6 +381,7 @@ class PlaylistInteractiveApp(App):
         self._mounted = True
         set_output_sink(self._emit_renderable)
         set_preview_sink(self._emit_preview)
+        set_status_sink(self._emit_status)
         configure_logging(handler=UILogHandler(self))
         self._refresh_env_status()
         self._update_top_bar()
@@ -379,6 +397,7 @@ class PlaylistInteractiveApp(App):
         self._mounted = False
         set_output_sink(None)
         set_preview_sink(None)
+        set_status_sink(None)
 
     def on_resize(self) -> None:
         self._update_top_bar()
@@ -498,6 +517,16 @@ class PlaylistInteractiveApp(App):
 
     def _emit_renderable(self, renderable) -> None:
         self._dispatch_ui(self.append_log, renderable)
+
+    def _emit_status(self, stage: Optional[str]) -> None:
+        """ui.set_status_sink handler: stage strings from the pipeline worker."""
+        self._dispatch_ui(self._set_stage, stage)
+
+    def _set_stage(self, stage: Optional[str]) -> None:
+        self._stage = stage or ""
+        # The 0.2s spinner tick re-renders the bar anyway; this direct update
+        # just makes the new stage visible immediately (and in tests).
+        self._update_top_bar()
 
     @staticmethod
     def _resolve_history_path() -> Path:
@@ -683,6 +712,11 @@ class PlaylistInteractiveApp(App):
         if self.status != "idle":
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
+        # Fresh error window + stage for this command. App-thread writes; the
+        # handler's worker-thread increments cannot overlap because the worker
+        # has not started yet and the `status` gate above serializes commands.
+        self._command_error_count = 0
+        self._stage = ""
         self._run_started = time.monotonic()
         self.status = f"running /{command}"
         self.run_worker(lambda: self._execute_command(command, args), thread=True)
@@ -700,6 +734,23 @@ class PlaylistInteractiveApp(App):
                         style="red",
                     ),
                 )
+            elif self._command_error_count:
+                # rc==0 but ERROR-level records fired mid-run: the command
+                # succeeded only nominally (e.g. partial failures that still
+                # return 0). Render the honest red line. This branch is
+                # rc==0-only, so it can never double-print with the rc!=0
+                # line above.
+                failed = True
+                count = self._command_error_count
+                noun = "error" if count == 1 else "errors"
+                self.call_from_thread(
+                    self.append_log,
+                    Text(
+                        f"/{command} exited with errors ({count} {noun} logged) "
+                        "— run /debug errors for details.",
+                        style="red",
+                    ),
+                )
         except Exception as exc:
             failed = True
             logger.exception("Command failed: /%s", command)
@@ -713,7 +764,7 @@ class PlaylistInteractiveApp(App):
             )
         finally:
             self._notify_command_result(command, failed)
-            self.call_from_thread(self._post_command, command)
+            self.call_from_thread(self._post_command, command, failed)
 
     def _notify_command_result(self, command: str, failed: bool) -> None:
         """Emit at most one toast per command: error on failure, info when slow."""
@@ -732,7 +783,9 @@ class PlaylistInteractiveApp(App):
             # Toasts are best-effort; never let them break command teardown.
             logger.debug("Toast notification failed for /%s", command, exc_info=True)
 
-    def _post_command(self, command: str) -> None:
+    # `failed` defaults to False because several tests (and the wizard paths)
+    # call _post_command directly with just the command name.
+    def _post_command(self, command: str, failed: bool = False) -> None:
         # Dismiss the transient preview pane — unless the command flagged that
         # the preview is the only copy of its results (SEARCH_FINAL_TABLE_MODE=none
         # writes no scrollback table, so clearing would lose them).
@@ -741,7 +794,10 @@ class PlaylistInteractiveApp(App):
         if self._run_started is not None:
             elapsed = self._format_elapsed(time.monotonic() - self._run_started)
             self._last_run_note = f"last: /{command} {elapsed}"
-            self.append_log(Text(f"/{command} finished in {elapsed}", style="dim"))
+            if not failed:
+                # A failed command already rendered its red completion line in
+                # _execute_command — the dim "finished" line would contradict it.
+                self.append_log(Text(f"/{command} finished in {elapsed}", style="dim"))
         if (
             command == "search"
             and self.cli.last_search_results
@@ -752,6 +808,7 @@ class PlaylistInteractiveApp(App):
 
     def _set_idle(self) -> None:
         self._run_started = None
+        self._stage = ""
         self.status = "idle"
 
     # ------------------------------------------------------------------
@@ -1097,6 +1154,9 @@ class PlaylistInteractiveApp(App):
         if max_status_width < 8:
             return Text(label_text, style=SUBSECTION_STYLE)
         status_label = self.status
+        if self._stage and self.status != "idle":
+            # Live stage readout, e.g. "running /search · extract 87/120".
+            status_label = f"{status_label} · {self._stage}"
         if self._spinner_timer is not None:
             status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
         if self.status != "idle" and self._run_started is not None:

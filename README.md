@@ -70,6 +70,14 @@ theme switcher is removed from the palette so the OP-1 theme stays put.
 ### Output styling
 The UI uses Rich for colorized tables and headers. To disable color output, set `NO_COLOR=1` in your shell.
 
+### Truthful status (TUI)
+While a command runs, the top status bar shows the live pipeline stage and provider
+progress (e.g. `running /search · providers 3/10 • 42s`, then `extract 87/120`,
+`embed`, `score …`). Stage counters update every 25 items, so short runs may show
+only the stage name. When a command logs ERROR-level records but still exits 0
+(a partial failure), the completion line is a red "exited with errors — run
+/debug errors" instead of the dim "finished in Xs", plus an error toast.
+
 ### Search (deep web search + local embeddings)
 ```bash
 /search "late night jazz with soft vocals"

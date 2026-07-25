@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from web_search import run_deep_search
 
@@ -32,10 +32,15 @@ class ProviderRun:
     requested_metrics: List[str] = field(default_factory=list)
 
 
-def run_providers(query: str, expanded: bool = False) -> ProviderRun:
+def run_providers(
+    query: str,
+    expanded: bool = False,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> ProviderRun:
     results, _, providers, error, requested_metrics, summary, constraints, policy = run_deep_search(
         query=query,
         expanded=expanded,
+        on_progress=on_progress,
     )
     if error:
         if error == _NO_PROVIDERS_ERROR:
