@@ -228,3 +228,36 @@ def test_auth_refresh_without_expiry(monkeypatch, cli_no_init):
     cli_no_init.auth_refresh()
 
     assert any("Token refreshed" in c for c in calls)
+
+
+def test_auth_manager_warns_on_localhost_redirect_uri(monkeypatch, caplog):
+    """A localhost redirect URI gets a warning naming the 127.0.0.1 fix.
+
+    Spotify rejects `localhost` at the consent screen with a browser-side
+    "redirect_uri: Insecure" error and no terminal hint; the warning is the
+    only in-app pointer to the fix.
+    """
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+    monkeypatch.setattr(spotify_manager, "SpotifyOAuth", lambda **kwargs: object())
+    monkeypatch.setattr(spotify_manager, "_get_cache_handler", lambda: None)
+
+    with caplog.at_level("WARNING", logger="spotify_manager"):
+        spotify_manager._get_auth_manager()
+
+    assert any("127.0.0.1" in r.message for r in caplog.records)
+
+
+def test_auth_manager_accepts_loopback_ip_redirect_uri(monkeypatch, caplog):
+    """The loopback IP literal form does not trigger the localhost warning."""
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+    monkeypatch.setattr(spotify_manager, "SpotifyOAuth", lambda **kwargs: object())
+    monkeypatch.setattr(spotify_manager, "_get_cache_handler", lambda: None)
+
+    with caplog.at_level("WARNING", logger="spotify_manager"):
+        spotify_manager._get_auth_manager()
+
+    assert not any("Insecure" in r.message for r in caplog.records)

@@ -13,12 +13,17 @@ Interactive CLI for Spotify playlist management with rotation, similarity, histo
 ## Setup
 
 1. Create a Spotify Developer app at https://developer.spotify.com/dashboard
+   and register `http://127.0.0.1:8888/callback` as a Redirect URI.
+   Spotify rejects `localhost` at the consent screen ("redirect_uri: Insecure")
+   — only HTTPS or the loopback IP literal `http://127.0.0.1:<port>` is
+   accepted, and it must match `SPOTIFY_REDIRECT_URI` below exactly
+   (host, port, and path).
 
 2. Create `config/.env` with required keys:
    ```
    SPOTIFY_CLIENT_ID=your_client_id
    SPOTIFY_CLIENT_SECRET=your_client_secret
-   SPOTIFY_REDIRECT_URI=your_redirect_uri
+   SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
    ```
    Optional for /search:
    ```

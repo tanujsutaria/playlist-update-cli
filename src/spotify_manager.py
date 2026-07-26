@@ -172,6 +172,19 @@ def _get_auth_manager(open_browser: bool = True) -> SpotifyOAuth:
         logger.warning("SPOTIFY_CLIENT_SECRET not set")
     if not redirect_uri:
         logger.warning("SPOTIFY_REDIRECT_URI not set")
+    elif "localhost" in redirect_uri:
+        # Spotify's Feb 2025 security policy (enforced Apr 9 2025) rejects
+        # `localhost` redirect URIs at consent time with a browser-side
+        # "redirect_uri: Insecure" error and no terminal hint. Only HTTPS or
+        # the loopback IP literal (http://127.0.0.1:<port>) is accepted, and
+        # the Dashboard entry must match exactly.
+        logger.warning(
+            "SPOTIFY_REDIRECT_URI uses 'localhost', which Spotify rejects at "
+            "the consent screen ('redirect_uri: Insecure'). Use the loopback "
+            "IP literal instead (e.g. http://127.0.0.1:8888/callback), keeping "
+            "the same port/path, and register the identical URI in the Spotify "
+            "Developer Dashboard."
+        )
     return SpotifyOAuth(
         scope=" ".join(SPOTIFY_SCOPES),
         redirect_uri=redirect_uri,
