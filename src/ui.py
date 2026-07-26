@@ -319,6 +319,18 @@ def warning(message: str) -> None:
     _emit(Text(message, style="yellow"))
 
 
+def error_panel(message: Union[str, Text], *, title: str = "Error") -> Panel:
+    """The one place error chrome is defined: red text in a red-bordered panel.
+
+    Both `error()` below and the TUI's inline error sites (interactive_app)
+    build their panels here, so a failure looks identical no matter which
+    layer rendered it. A plain string is styled red; a pre-styled Text passes
+    through untouched (callers that need mixed styling keep it).
+    """
+    text = message if isinstance(message, Text) else Text(message, style="red")
+    return Panel(text, title=title, border_style="red")
+
+
 def error(message: str, *, title: str = "Error") -> None:
     """Render a failure as a red panel. Red == the command failed.
 
@@ -327,7 +339,7 @@ def error(message: str, *, title: str = "Error") -> None:
     (the TUI scrollback); otherwise in json mode it prints to stderr so the
     `--json` stdout payload stays pure; otherwise it prints to the console.
     """
-    renderable = Panel(Text(message, style="red"), title=title, border_style="red")
+    renderable = error_panel(message, title=title)
     if _output_sink:
         _output_sink(renderable)
     elif is_json_mode():

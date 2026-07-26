@@ -26,6 +26,12 @@ class FakeSpotify:
     def __init__(self, tracks: List[Dict[str, Any]]) -> None:
         self.tracks = tracks
         self.replace_calls: List[List[Any]] = []
+        # Mirrors SpotifyManager's name->id cache; the suggest-on-miss
+        # pre-check resolves through get_playlist_id before loading tracks.
+        self.playlists: Dict[str, str] = {"My Mix": "playlist_my_mix"}
+
+    def get_playlist_id(self, name: str) -> Any:
+        return self.playlists.get(name)
 
     def get_playlist_tracks(self, name: str) -> List[Dict[str, Any]]:
         return list(self.tracks)
