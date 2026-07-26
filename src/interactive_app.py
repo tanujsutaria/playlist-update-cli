@@ -29,7 +29,12 @@ from completions import TunrSuggester
 from dashboard import DashboardScreen
 from main import PlaylistCLI, configure_logging, dispatch_command
 from results_screen import ResultsAction, ResultsScreen, results_for_browse
-from spotify_manager import get_cached_token_info, missing_scopes, scope_error_hint
+from spotify_manager import (
+    SPOTIFY_ENV_KEYS,
+    get_cached_token_info,
+    missing_scopes,
+    scope_error_hint,
+)
 from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
@@ -71,11 +76,8 @@ OP1_THEME = Theme(
 # Persisted command history is capped to this many lines (enforced on load).
 HISTORY_MAX_LINES = 500
 
-SPOTIFY_REQUIRED_KEYS = [
-    "SPOTIFY_CLIENT_ID",
-    "SPOTIFY_CLIENT_SECRET",
-    "SPOTIFY_REDIRECT_URI",
-]
+# Canonical list lives in spotify_manager (shared with /status).
+SPOTIFY_REQUIRED_KEYS = list(SPOTIFY_ENV_KEYS)
 
 SEARCH_OPTIONAL_KEYS = [
     "ANTHROPIC_API_KEY",
@@ -83,6 +85,9 @@ SEARCH_OPTIONAL_KEYS = [
 ]
 
 COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
+    # Read-only local snapshot — designed for the "is my setup even
+    # configured?" audience, so it must run before credentials exist.
+    "status",
     "backup",
     "list-backups",
     "restore",
@@ -111,6 +116,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
     (
         "Set up",
         [
+            "status",
             "auth-status",
             "auth-refresh",
             "auth-reset",

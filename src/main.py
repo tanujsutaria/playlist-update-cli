@@ -33,7 +33,9 @@ from rotation_manager import RotationManager
 from scoring import PlaylistScoreConfig
 from song_store import SongStore
 from spotify_manager import (
+    SPOTIFY_ENV_KEYS,
     SpotifyManager,
+    cached_token_summary,
     get_cached_token_info,
     missing_scopes,
     refresh_cached_token,
@@ -41,7 +43,7 @@ from spotify_manager import (
     scope_error_hint,
     set_retry_status_callback,
 )
-from storage.db import Database
+from storage.db import Database, get_db_path
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.sonic import SONIC_FEATURES, describe_sonic
@@ -92,6 +94,7 @@ from ui import (
     text_line,
     warning,
 )
+from web_search import detect_search_commands
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,81 @@ def _coverage_and_backfill(conn: Any) -> Tuple[Dict[str, Dict[str, int]], Dict[s
     coverage = {key: {"have": n, "total": total} for key, n in have.items()}
     backfill = {f"missing_{key}": total - n for key, n in have.items()}
     return coverage, backfill
+
+
+def _render_backfill_runway(backfill: Dict[str, int]) -> None:
+    """Render the backfill gaps + per-gap remedies block (shared by /profile
+    and /status), from a ``_coverage_and_backfill`` gap dict.
+
+    Sonic is deliberately excluded from any "complete" claim — AcousticBrainz
+    coverage is partial by nature and never inferred. Remedies are per-gap:
+    /enrich closes context+embedding gaps only; sonic comes from /sonic;
+    spotify ids resolve when tracks are re-matched, not via /enrich.
+    """
+    gap_parts: List[str] = []
+    if backfill["missing_embeddings"]:
+        gap_parts.append(f"{backfill['missing_embeddings']} tracks awaiting embeddings")
+    if backfill["missing_context"]:
+        gap_parts.append(f"{backfill['missing_context']} unenriched")
+    if backfill["missing_sonic"]:
+        gap_parts.append(f"{backfill['missing_sonic']} without sonic data")
+    if backfill["missing_spotify_id"]:
+        gap_parts.append(f"{backfill['missing_spotify_id']} missing spotify ids")
+    hard_gaps = (
+        backfill["missing_embeddings"]
+        or backfill["missing_context"]
+        or backfill["missing_spotify_id"]
+    )
+    if not hard_gaps:
+        if backfill["missing_sonic"]:
+            notice(
+                f"{backfill['missing_sonic']} tracks without sonic data — "
+                "AcousticBrainz coverage is partial by nature."
+            )
+        else:
+            info("Backfill complete — every track has embeddings, context, and ids.")
+        return
+    remedies: List[str] = []
+    if backfill["missing_context"] or backfill["missing_embeddings"]:
+        remedies.append("/enrich backfills context + embeddings")
+    if backfill["missing_sonic"]:
+        remedies.append("/sonic fetches AcousticBrainz features (partial by nature)")
+    if backfill["missing_spotify_id"]:
+        remedies.append("spotify ids resolve on the next playlist match")
+    ink_panel(
+        Group(
+            Text(" · ".join(gap_parts)),
+            Text(" · ".join(remedies), style="dim"),
+        ),
+        title="Backfill runway",
+    )
+
+
+def _auth_token_rows(token_info: Dict[str, Any]) -> List[List[Any]]:
+    """Key/value rows summarizing a cached token's METADATA — never its secrets.
+
+    Shared by ``auth_status`` (spotipy's validated token dict) and ``/status``
+    (the offline ``cached_token_summary``); rows are emitted only for the
+    fields the given dict actually has. The verdict diffs the CACHED token's
+    granted scopes against what the app requests now — it reads the given
+    dict only and never live-validates the token against Spotify.
+    """
+    expires_at = token_info.get("expires_at")
+    expires_in = token_info.get("expires_in")
+    scope = token_info.get("scope")
+    rows: List[List[Any]] = []
+    if expires_at:
+        rows.append(["Expires at", datetime.fromtimestamp(expires_at).isoformat()])
+    if expires_in:
+        rows.append(["Expires in (seconds)", expires_in])
+    if scope:
+        rows.append(["Scopes", scope])
+    missing = missing_scopes(scope)
+    if missing:
+        rows.append(["Verdict", f"missing scopes: {', '.join(missing)} -> run /auth-reset"])
+    else:
+        rows.append(["Verdict", "cached token grants all required scopes"])
+    return rows
 
 
 def _concentration_verdict(top10_share_pct: float) -> str:
@@ -915,51 +993,10 @@ class PlaylistCLI:
                         f"latest {_month_label(months[-1][0])}."
                     )
 
-            # Backfill runway: the same JOIN-counted gaps /stats reports. Sonic
-            # is deliberately excluded from any "complete" claim — AcousticBrainz
-            # coverage is partial by nature and never inferred.
+            # Backfill runway: the same JOIN-counted gaps /stats reports,
+            # rendered by the helper /status shares.
             coverage, backfill = _coverage_and_backfill(conn)
-            gap_parts: List[str] = []
-            if backfill["missing_embeddings"]:
-                gap_parts.append(f"{backfill['missing_embeddings']} tracks awaiting embeddings")
-            if backfill["missing_context"]:
-                gap_parts.append(f"{backfill['missing_context']} unenriched")
-            if backfill["missing_sonic"]:
-                gap_parts.append(f"{backfill['missing_sonic']} without sonic data")
-            if backfill["missing_spotify_id"]:
-                gap_parts.append(f"{backfill['missing_spotify_id']} missing spotify ids")
-            hard_gaps = (
-                backfill["missing_embeddings"]
-                or backfill["missing_context"]
-                or backfill["missing_spotify_id"]
-            )
-            if not hard_gaps:
-                if backfill["missing_sonic"]:
-                    notice(
-                        f"{backfill['missing_sonic']} tracks without sonic data — "
-                        "AcousticBrainz coverage is partial by nature."
-                    )
-                else:
-                    info("Backfill complete — every track has embeddings, context, and ids.")
-            else:
-                # Prescribe per-gap remedies: /enrich closes context+embedding
-                # gaps only; sonic comes from /sonic (AcousticBrainz, partial by
-                # nature); spotify ids resolve when tracks are re-matched, not
-                # via /enrich.
-                remedies: List[str] = []
-                if backfill["missing_context"] or backfill["missing_embeddings"]:
-                    remedies.append("/enrich backfills context + embeddings")
-                if backfill["missing_sonic"]:
-                    remedies.append("/sonic fetches AcousticBrainz features (partial by nature)")
-                if backfill["missing_spotify_id"]:
-                    remedies.append("spotify ids resolve on the next playlist match")
-                ink_panel(
-                    Group(
-                        Text(" · ".join(gap_parts)),
-                        Text(" · ".join(remedies), style="dim"),
-                    ),
-                    title="Backfill runway",
-                )
+            _render_backfill_runway(backfill)
 
             return {
                 "tracks": total_tracks,
@@ -4442,6 +4479,148 @@ class PlaylistCLI:
         except Exception as e:
             logger.error(f"Error generating playlist diff: {str(e)}")
 
+    def show_status(self) -> Dict[str, Any]:
+        """One-screen, read-only snapshot: storage, auth, data coverage, config.
+
+        Offline by design — reads the local DB, the token file's METADATA
+        (via ``cached_token_summary``, never spotipy's validate/refresh path,
+        which can hit the network), and environment key NAMES. No Spotify
+        calls, no token contents, no secret values. Returns the payload the
+        sections rendered (tests pin the numbers).
+        """
+        payload: Dict[str, Any] = {}
+        conn = self.repos.conn
+        section("Status", "read-only · offline")
+
+        # -- Storage: cheap COUNT(*)s only — never loads full objects. -----
+        storage_obj = getattr(self, "_storage", None)
+        db_path = storage_obj.path if storage_obj is not None else get_db_path()
+        try:
+            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            schema_version: Optional[int] = int(row[0]) if row is not None else 0
+        except Exception:
+            schema_version = None  # database predates schema_version tracking
+
+        def _count(table: str) -> int:
+            # `table` is a trusted literal from the calls below, never input.
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+        coverage, backfill = _coverage_and_backfill(conn)
+        tracks = coverage["context"]["total"]
+        listen_events = _count("listen_events")
+        mirrored_playlists = _count("spotify_playlists")
+        rotation_playlists = _count("playlists")
+        generations = _count("rotation_generations")
+        payload["storage"] = {
+            "db_path": str(db_path),
+            "schema_version": schema_version,
+            "tracks": tracks,
+            "contexts": coverage["context"]["have"],
+            "embeddings": coverage["embeddings"]["have"],
+            "sonic": coverage["sonic"]["have"],
+            "listen_events": listen_events,
+            "mirrored_playlists": mirrored_playlists,
+            "rotation_playlists": rotation_playlists,
+            "rotation_generations": generations,
+        }
+        subsection("Storage")
+        key_value_table(
+            [
+                ["DB", str(db_path)],
+                ["Schema", f"v{schema_version}" if schema_version is not None else "untracked"],
+                ["Tracks", tracks],
+                ["Enriched contexts", f"{coverage['context']['have']}/{tracks}"],
+                ["Embeddings", f"{coverage['embeddings']['have']}/{tracks}"],
+                ["Sonic features", f"{coverage['sonic']['have']}/{tracks}"],
+                ["Listen events", listen_events],
+                ["Mirrored playlists", mirrored_playlists],
+                ["Rotation playlists", f"{rotation_playlists} ({generations} generations)"],
+            ]
+        )
+
+        # -- Auth: offline only — token METADATA + env key NAMES. ----------
+        missing_env = [key for key in SPOTIFY_ENV_KEYS if not os.getenv(key)]
+        token = cached_token_summary()
+        auth_rows: List[List[Any]] = []
+        if missing_env:
+            auth_rows.append(["Credentials", f"missing env: {', '.join(missing_env)}"])
+        else:
+            auth_rows.append(["Credentials", "all Spotify env keys set"])
+        if token is None:
+            auth_rows.append(["Token", "no cached token — the next Spotify command opens consent"])
+        else:
+            expires_at = token.get("expires_at")
+            state = "cached"
+            if expires_at:
+                expired = datetime.fromtimestamp(expires_at) <= datetime.now()
+                state = "cached · expired (refreshes on next use)" if expired else "cached · valid"
+            auth_rows.append(["Token", state])
+            auth_rows.extend(_auth_token_rows(token))
+        subsection("Auth")
+        key_value_table(auth_rows)
+        payload["auth"] = {
+            "missing_env": missing_env,
+            "token_present": token is not None,
+            "missing_scopes": missing_scopes(token.get("scope")) if token else None,
+        }
+
+        # -- Data coverage: the same gaps+remedies /profile renders. -------
+        subsection("Data coverage")
+        if tracks == 0:
+            notice("Library is empty — /ingest, /pull, or /search to begin.")
+        else:
+            _render_backfill_runway(backfill)
+        if listen_events == 0:
+            notice(
+                "Listen history is empty — /listen-sync polls recent plays; "
+                "/import-history seeds a GDPR export."
+            )
+        payload["coverage"] = {"backfill": backfill, "listen_events": listen_events}
+
+        # -- Config: provider/config PRESENCE only — values never shown. ---
+        playlist_row = conn.execute(
+            "SELECT name, current_generation FROM playlists "
+            "ORDER BY updated_at IS NULL, updated_at DESC, name ASC LIMIT 1"
+        ).fetchone()
+        # detect_search_commands values are command lines (trusted-local but
+        # potentially sensitive) — only the provider NAMES are ever rendered.
+        providers = sorted(detect_search_commands())
+        overrides = sorted(
+            key
+            for key, value in os.environ.items()
+            if value and key.startswith(("WEB_SEARCH_", "WEB_SCORE_"))
+        )
+        model_name = AppConfig.from_env().model_name
+        subsection("Config")
+        key_value_table(
+            [
+                [
+                    "Active playlist",
+                    (
+                        f"{playlist_row['name']} (generation {playlist_row['current_generation']})"
+                        if playlist_row is not None
+                        else "none yet — /update <name> starts one"
+                    ),
+                ],
+                ["Embedding model", model_name],
+                [
+                    "Search providers",
+                    ", ".join(providers) if providers else "none — see /setup for API keys",
+                ],
+                [
+                    "WEB_SEARCH_*/WEB_SCORE_* env",
+                    f"set: {', '.join(overrides)}" if overrides else "not set",
+                ],
+            ]
+        )
+        payload["config"] = {
+            "active_playlist": playlist_row["name"] if playlist_row is not None else None,
+            "embedding_model": model_name,
+            "search_providers": providers,
+            "provider_env_keys": overrides,
+        }
+        return payload
+
     def auth_status(self):
         """Show Spotify auth token status without triggering auth flow."""
         token_info = get_cached_token_info()
@@ -4449,30 +4628,8 @@ class PlaylistCLI:
             info("No cached Spotify token found.")
             return
 
-        expires_at = token_info.get("expires_at")
-        expires_in = token_info.get("expires_in")
-        scope = token_info.get("scope")
-
         section("Spotify Auth Status")
-        rows = []
-        if expires_at:
-            expires_dt = datetime.fromtimestamp(expires_at)
-            rows.append(["Expires at", expires_dt.isoformat()])
-        if expires_in:
-            rows.append(["Expires in (seconds)", expires_in])
-        if scope:
-            rows.append(["Scopes", scope])
-
-        # Verdict: diff the CACHED token's granted scopes against what the app
-        # requests now. This reads the cache only — it does not live-validate
-        # the token against Spotify.
-        missing = missing_scopes(scope)
-        if missing:
-            rows.append(["Verdict", f"missing scopes: {', '.join(missing)} -> run /auth-reset"])
-        else:
-            rows.append(["Verdict", "cached token grants all required scopes"])
-
-        key_value_table(rows)
+        key_value_table(_auth_token_rows(token_info))
 
     def auth_reset(self, yes: bool = False):
         """Delete the cached Spotify token so the next command re-authorizes.
@@ -4584,6 +4741,11 @@ def _handle_stats(cli: "PlaylistCLI", args: Any) -> int:
         if json_mode:
             emit_json(payload)
         set_json_mode(False)
+    return 0
+
+
+def _handle_status(cli: "PlaylistCLI", args: Any) -> int:
+    cli.show_status()
     return 0
 
 
@@ -5089,6 +5251,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "import": _handle_import,
     "update": _handle_update,
     "stats": _handle_stats,
+    "status": _handle_status,
     "profile": _handle_profile,
     "taste": _handle_taste,
     "view": _handle_view,

@@ -133,6 +133,12 @@ def setup_parsers(
         "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
     )
 
+    # Status command (read-only, offline): one screen answering "what state
+    # is my tunr in?" — storage counts, auth, data coverage, config.
+    subparsers.add_parser(
+        "status", help="One-screen status: storage, auth, data coverage, config (offline)"
+    )
+
     # Profile command (library visualization)
     profile_parser = subparsers.add_parser(
         "profile", help="Visualize your library: top artists + rotation coverage"
