@@ -39,6 +39,7 @@ from spotify_manager import (
     refresh_cached_token,
     reset_cached_token,
     scope_error_hint,
+    set_retry_status_callback,
 )
 from storage.db import Database
 from storage.migrations import ensure_schema
@@ -3116,20 +3117,34 @@ class PlaylistCLI:
         sp = self.spotify.sp
         me = self.spotify.current_user_id()
 
+        # Live progress contract (the /search _progress pattern): emit_status
+        # feeds the TUI top bar (no-op elsewhere) with SHORT stage strings, and
+        # scrollback gets AT MOST one info line per paging step — never per
+        # item — so a 1200-track pull is visible without spamming the log.
         remote: List[dict] = []
+        emit_status("playlists p1")
         results = sp.current_user_playlists(limit=50)
+        page = 1
         while results:
             remote.extend(p for p in (results.get("items") or []) if p)
-            results = sp.next(results) if results.get("next") else None
+            if results.get("next"):
+                page += 1
+                emit_status(f"playlists p{page}")
+                results = sp.next(results)
+            else:
+                results = None
+        total = len(remote)
+        info(f"Found {total} playlist{'s' if total != 1 else ''}.")
 
         synced = 0
         skipped = 0
         memberships = 0
         keep_ids: List[str] = []
-        for playlist in remote:
+        for index, playlist in enumerate(remote, start=1):
             playlist_id = playlist.get("id")
             if not playlist_id:
                 continue
+            emit_status(f"playlists {index}/{total}")
             keep_ids.append(playlist_id)
             snapshot_id = playlist.get("snapshot_id")
             stored = self.repos.spotify_playlists.get(playlist_id)
@@ -3137,7 +3152,14 @@ class PlaylistCLI:
                 skipped += 1
                 continue
 
-            items = self.spotify.get_playlist_items_full(playlist_id)
+            name = playlist.get("name") or playlist_id
+            short_name = name if len(name) <= 24 else name[:23] + "…"
+            emit_status(f"tracks: {short_name}")
+
+            def _page_progress(page_no: int, fetched: int, _name: str = short_name) -> None:
+                emit_status(f"tracks: {_name} p{page_no}")
+
+            items = self.spotify.get_playlist_items_full(playlist_id, on_page=_page_progress)
             rows: List[Dict[str, Any]] = []
             seen: set = set()
             for position, item in enumerate(items):
@@ -3174,6 +3196,9 @@ class PlaylistCLI:
             self.repos.playlist_tracks.replace_for_playlist(playlist_id, rows)
             memberships += len(rows)
             synced += 1
+            # One scrollback line per SYNCED playlist (>= one API page each),
+            # never per track; skipped playlists stay silent.
+            info(f"  {name}: {len(rows)} tracks")
 
         removed = self.repos.spotify_playlists.delete_missing(keep_ids)
         self.repos.sync_state.set("pull_playlists", None, now)
@@ -3191,8 +3216,15 @@ class PlaylistCLI:
         keep_ids: List[str] = []
         seen: set = set()
         offset = 0
+        total: Optional[int] = None
+        last_reported = 0
         while True:
+            # Status BEFORE the fetch: the round-trip is where the waiting
+            # happens, so the bar reads "liked 250/1284" while page 6 loads.
+            emit_status(f"liked {offset}/{total}" if total is not None else f"liked {offset}")
             batch = sp.current_user_saved_tracks(limit=50, offset=offset)
+            if total is None:
+                total = batch.get("total")
             items = batch.get("items") or []
             if not items:
                 break
@@ -3216,6 +3248,11 @@ class PlaylistCLI:
                 keep_ids.append(track_id)
                 liked += 1
             offset += len(items)
+            # Throttled scrollback progress: one line per ~100 items scanned
+            # (every other 50-item page), never per item.
+            if offset - last_reported >= 100:
+                last_reported = offset
+                info(f"  liked: {offset}{f'/{total}' if total is not None else ''} scanned")
             if len(items) < 50:
                 break
         pruned = self.repos.liked_tracks.prune_missing(keep_ids)
@@ -3237,6 +3274,10 @@ class PlaylistCLI:
         now = datetime.utcnow().isoformat() + "Z"
         section("Pull", "Spotify Library Mirror")
         payload: Dict[str, Any] = {"playlists": None, "liked": None, "synced_at": now}
+        # Surface Spotify 429/transient backoffs in the top bar for the whole
+        # pull ("rate limited — retrying in 4s"); scoped to /pull and always
+        # uninstalled so other commands' retries stay on the logger only.
+        set_retry_status_callback(emit_status)
         try:
             if not liked_only:
                 payload["playlists"] = self._pull_playlists(full=full, now=now)
@@ -3249,6 +3290,8 @@ class PlaylistCLI:
             warning(hint if hint else f"Pull failed: {exc}")
             payload["error"] = str(exc)
             return payload
+        finally:
+            set_retry_status_callback(None)
 
         rows: List[List[Any]] = []
         playlists_summary = payload["playlists"]

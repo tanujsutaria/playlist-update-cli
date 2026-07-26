@@ -17,6 +17,24 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Process-global retry-notice channel, cloned from ui.set_status_sink's pattern:
+# commands that want VISIBLE backoff (e.g. /pull feeding the TUI top bar) install
+# a callback around their Spotify calls; ``None`` uninstalls. Kept here (not in
+# ui) so this module stays free of any ui import.
+_retry_status_callback: Optional[Callable[[str], None]] = None
+
+
+def set_retry_status_callback(callback: Optional[Callable[[str], None]]) -> None:
+    """Route human-readable retry notices ("rate limited — retrying in 2s") to a sink.
+
+    Without a callback the only trace of a 429 backoff is a logger.warning that
+    a TUI user never sees — a rate-limited /pull looks frozen for the whole
+    sleep. The callback is best-effort UX: it is guarded at the call site so a
+    display failure can never break a retry.
+    """
+    global _retry_status_callback
+    _retry_status_callback = callback
+
 
 def _retry_with_backoff(
     func: Callable[[], T],
@@ -59,6 +77,13 @@ def _retry_with_backoff(
                 logger.warning(
                     f"Spotify API error (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {delay:.1f}s..."
                 )
+                if _retry_status_callback is not None:
+                    reason = "rate limited" if is_rate_limited else "transient error"
+                    try:
+                        _retry_status_callback(f"{reason} — retrying in {delay:.0f}s")
+                    except Exception:
+                        # Display is best-effort; a broken sink must never break a retry.
+                        logger.debug("retry status callback failed", exc_info=True)
                 time.sleep(delay)
             else:
                 raise
@@ -507,7 +532,11 @@ class SpotifyManager:
         "album(name,release_date),duration_ms,explicit,popularity,external_urls)),next"
     )
 
-    def get_playlist_items_full(self, playlist_id: str) -> List[Dict]:
+    def get_playlist_items_full(
+        self,
+        playlist_id: str,
+        on_page: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Dict]:
         """All items of a playlist, with added_at + rich track fields (paginated).
 
         Unlike ``get_playlist_tracks`` this takes a playlist ID (not a name),
@@ -517,8 +546,13 @@ class SpotifyManager:
         partial page list alongside the current snapshot_id would freeze the
         truncation until the playlist changes remotely (the snapshot-skip
         check would keep skipping it).
+
+        ``on_page(page_number, items_so_far)`` is invoked once per fetched page
+        (1-based) so callers can surface paging progress; it must be cheap and
+        is called at most once per API round-trip, never per item.
         """
         items: List[Dict] = []
+        page = 0
         results = _retry_with_backoff(
             lambda: self.sp.playlist_items(playlist_id, fields=self.PLAYLIST_ITEM_FIELDS)
         )
@@ -526,6 +560,9 @@ class SpotifyManager:
             for item in results.get("items") or []:
                 if item and item.get("track"):
                     items.append(item)
+            page += 1
+            if on_page:
+                on_page(page, len(items))
             if results.get("next"):
                 try:
                     results = _retry_with_backoff(lambda r=results: self.sp.next(r))
