@@ -160,8 +160,14 @@ META_COMMAND_HELP = {
     "search-more": "Expand the last search",
     "dash": "Open the interactive dashboard (taste · stats · plays)",
     "dashboard": "Open the interactive dashboard (taste · stats · plays)",
-    "results": "Browse the last /search or /find results (enter=inspect, space=select, a/p=apply)",
-    "browse": "Browse the last /search or /find results (enter=inspect, space=select, a/p=apply)",
+    "results": (
+        "Browse the last /search or /find results "
+        "(enter=find-similar, i=inspect, c=copy id, o=url, space=select, a/p=apply)"
+    ),
+    "browse": (
+        "Browse the last /search or /find results "
+        "(enter=find-similar, i=inspect, c=copy id, o=url, space=select, a/p=apply)"
+    ),
     "clear": "Clear the output pane",
     "cls": "Clear the output pane",
     "quit": "Exit the app",
@@ -1882,7 +1888,15 @@ class PlaylistInteractiveApp(App):
                 self.query_one(Input).focus()
             except Exception:
                 logger.debug("Could not refocus input after results close", exc_info=True)
-            if action is not None and action.track_ids:
+            if action is None:
+                return
+            if action.mode == "prefill" and action.prefill:
+                # Enter on a row: preload the seeded command for the user to
+                # edit and submit — insert, never dispatch (the palette's
+                # insert-vs-submit convention).
+                self._write_input(action.prefill)
+                return
+            if action.track_ids:
                 self._apply_search_results(
                     mode=action.mode,
                     playlist_name=action.playlist_name,

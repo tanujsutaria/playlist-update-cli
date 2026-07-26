@@ -3,9 +3,10 @@
 Covers: the pure row-building functions (empty results, missing metrics, long
 fields, /find's blended-score fallback), the browse-order preference
 (last_find_ranked over last_search_results), the offline spotify-url helpers,
-and Pilot-driven screen behavior (cursor + enter inspect, space selection,
-o open, the in-screen playlist prompt, and the dismissal payloads). All
-offline — the cli is a stub, no network, no real Spotify.
+and Pilot-driven screen behavior (cursor + i inspect, space selection, the
+row actions — enter prefill, c copy id, o print link (never a browser) —
+the in-screen playlist prompt, and the dismissal payloads). All offline —
+the cli is a stub, no network, no real Spotify.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from results_screen import (
     MAX_FIELD_CHARS,
     ResultsAction,
     ResultsScreen,
+    prefill_for_item,
     results_for_browse,
     rows_for_table,
     spotify_url_for_item,
@@ -207,6 +209,45 @@ class TestSpotifyUrlForTrack:
 
 
 # ---------------------------------------------------------------------------
+# prefill_for_item — the enter row action's editable /find command (pure)
+# ---------------------------------------------------------------------------
+
+
+class TestPrefillForItem:
+    def test_song_and_artist(self):
+        assert (
+            prefill_for_item({"song": "Aligned", "artist": "Result Artist"})
+            == '/find "more like Aligned by Result Artist"'
+        )
+
+    def test_apostrophes_survive_shlex(self):
+        import shlex
+
+        command = prefill_for_item({"song": "Don't Stop", "artist": "Fleetwood Mac"})
+        tokens = shlex.split(command.lstrip("/"))
+        assert tokens == ["find", "more like Don't Stop by Fleetwood Mac"]
+
+    def test_double_quotes_escaped(self):
+        import shlex
+
+        command = prefill_for_item({"song": 'Say "Yes"', "artist": "A"})
+        tokens = shlex.split(command.lstrip("/"))
+        assert tokens == ["find", 'more like Say "Yes" by A']
+
+    def test_falls_back_to_track_id(self):
+        assert (
+            prefill_for_item({"track_id": "some artist|||some song"})
+            == '/find "more like some song by some artist"'
+        )
+
+    def test_partial_row_uses_what_exists(self):
+        assert prefill_for_item({"song": "Solo"}) == '/find "more like Solo"'
+
+    def test_empty_when_unresolvable(self):
+        assert prefill_for_item({}) == ""
+
+
+# ---------------------------------------------------------------------------
 # /find wiring: a fresh CLI starts with no ranked order; resets clear it
 # ---------------------------------------------------------------------------
 
@@ -246,6 +287,26 @@ def _smoke_app():
     return SmokeApp()
 
 
+def _host_app():
+    """A bare host app exposing the two seams the row actions duck-type:
+    append_log (scrollback confirmations) and copy_to_clipboard."""
+    from textual.app import App
+
+    class HostApp(App):
+        def __init__(self):
+            super().__init__()
+            self.logged = []
+            self.copied = []
+
+        def append_log(self, renderable):
+            self.logged.append(renderable)
+
+        def copy_to_clipboard(self, text):
+            self.copied.append(text)
+
+    return HostApp()
+
+
 DEBUG_PAYLOAD = {
     "track": {"track_id": "r|||aligned", "status": "candidate", "spotify_id": "spotify:track:a"},
     "context": {"strict_ratio": 0.42},
@@ -271,10 +332,11 @@ class TestResultsScreenPilot:
                 table = screen.query_one(DataTable)
                 assert table.row_count == 3
                 assert table.cursor_row == 0
-                # Cursor moves; enter inspects via cli.debug_track's payload.
+                # Cursor moves; i inspects via cli.debug_track's payload
+                # (enter is the prefill row action now).
                 await pilot.press("down")
                 assert table.cursor_row == 1
-                await pilot.press("enter")
+                await pilot.press("i")
                 detail = screen.query_one("#results_detail", Static)
                 readout = detail.render() if callable(detail.render) else ""
                 text = str(readout)
@@ -352,49 +414,56 @@ class TestResultsScreenPilot:
         assert action.playlist_name == "mix"
         assert action.track_ids == ["r|||aligned"]
 
-    def test_open_spotify_db_fallback_and_no_url_state(self):
+    def test_spotify_url_prints_and_never_opens_browser(self, monkeypatch):
+        import webbrowser
+
         from textual.widgets import Static
 
-        # First: db fallback provides the url (rows carry none).
+        def _no_browser(*args, **kwargs):  # pragma: no cover - tripwire
+            raise AssertionError("the o action must never open a browser")
+
+        monkeypatch.setattr(webbrowser, "open", _no_browser)
+
+        # First: db fallback provides the url (rows carry none); it is
+        # PRINTED — detail readout + app scrollback — never opened.
         cli = _stub_cli(
             results=[dict(r) for r in RESULTS],
             url="https://open.spotify.com/track/abc",
         )
-        opened = []
 
         async def drive_with_url():
-            app = _smoke_app()
+            app = _host_app()
             async with app.run_test(size=(100, 30)) as pilot:
                 screen = ResultsScreen(cli)
-                screen._open_url = opened.append  # OS seam: no real browser
                 await app.push_screen(screen)
                 await pilot.pause()
                 await pilot.press("o")
-                assert opened == ["https://open.spotify.com/track/abc"]
+                detail = str(screen.query_one("#results_detail", Static).render())
+                assert "https://open.spotify.com/track/abc" in detail
+                logged = "\n".join(str(line) for line in app.logged)
+                assert "Aligned — Result Artist: https://open.spotify.com/track/abc" in logged
                 await pilot.press("escape")
                 await pilot.pause()
 
         _drive(drive_with_url())
 
-        # Second: no cached url anywhere -> graceful status, no crash.
+        # Second: no cached url anywhere -> graceful status, nothing logged.
         cli_no_url = _stub_cli(results=[dict(r) for r in RESULTS], url="")
-        missed = []
 
         async def drive_without_url():
-            app = _smoke_app()
+            app = _host_app()
             async with app.run_test(size=(100, 30)) as pilot:
                 screen = ResultsScreen(cli_no_url)
-                screen._open_url = missed.append
                 await app.push_screen(screen)
                 await pilot.pause()
                 await pilot.press("o")
                 detail = str(screen.query_one("#results_detail", Static).render())
                 assert "no spotify link" in detail
+                assert app.logged == []
                 await pilot.press("escape")
                 await pilot.pause()
 
         _drive(drive_without_url())
-        assert missed == []
 
     def test_escape_dismisses_with_none(self):
         cli = _stub_cli(results=[dict(r) for r in RESULTS])
@@ -432,6 +501,105 @@ class TestResultsScreenPilot:
                 await pilot.pause()
 
         _drive(drive())
+
+
+# ---------------------------------------------------------------------------
+# Row actions: enter prefill, c copy id (screen-level and end-to-end)
+# ---------------------------------------------------------------------------
+
+
+class TestRowActionsPilot:
+    def test_enter_dismisses_with_prefill_action(self):
+        cli = _stub_cli(results=[dict(r) for r in RESULTS])
+        dismissed = []
+
+        async def drive():
+            app = _smoke_app()
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = ResultsScreen(cli)
+                await app.push_screen(screen, callback=dismissed.append)
+                await pilot.pause()
+                await pilot.press("down")  # row-aware: acts on the cursor row
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app.screen is not screen
+
+        _drive(drive())
+        assert len(dismissed) == 1
+        action = dismissed[0]
+        assert isinstance(action, ResultsAction)
+        assert action.mode == "prefill"
+        assert action.prefill == '/find "more like Offbeat by Result Artist"'
+        assert action.track_ids == []
+
+    def test_copy_key_copies_id_and_logs_confirmation(self):
+        from textual.widgets import Static
+
+        cli = _stub_cli(results=[dict(r) for r in RESULTS])
+
+        async def drive():
+            app = _host_app()
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = ResultsScreen(cli)
+                await app.push_screen(screen)
+                await pilot.pause()
+                await pilot.press("c")
+                assert app.copied == ["r|||aligned"]
+                detail = str(screen.query_one("#results_detail", Static).render())
+                assert "copied r|||aligned" in detail
+                logged = "\n".join(str(line) for line in app.logged)
+                assert "Copied track id to clipboard: r|||aligned" in logged
+                # The screen stays up: copying is not a dismissal.
+                assert app.screen is screen
+                await pilot.press("escape")
+                await pilot.pause()
+
+        _drive(drive())
+
+    def test_enter_prefills_the_main_command_input(self, monkeypatch):
+        """End-to-end: /results in the real app; enter closes the browser and
+        preloads an editable /find into the command input — never submits."""
+        import logging as _logging
+
+        from textual.widgets import Input
+
+        import ui as _ui
+        from arg_parse import setup_parsers
+        from interactive_app import SPOTIFY_REQUIRED_KEYS, PlaylistInteractiveApp
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        cli = PlaylistCLI()
+        cli.last_search_results = [dict(r) for r in RESULTS]
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=cli, parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+                app._open_results()
+                await pilot.pause()
+                assert isinstance(app.screen, ResultsScreen)
+                await pilot.press("enter")
+                await pilot.pause()
+                assert not isinstance(app.screen, ResultsScreen)
+                value = app.query_one("#command_input", Input).value
+                assert value == '/find "more like Aligned by Result Artist"'
+                assert app.status == "idle"  # inserted, never dispatched
+
+        # on_mount replaces root logging handlers and points the ui sinks at
+        # this app; restore both afterwards (same pattern as the Esc pilot).
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _drive(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)
+            _ui.set_status_sink(None)
 
 
 # ---------------------------------------------------------------------------
