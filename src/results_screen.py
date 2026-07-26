@@ -7,7 +7,9 @@ Three layers, deliberately separable (same doctrine as dashboard.py):
   emission — so the table contents are unit-testable without a running app.
   A follow-up viz pass can restyle the widget without touching these.
 * **ResultsAction** is the screen's dismissal payload: the app-side callback
-  (interactive_app._open_results) routes it into the existing apply worker.
+  (interactive_app._open_results) routes it into the existing apply worker —
+  or, for the ``prefill`` mode Enter produces, into the command input
+  (insert-not-submit, the same convention as the command palette).
   The screen itself NEVER runs workers — while it is pushed it holds the
   app-thread read contract on the shared sqlite connection (the same
   serialized-use contract DashboardScreen documents), so all writes happen
@@ -16,6 +18,9 @@ Three layers, deliberately separable (same doctrine as dashboard.py):
   readout fed by ``cli.debug_track`` (synchronous app-thread read), per-row
   selection markers, and an in-screen playlist-name prompt — the prompt never
   round-trips through the main app's Input or its ``_pending_action`` wizard.
+  Row actions stay offline: ``c`` copies the track id (OSC-52 clipboard),
+  ``o`` prints the cached Spotify link to the scrollback — never the browser,
+  never the network.
 
 Ordering: when the last discovery command was /find, ``cli.last_find_ranked``
 holds the taste-ranked rows (a fresh /search clears it), and the browser shows
@@ -26,7 +31,6 @@ shows ``last_search_results`` in relevance order.
 from __future__ import annotations
 
 import logging
-import webbrowser
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -56,12 +60,16 @@ class ResultsAction:
     """What the user asked the app to do with a subset of rows.
 
     ``mode`` mirrors the existing apply path: "db" marks the tracks accepted,
-    "playlist" adds them to ``playlist_name``.
+    "playlist" adds them to ``playlist_name``. The third mode, "prefill",
+    carries no track ids: ``prefill`` is a ready-to-edit slash command the
+    app preloads into its input (never submits) — the palette's
+    insert-vs-submit convention.
     """
 
     mode: str
     track_ids: List[str] = field(default_factory=list)
     playlist_name: Optional[str] = None
+    prefill: Optional[str] = None
 
 
 def results_for_browse(cli: Any) -> List[Dict[str, Any]]:
@@ -169,12 +177,39 @@ def spotify_url_for_item(item: ResultItem) -> str:
     return ""
 
 
+def prefill_for_item(item: ResultItem) -> str:
+    """The editable slash command Enter hands back to the app for one row.
+
+    ``/find`` is the natural default action over a result row — "find more
+    like this" continues the discovery loop, and its freeform query is the
+    identifier every user can read and edit. The query is double-quoted for
+    the app's ``shlex.split`` so titles with apostrophes survive parsing.
+    Empty when the row carries nothing usable (no song/artist, no track id).
+    """
+    song = str(item.get("song") or item.get("name") or "").strip()
+    artist = str(item.get("artist") or "").strip()
+    if not (song or artist):
+        track_id = str(item.get("track_id") or "")
+        if "|||" in track_id:
+            artist, _, song = (part.strip() for part in track_id.partition("|||"))
+    if song and artist:
+        seed = f"more like {song} by {artist}"
+    elif song or artist:
+        seed = f"more like {song or artist}"
+    else:
+        return ""
+    quoted = seed.replace("\\", "\\\\").replace('"', '\\"')
+    return f'/find "{quoted}"'
+
+
 class ResultsScreen(Screen[Optional[ResultsAction]]):
-    """Row-level browser over the cached results: ↑/↓ cursor, enter inspect,
-    space select, o open in Spotify, a accept selected, p playlist selected,
-    esc/q close. All reads run synchronously on the app thread (the pushed
-    screen holds the serialized-connection contract); the dismissal payload
-    carries the write intent back to the app, which owns the workers.
+    """Row-level browser over the cached results: ↑/↓ cursor, enter prefill
+    a /find seeded with the row (insert-not-submit), i inspect, space select,
+    c copy the track id, o print the Spotify link, a accept selected,
+    p playlist selected, esc/q close. All reads run synchronously on the app
+    thread (the pushed screen holds the serialized-connection contract); the
+    dismissal payload carries the write/prefill intent back to the app, which
+    owns the workers and the command input.
     """
 
     DEFAULT_CSS = """
@@ -211,7 +246,9 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
         Binding("escape", "close", "close", show=False),
         Binding("q", "close", "close", show=False),
         Binding("space", "toggle_select", "select", show=False),
-        Binding("o", "open_spotify", "open in spotify", show=False),
+        Binding("i", "inspect_row", "inspect", show=False),
+        Binding("c", "copy_track_id", "copy track id", show=False),
+        Binding("o", "spotify_url", "print spotify link", show=False),
         Binding("a", "accept_selected", "accept selected", show=False),
         Binding("p", "playlist_selected", "add to playlist", show=False),
     ]
@@ -272,8 +309,8 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
 
     def _render_footer(self) -> Text:
         footer = Text(
-            "↑/↓ move · enter inspect · space select · o spotify"
-            " · a accept · p playlist · esc close",
+            "enter find-similar · i inspect · space select · c copy id"
+            " · o url · a accept · p playlist · esc close",
             style="dim",
         )
         if self.selected:
@@ -298,7 +335,20 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
         return None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter on a row → inspect it via cli.debug_track's payload."""
+        """Enter on a row → close, handing the app an editable /find seeded
+        with the row. The app inserts it into the command input and the user
+        finishes/submits — never auto-submitted (palette convention)."""
+        index = self._cursor_index()
+        if index is None:
+            return
+        command = prefill_for_item(self.results[index])
+        if not command:
+            self._set_status(Text("nothing usable on this row to search from", style="yellow"))
+            return
+        self.dismiss(ResultsAction(mode="prefill", prefill=command))
+
+    def action_inspect_row(self) -> None:
+        """i → inspect the cursor row via cli.debug_track's payload."""
         index = self._cursor_index()
         if index is not None:
             self._show_detail(index, inspect=True)
@@ -391,7 +441,9 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
     # Actions
     # ------------------------------------------------------------------
 
-    def action_open_spotify(self) -> None:
+    def action_spotify_url(self) -> None:
+        """o → print the row's Spotify link (print only — never the browser,
+        never the network: the cached row first, then the local db record)."""
         index = self._cursor_index()
         if index is None:
             return
@@ -416,15 +468,43 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
                 )
             )
             return
-        self._open_url(url)
-        self._set_status(Text(f"opened {url}", style="dim"))
+        song = str(item.get("song") or item.get("name") or "").strip()
+        artist = str(item.get("artist") or "").strip()
+        label = " — ".join(part for part in (song, artist) if part) or track_id_of(item)
+        self._set_status(Text(url, style=ACCENT_BLUE))
+        self._log_to_app(Text(f"{label}: {url}", style="dim"))
 
-    def _open_url(self, url: str) -> None:
-        """Thin OS seam (tests override): hand the URL to the default browser."""
+    def action_copy_track_id(self) -> None:
+        """c → copy the cursor row's track id to the clipboard (OSC-52)."""
+        index = self._cursor_index()
+        if index is None:
+            return
+        track_id = track_id_of(self.results[index])
+        if not track_id:
+            self._set_status(Text("no track id for this row", style="yellow"))
+            return
         try:
-            webbrowser.open(url)
+            self.app.copy_to_clipboard(track_id)
         except Exception:
-            logger.debug("Could not open browser for %s", url, exc_info=True)
+            # Clipboard support is terminal-dependent; the scrollback line
+            # below still shows the id in selectable text form.
+            logger.debug("copy_to_clipboard failed for %s", track_id, exc_info=True)
+        self._set_status(Text(f"copied {track_id}", style="dim"))
+        self._log_to_app(Text(f"Copied track id to clipboard: {track_id}", style="dim"))
+
+    def _log_to_app(self, message: Text) -> None:
+        """Append a confirmation line to the main app's scrollback.
+
+        Duck-typed so the screen keeps working under any host app (tests push
+        it onto a bare Textual App with no append_log): missing seam → skip.
+        """
+        append = getattr(self.app, "append_log", None)
+        if not callable(append):
+            return
+        try:
+            append(message)
+        except Exception:
+            logger.debug("Could not write to the app scrollback", exc_info=True)
 
     def action_accept_selected(self) -> None:
         ids = self._effective_ids()

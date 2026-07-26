@@ -1928,3 +1928,653 @@ class TestPaletteSmoke:
             root.setLevel(saved_level)
             _ui.set_output_sink(None)
             _ui.set_preview_sink(None)
+
+
+# ============================================================================
+# Esc-to-cancel: the run-generation guard, the cancel action, and gates
+# ============================================================================
+
+
+class _FakeWorker:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class TestEscCancelUnit:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = DummyApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_escape_when_idle_is_noop(self, monkeypatch):
+        app = self._app(monkeypatch)
+        gen = app._run_generation
+        app.action_cancel_command()
+        assert app.status == "idle"
+        assert app._run_generation == gen  # no spurious invalidation
+        assert app.logged == []
+
+    def test_cancel_flags_worker_flips_status_and_logs_honest_line(self, monkeypatch):
+        import time as _time
+
+        app = self._app(monkeypatch)
+        app.status = "running /search"
+        app._run_started = _time.monotonic()
+        app._stage = "extract 1/10"
+        worker = _FakeWorker()
+        app._active_worker = worker
+        gen = app._run_generation
+
+        app.action_cancel_command()
+
+        assert worker.cancelled is True
+        assert app.status == "cancelled"
+        assert app._active_worker is None
+        assert app._run_generation == gen + 1
+        assert app._run_started is None
+        assert app._stage == ""
+        assert app._last_run_note == "last: /search cancelled"
+        text = _logged_text(app)
+        assert "Cancelled /search" in text
+        assert "background" in text  # honest thread-worker caveat
+
+    def test_gate_blocks_while_cancelled_thread_unwinds_then_reopens(self, monkeypatch):
+        class GateApp(DummyApp):
+            _run_command = PlaylistInteractiveApp._run_command
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = GateApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.run_worker = lambda fn, thread=True: _FakeWorker()
+
+        # Esc-cancelled run whose thread is still unwinding: new work must
+        # NOT start — it would overlap the stale thread on the shared
+        # serialized-use sqlite connection (and possibly the same playlist).
+        app.status = "cancelled"
+        app._inflight_workers = 1
+        app._run_generation = 3  # the cancelled run held a stale generation
+        app._run_command("stats", object())
+        assert app.status == "cancelled"  # gate stays closed
+        assert "Waiting for the cancelled command" in _logged_text(app)
+
+        # The stale thread unwinds: true idle is restored, the gate reopens.
+        app._worker_thread_exited(2)
+        assert app.status == "idle"
+        app._run_command("stats", object())
+        assert app.status == "running /stats"
+
+        app._run_command("stats", object())  # …running still blocks
+        assert "Another command is already running" in _logged_text(app)
+
+    def test_is_idle_requires_zero_inflight_threads(self, monkeypatch):
+        app = self._app(monkeypatch)
+        assert app._is_idle()
+        app._inflight_workers = 1
+        assert not app._is_idle()  # "idle" status alone is not enough
+        app.status = "cancelled"
+        assert not app._is_idle()
+        app._inflight_workers = 0
+        assert app._is_idle()  # rest status + fully unwound
+
+    def test_refuse_messages_distinguish_cancelled_from_finishing(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._inflight_workers = 1
+        app.status = "cancelled"
+        assert app._refuse_if_busy() is True
+        assert "Waiting for the cancelled command" in _logged_text(app)
+        app.logged.clear()
+        # _post_command already restored "idle" from the worker thread, but
+        # the thread's exit notification hasn't landed yet.
+        app.status = "idle"
+        assert app._refuse_if_busy() is True
+        assert "still finishing" in _logged_text(app)
+        app.logged.clear()
+        app.status = "running /stats"
+        assert app._refuse_if_busy() is True
+        assert "Another command is already running" in _logged_text(app)
+        app.logged.clear()
+        app._inflight_workers = 0
+        app.status = "idle"
+        assert app._refuse_if_busy() is False
+        assert app.logged == []
+
+    def test_run_if_current_drops_stale_runs_current(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._run_generation = 5
+        calls = []
+        app._run_if_current(4, calls.append, "stale")
+        assert calls == []
+        app._run_if_current(5, calls.append, "current")
+        assert calls == ["current"]
+
+    def test_dispatch_ui_guards_thread_bound_generation(self, monkeypatch):
+        app = self._app(monkeypatch)
+        calls = []
+        app._worker_gen.gen = 1  # simulate a worker-bound thread
+        app._run_generation = 2  # …whose run has been cancelled
+        app._dispatch_ui(calls.append, "stale")
+        assert calls == []
+        app._run_generation = 1  # generation current again
+        app._dispatch_ui(calls.append, "current")
+        assert calls == ["current"]
+
+    def test_dispatch_ui_unbound_thread_never_guarded(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._run_generation = 99  # no thread-local gen bound -> no guard
+        calls = []
+        app._dispatch_ui(calls.append, "auto-sync line")
+        assert calls == ["auto-sync line"]
+
+    def test_worker_thread_exited_restores_idle_at_zero_inflight(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.status = "cancelled"
+        app._inflight_workers = 2
+        app._run_generation = 7
+        app._worker_thread_exited(3)  # stale thread unwinds first
+        assert app.status == "cancelled"  # one thread still in flight
+        app._worker_thread_exited(3)
+        assert app.status == "idle"
+        assert app._inflight_workers == 0
+
+    def test_worker_thread_exited_clears_active_worker_only_for_current_gen(self, monkeypatch):
+        app = self._app(monkeypatch)
+        current = _FakeWorker()
+        app._active_worker = current
+        app._run_generation = 7
+        app._inflight_workers = 2
+        app._worker_thread_exited(3)  # stale exit must not touch the new handle
+        assert app._active_worker is current
+        app._worker_thread_exited(7)
+        assert app._active_worker is None
+
+    def test_worker_thread_exited_never_flips_a_running_status(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.status = "running /stats"
+        app._inflight_workers = 1
+        app._worker_thread_exited(0)
+        assert app.status == "running /stats"
+
+    def test_run_user_work_binds_generation_and_notifies_exit(self, monkeypatch):
+        app = self._app(monkeypatch)
+        seen = []
+        app._run_generation = 4
+        app._inflight_workers = 1  # as _start_user_worker would have set
+        app._run_user_work(4, lambda: seen.append(getattr(app._worker_gen, "gen", None)))
+        assert seen == [4]  # generation visible to the work
+        assert getattr(app._worker_gen, "gen", None) is None  # cleared (pooled threads)
+        assert app._inflight_workers == 0  # exit notification delivered
+
+    def test_cancelled_status_does_not_animate_spinner(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = SpinnerRecordingApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.status = "running /stats"
+        app.spinner_calls.clear()
+        app.status = "cancelled"
+        assert app.spinner_calls == ["stop"]
+
+
+class TestEscCancelStaleWorkerOutput:
+    """A cancelled run's worker thread must not write late output anywhere."""
+
+    def _worker_app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = WorkerApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        app.cli.last_search_results = None
+        return app
+
+    def _make_stale(self, app):
+        """Bind this (test) thread to a generation that is no longer current."""
+        app._worker_gen.gen = 1
+        app._run_generation = 2
+
+    def test_stale_execute_command_emits_nothing(self, monkeypatch):
+        import time as _time
+
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+        monkeypatch.setattr(ia, "dispatch_command", lambda cli, cmd, args: 0)
+        self._make_stale(app)
+        app.status = "cancelled"
+        app._run_started = _time.monotonic() - 20
+        app._execute_command("stats", object())
+        assert app.status == "cancelled"  # _post_command suppressed
+        assert "finished in" not in _logged_text(app)
+        assert app.notifications == []  # slow-command toast suppressed
+
+    def test_stale_failure_lines_and_toast_suppressed(self, monkeypatch):
+        import interactive_app as ia
+
+        app = self._worker_app(monkeypatch)
+        monkeypatch.setattr(ia, "dispatch_command", lambda cli, cmd, args: 1)
+        self._make_stale(app)
+        app.status = "cancelled"
+        app._execute_command("stats", object())
+        assert "exited with errors" not in _logged_text(app)
+        assert app.notifications == []
+        assert app.status == "cancelled"
+
+    def test_stale_error_records_dropped_and_not_counted(self, monkeypatch):
+        import logging as _logging
+        import threading as _threading
+
+        from interactive_app import UILogHandler
+
+        app = self._worker_app(monkeypatch)
+        app._app_thread_id = _threading.get_ident()
+        self._make_stale(app)
+        handler = UILogHandler(app)
+        record = _logging.LogRecord("t", _logging.ERROR, __file__, 1, "late boom", None, None)
+        handler.emit(record)
+        assert app._command_error_count == 0  # new command's window stays clean
+        assert "late boom" not in _logged_text(app)  # scrollback line dropped
+
+    def test_current_error_records_still_counted(self, monkeypatch):
+        import logging as _logging
+        import threading as _threading
+
+        from interactive_app import UILogHandler
+
+        app = self._worker_app(monkeypatch)
+        app._app_thread_id = _threading.get_ident()
+        app._worker_gen.gen = app._run_generation  # bound and current
+        handler = UILogHandler(app)
+        record = _logging.LogRecord("t", _logging.ERROR, __file__, 1, "boom", None, None)
+        handler.emit(record)
+        assert app._command_error_count == 1
+        assert "boom" in _logged_text(app)
+
+
+# ---------------------------------------------------------------------------
+# Pilot: Esc cancels the live worker; pushed-screen Esc keeps priority; the
+# stale worker's late output never reaches the scrollback. The blocked
+# handler is gated on threading.Events so the test controls all timing.
+# ---------------------------------------------------------------------------
+
+
+class TestEscCancelPilot:
+    def test_escape_cancels_running_command_end_to_end(self, monkeypatch):
+        import logging as _logging
+        import threading as _threading
+
+        from textual.command import CommandPalette
+        from textual.widgets import RichLog
+
+        import interactive_app as ia
+        import ui as _ui
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        gate = _threading.Event()  # blocks the first /stats until the test says go
+        entered = _threading.Event()  # first /stats reached the handler
+        finished = _threading.Event()  # first /stats fully unwound
+        calls = []
+
+        def _dispatch(cli, command, args):
+            calls.append(command)
+            if len(calls) == 1:
+                entered.set()
+                gate.wait(timeout=10)
+                # Late output from the cancelled run: must be swallowed.
+                _ui.info("stale output after cancel")
+                finished.set()
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+
+        def _scrollback(app) -> str:
+            log = app.query_one(RichLog)
+            return "\n".join(strip.text for strip in log.lines)
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+                app._submit_text("/stats")
+                for _ in range(500):  # bounded wait on a test-owned Event
+                    if entered.is_set():
+                        break
+                    await pilot.pause(0.01)
+                assert entered.is_set()
+                assert app.status == "running /stats"
+
+                # Pushed screens keep Esc priority: the palette's own Escape
+                # closes it and must NOT cancel the running command.
+                await pilot.press("ctrl+p")
+                await pilot.pause()
+                assert CommandPalette.is_open(app)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not CommandPalette.is_open(app)
+                assert app.status == "running /stats"
+
+                # Esc on the main screen cancels the worker.
+                worker = app._active_worker
+                assert worker is not None
+                await pilot.press("escape")
+                assert app.status == "cancelled"
+                assert worker.is_cancelled
+                assert app._active_worker is None
+                assert "Cancelled /stats" in _scrollback(app)
+
+                # The gate stays CLOSED while the cancelled thread unwinds:
+                # a second /stats must not start a worker that would share
+                # the serialized-use sqlite connection with the stale thread.
+                app._submit_text("/stats")
+                await pilot.pause()
+                assert calls == ["stats"]  # nothing new dispatched
+                assert app.status == "cancelled"
+                assert "Waiting for the cancelled command" in _scrollback(app)
+
+                # Release the cancelled worker: its late output and completion
+                # must be suppressed, and true idle must survive its exit.
+                gate.set()
+                for _ in range(500):
+                    if finished.is_set():
+                        break
+                    await pilot.pause(0.01)
+                assert finished.is_set()
+                for _ in range(500):  # drain the stale worker's exit callback
+                    if app.status == "idle" and app._inflight_workers == 0:
+                        break
+                    await pilot.pause(0.01)
+                text = _scrollback(app)
+                assert "stale output after cancel" not in text
+                assert "finished in" not in text  # cancelled run stays silent
+                assert app.status == "idle"
+                assert app._inflight_workers == 0
+
+                # Gate reopened at true idle: the second /stats now runs.
+                app._submit_text("/stats")
+                for _ in range(500):
+                    if len(calls) == 2 and app.status == "idle":
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["stats", "stats"]
+                assert app.status == "idle"
+                assert _scrollback(app).count("finished in") == 1  # 2nd run only
+
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _run_async(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)
+            _ui.set_status_sink(None)
+
+
+# ============================================================================
+# Destructive-command confirm modal (TUI dispatch path only)
+# ============================================================================
+
+
+class _ConfirmGateApp(DummyApp):
+    """DummyApp with the REAL _run_command so the modal gate is under test;
+    push_screen and _start_command are captured instead of executed."""
+
+    _run_command = PlaylistInteractiveApp._run_command
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.pushed = []
+        self.started = []
+
+    def push_screen(self, screen, callback=None):
+        self.pushed.append((screen, callback))
+
+    def _start_command(self, command, args):
+        self.started.append((command, args))
+
+    def _focus_input(self):
+        pass
+
+
+class TestDestructiveQuestion:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = DummyApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_destructive_commands_get_questions(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        assert "backup 'b1'" in question("restore", SimpleNamespace(backup_name="b1"))
+        assert "token" in question("auth-reset", SimpleNamespace(yes=False))
+        assert "rewrites" in question("update", SimpleNamespace(playlist="Chill", dry_run=False))
+        assert "Rotate" in question("rotate", SimpleNamespace(playlist="Chill"))
+        assert "Rotate" in question("rotate-played", SimpleNamespace(playlist="Chill"))
+        assert "mirrors the db" in question("sync", SimpleNamespace(playlist="Chill"))
+        assert "Permanently" in question("clean", SimpleNamespace(dry_run=False))
+
+    def test_dry_runs_are_not_gated(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        assert question("update", SimpleNamespace(playlist="Chill", dry_run=True)) is None
+        assert question("clean", SimpleNamespace(dry_run=True)) is None
+
+    def test_non_destructive_and_recovery_commands_are_not_gated(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        args = SimpleNamespace(playlist="Chill", backup_name="b1", top=5, offset=-1)
+        for command in (
+            "stats",
+            "view",
+            "plan",
+            "diff",
+            "backup",
+            "search",
+            "find",
+            "auth-status",
+            # Recovery commands stay friction-free on purpose:
+            "undo",
+            "restore-previous-rotation",
+        ):
+            assert question(command, args) is None, command
+
+
+class TestConfirmGateUnit:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _ConfirmGateApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_non_destructive_starts_without_modal(self, monkeypatch):
+        app = self._app(monkeypatch)
+        args = object()
+        app._run_command("stats", args)
+        assert app.pushed == []
+        assert app.started == [("stats", args)]
+
+    def test_destructive_waits_for_confirmation(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from interactive_app import ConfirmScreen
+
+        app = self._app(monkeypatch)
+        args = SimpleNamespace(playlist="Chill")
+        app._run_command("rotate", args)
+        assert app.started == []  # nothing runs until the modal answers
+        assert len(app.pushed) == 1
+        screen, callback = app.pushed[0]
+        assert isinstance(screen, ConfirmScreen)
+        callback(True)
+        assert app.started == [("rotate", args)]
+
+    def test_cancel_leaves_command_unrun_and_logs(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        app._run_command("restore", SimpleNamespace(backup_name="b1"))
+        _screen, callback = app.pushed[0]
+        callback(False)
+        assert app.started == []
+        assert "/restore cancelled — nothing changed." in _logged_text(app)
+
+    def test_confirmed_auth_reset_forces_yes(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        args = SimpleNamespace(yes=False)
+        app._run_command("auth-reset", args)
+        _screen, callback = app.pushed[0]
+        callback(True)
+        assert args.yes is True  # the modal IS the TUI confirmation
+        assert app.started == [("auth-reset", args)]
+
+    def test_busy_gate_precedes_modal(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        app.status = "running /stats"
+        app._run_command("rotate", SimpleNamespace(playlist="Chill"))
+        assert app.pushed == []
+        assert app.started == []
+        assert "Another command is already running" in _logged_text(app)
+
+
+# ---------------------------------------------------------------------------
+# Pilot: real modal end-to-end — confirm runs, cancel doesn't, and Esc in the
+# modal closes only the modal (never the app-level Esc-cancel binding).
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmModalPilot:
+    def test_confirm_cancel_and_esc_paths(self, monkeypatch):
+        import logging as _logging
+
+        from textual.widgets import RichLog
+
+        import interactive_app as ia
+        import ui as _ui
+        from interactive_app import ConfirmScreen
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        calls = []
+
+        def _dispatch(cli, command, args):
+            calls.append(command)
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+
+        def _scrollback(app) -> str:
+            log = app.query_one(RichLog)
+            return "\n".join(strip.text for strip in log.lines)
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+                # Spy on the app-level Esc cancel action: the modal's own
+                # Escape binding must win, so this must never fire.
+                cancel_calls = []
+                orig_cancel = app.action_cancel_command
+
+                def _spy_cancel():
+                    cancel_calls.append(1)
+                    orig_cancel()
+
+                app.action_cancel_command = _spy_cancel
+
+                # 1) Esc inside the modal closes ONLY the modal.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                assert calls == []  # nothing dispatched while the modal is up
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == []
+                assert cancel_calls == []  # app-level Esc binding never fired
+                assert app.status == "idle"
+                assert "/rotate cancelled — nothing changed." in _scrollback(app)
+
+                # 2) y confirms and the command actually runs.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("y")
+                for _ in range(500):
+                    if calls == ["rotate"] and app.status == "idle" and app._inflight_workers == 0:
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["rotate"]
+                assert app.status == "idle"
+                assert "/rotate finished in" in _scrollback(app)
+
+                # 3) Enter must NOT confirm: "no" is focused on mount and
+                # the screen binds no Enter, so the queued second Enter of an
+                # accidental double-tap presses the SAFE button and cancels.
+                app._submit_text("/restore b1")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("enter")  # the double-tap's second Enter
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == ["rotate"]  # restore never dispatched
+                assert "/restore cancelled — nothing changed." in _scrollback(app)
+
+                # 3b) The deliberate keyboard route to yes still works: tab
+                # moves focus to the yes button, enter presses it.
+                app._submit_text("/restore b1")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("tab")
+                await pilot.press("enter")
+                for _ in range(500):
+                    if (
+                        calls == ["rotate", "restore"]
+                        and app.status == "idle"
+                        and app._inflight_workers == 0
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["rotate", "restore"]
+
+                # 4) n cancels: no further dispatch.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("n")
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == ["rotate", "restore"]
+                assert app.status == "idle"
+
+        # on_mount replaces root logging handlers and points the ui sinks at
+        # this app; restore both afterwards (same pattern as the Esc pilot).
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _run_async(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)
+            _ui.set_status_sink(None)
