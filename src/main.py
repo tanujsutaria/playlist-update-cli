@@ -71,6 +71,7 @@ from taste_facets import (
 from ui import (
     FILL_STYLE,
     MARKER_STYLE,
+    ColumnSpec,
     bar_chart,
     caption,
     chart_panel,
@@ -1436,7 +1437,12 @@ class PlaylistCLI:
                     display_rows.append(cells)
                 return display_rows
 
-            headers = ["#", "Track", "Artist", "Tags"] + (["●"] if show_sonic_col else [])
+            headers = [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Track",
+                "Artist",
+                "Tags",
+            ] + ([ColumnSpec("●", justify="center")] if show_sonic_col else [])
             ranking_caption = "ranked by closeness to your taste centroid · "
             if show_sonic_col:
                 ranking_caption += f"● sonic-informed ({sonic_count}/{len(seed)}) · "
@@ -2150,7 +2156,7 @@ class PlaylistCLI:
                 if row[1]
             ]
             subsection("Backfill queue")
-            table(["gap", "tracks", "note"], queue_rows)
+            table(["gap", ColumnSpec("tracks", metric=True), "note"], queue_rows)
 
         # Library DNA: enriched-facet aggregations over every context row.
         # JOIN-scoped to live tracks — the same doctrine as the coverage
@@ -2827,7 +2833,14 @@ class PlaylistCLI:
             ]
 
         if live_mode == "compact":
-            live_base_headers = ["#", "Song", "Artist", "Score", "Strict", "Sources"]
+            live_base_headers: List[object] = [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Song",
+                "Artist",
+                ColumnSpec("Score", metric=True),
+                ColumnSpec("Strict", metric=True),
+                ColumnSpec("Sources", metric=True),
+            ]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
                 return [
@@ -2841,15 +2854,15 @@ class PlaylistCLI:
 
         else:
             live_base_headers = [
-                "#",
+                ColumnSpec("#", justify="right", style="dim"),
                 "Song",
                 "Artist",
                 "Year",
-                "Score",
-                "Strict",
+                ColumnSpec("Score", metric=True),
+                ColumnSpec("Strict", metric=True),
                 "Status",
-                "Providers",
-                "Sources",
+                ColumnSpec("Providers", metric=True),
+                ColumnSpec("Sources", metric=True),
             ]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
@@ -2866,7 +2879,11 @@ class PlaylistCLI:
                 ] + _metric_cells(item)
 
         def _live_headers() -> List[object]:
-            return list(live_base_headers) + [_metric_label(m) for m in _requested_metrics()]
+            # Metric cells arrive pre-styled from _metric_cell (Text passthrough);
+            # the spec only right-aligns the column.
+            return list(live_base_headers) + [
+                ColumnSpec(_metric_label(m), justify="right") for m in _requested_metrics()
+            ]
 
         def _page_slice(rows: List[List[object]]) -> List[List[object]]:
             start = (live_page - 1) * live_page_size
@@ -2954,7 +2971,11 @@ class PlaylistCLI:
         # grows one column per requested metric — the values the constraint
         # filter actually enforced, styled by _metric_cell.
         requested_metrics = _requested_metrics()
-        metric_headers = [_metric_label(m) for m in requested_metrics]
+        # Pre-styled Text cells (see _metric_cell) pass through; the specs
+        # right-align the numeric columns.
+        metric_headers: List[object] = [
+            ColumnSpec(_metric_label(m), justify="right") for m in requested_metrics
+        ]
         rows = []
         for idx, item in enumerate(results, 1):
             rows.append(
@@ -2976,17 +2997,24 @@ class PlaylistCLI:
             )
 
         headers = [
-            "#",
+            ColumnSpec("#", justify="right", style="dim"),
             "Song",
             "Artist",
             "Year",
-            "Score",
-            "Strict",
+            ColumnSpec("Score", metric=True),
+            ColumnSpec("Strict", metric=True),
             "Status",
-            "Providers",
-            "Sources",
+            ColumnSpec("Providers", metric=True),
+            ColumnSpec("Sources", metric=True),
         ] + metric_headers
-        compact_headers = ["#", "Song", "Artist", "Score", "Strict", "Status"] + metric_headers
+        compact_headers = [
+            ColumnSpec("#", justify="right", style="dim"),
+            "Song",
+            "Artist",
+            ColumnSpec("Score", metric=True),
+            ColumnSpec("Strict", metric=True),
+            "Status",
+        ] + metric_headers
 
         def _compact_rows() -> List[List[object]]:
             # Base full-row layout is 9 cells; metric cells start at index 9.
@@ -5018,7 +5046,15 @@ def _handle_find(cli: "PlaylistCLI", args: Any) -> int:
     section("Find", cli.last_search_query)
     info(f"Blend: {round(weight * 100)}% taste · {round((1 - weight) * 100)}% relevance — {signal}")
     table(
-        ["#", "Song", "Artist", "Year", "Rel", "Taste", "Blend"],
+        [
+            ColumnSpec("#", justify="right", style="dim"),
+            "Song",
+            "Artist",
+            "Year",
+            ColumnSpec("Rel", metric=True),
+            ColumnSpec("Taste", metric=True),
+            ColumnSpec("Blend", metric=True),
+        ],
         [
             [
                 i,

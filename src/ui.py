@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 from rich import box
@@ -10,7 +11,7 @@ from rich.cells import cell_len
 from rich.color import Color, blend_rgb
 from rich.color_triplet import ColorTriplet
 from rich.columns import Columns
-from rich.console import Console, Group, RenderableType
+from rich.console import Console, Group, JustifyMethod, RenderableType
 from rich.measure import Measurement
 from rich.panel import Panel
 from rich.rule import Rule
@@ -65,6 +66,122 @@ SUBSECTION_STYLE = f"bold {ACCENT_BLUE}"  # subsection lines & panel titles (was
 # sink runs with markup=False, so styles must be real objects/strings on Text
 # segments — never markup strings embedded in content.
 StyleLike = Union[str, Style]
+
+# ColumnSpec.metric as a callable: a per-cell colorer, called with the RAW
+# cell value; returns a style for that cell, or None to fall back to the
+# column's base styling.
+MetricColorer = Callable[[Any], Optional[StyleLike]]
+# ColumnSpec.link: called with (raw cell value, raw row); returns the URL the
+# cell's visible text should hyperlink to — falsy means "no link".
+LinkBuilder = Callable[[Any, Sequence[Any]], Optional[str]]
+
+
+@dataclass(frozen=True)
+class ColumnSpec:
+    """Typed per-column spec for `table` / `preview_table` — an additive API.
+
+    Anywhere `table()` accepts a header string it also accepts a ColumnSpec;
+    plain strings keep the exact legacy behavior (str headers, str-coerced
+    cells, Text passthrough), so call sites migrate one column at a time.
+
+    * `justify` — cell justification; ``None`` means left, or right for
+      metric columns (numbers right-align by default).
+    * `style` — base style for plain (non-Text) cells. Rich `Text` cells
+      always pass through untouched: pre-styled cells (e.g. the constraint-
+      colored metric cells) keep their own styling.
+    * `metric` — ``True`` renders plain cells as bold values (`VALUE_STYLE`);
+      a callable is a per-cell colorer (raw value -> style) whose ``None``
+      result falls back to `style`, then `VALUE_STYLE`.
+    * `width` / `max_width` / `no_wrap` — width hints forwarded to the
+      column; `no_wrap` columns crop with a visible ellipsis, never silently.
+    * `link` — builds a URL from ``(cell, row)``; the cell's VISIBLE text is
+      unchanged, it just gains an OSC 8 terminal hyperlink (`link_text`), so
+      terminals without hyperlink support still identify the row.
+    """
+
+    header: str
+    justify: Optional[JustifyMethod] = None
+    style: Optional[StyleLike] = None
+    metric: Union[bool, MetricColorer] = False
+    width: Optional[int] = None
+    max_width: Optional[int] = None
+    no_wrap: bool = False
+    link: Optional[LinkBuilder] = None
+
+
+def link_text(label: object, url: Optional[str], *, style: Optional[StyleLike] = None) -> Text:
+    """A Text whose visible label is unchanged but carries a terminal hyperlink.
+
+    Rich emits OSC 8 hyperlink codes only where the terminal supports them;
+    everywhere else (pipes, captured output, dumb terminals) the label renders
+    as-is — the URL never leaks into the visible text, so the label must
+    identify the row on its own. A falsy `url` yields a plain (optionally
+    styled) Text, so callers can pass an unresolved lookup result unguarded.
+    """
+    text = Text(str(label), style=style) if style is not None else Text(str(label))
+    if url:
+        text.stylize(Style(link=url))
+    return text
+
+
+def _spec_columns(t: Table, headers: Sequence[Any]) -> List[Optional[ColumnSpec]]:
+    """Add one table column per header (string or ColumnSpec); return specs."""
+    specs: List[Optional[ColumnSpec]] = []
+    for header in headers:
+        if isinstance(header, ColumnSpec):
+            t.add_column(
+                header.header,
+                justify=header.justify or ("right" if header.metric else "left"),
+                width=header.width,
+                max_width=header.max_width,
+                no_wrap=header.no_wrap,
+                overflow="ellipsis" if header.no_wrap else "fold",
+            )
+            specs.append(header)
+        else:
+            t.add_column(str(header), overflow="fold", no_wrap=False)
+            specs.append(None)
+    return specs
+
+
+def _spec_cell_style(spec: ColumnSpec, cell: Any) -> Optional[StyleLike]:
+    """The style a plain cell wears: metric colorer > column style > metric bold."""
+    if callable(spec.metric):
+        styled = spec.metric(cell)
+        if styled is not None:
+            return styled
+    if spec.style is not None:
+        return spec.style
+    if spec.metric:
+        return VALUE_STYLE
+    return None
+
+
+def _spec_cell(cell: Any, row: Sequence[Any], spec: Optional[ColumnSpec]) -> Union[str, Text]:
+    """Resolve one cell: legacy passthrough for spec-less columns; styled /
+    linked rendering for spec columns. A caller's Text cell is never mutated —
+    linking copies it first."""
+    if spec is None:
+        return cell if isinstance(cell, Text) else str(cell)
+    url = spec.link(cell, row) if spec.link is not None else None
+    if isinstance(cell, Text):
+        if url:
+            linked = cell.copy()
+            linked.stylize(Style(link=url))
+            return linked
+        return cell
+    style = _spec_cell_style(spec, cell)
+    if url:
+        return link_text(cell, url, style=style)
+    return Text(str(cell), style=style) if style is not None else str(cell)
+
+
+def _spec_row(row: Sequence[Any], specs: Sequence[Optional[ColumnSpec]]) -> List[Union[str, Text]]:
+    """Resolve a whole row; cells beyond the spec'd columns keep legacy coercion."""
+    return [
+        _spec_cell(cell, row, specs[index] if index < len(specs) else None)
+        for index, cell in enumerate(row)
+    ]
 
 
 def set_json_mode(enabled: bool) -> None:
@@ -155,14 +272,16 @@ def subsection(title: str) -> None:
 
 
 def table(headers: list[Any], rows: list[list[Any]]) -> None:
+    """Emit a table. Headers may be plain strings (legacy behavior: str
+    headers, str-coerced cells with Text passthrough) or `ColumnSpec`s for
+    typed alignment / styling / metric coloring / hyperlinks per column."""
     t = Table(show_header=True, header_style=TABLE_HEADER_STYLE, box=box.SIMPLE, expand=True)
-    for header in headers:
-        t.add_column(str(header), overflow="fold", no_wrap=False)
+    specs = _spec_columns(t, headers)
     for row in rows:
         # Rich Text cells pass through untouched so callers can style cells
         # (e.g. green when a constraint is satisfied); everything else is
-        # coerced with str() as before.
-        t.add_row(*[cell if isinstance(cell, Text) else str(cell) for cell in row])
+        # coerced with str() — or styled/linked by its column's ColumnSpec.
+        t.add_row(*_spec_row(row, specs))
     _emit(t)
 
 
@@ -170,10 +289,9 @@ def preview_table(headers: list[Any], rows: list[list[Any]], title: Optional[str
     if not _preview_sink:
         return
     t = Table(show_header=True, header_style=TABLE_HEADER_STYLE, box=box.SIMPLE, expand=True)
-    for header in headers:
-        t.add_column(str(header), overflow="fold", no_wrap=False)
+    specs = _spec_columns(t, headers)
     for row in rows:
-        t.add_row(*[cell if isinstance(cell, Text) else str(cell) for cell in row])
+        t.add_row(*_spec_row(row, specs))
     if title:
         _emit_preview(Panel(t, title=title, border_style=ACCENT_BLUE))
     else:
