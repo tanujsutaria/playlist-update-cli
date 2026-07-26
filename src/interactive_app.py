@@ -288,8 +288,14 @@ class UILogHandler(logging.Handler):
 class ConfirmScreen(ModalScreen[bool]):
     """Generic yes/no modal gating destructive commands (TUI path only).
 
-    y / enter (or the yes button) confirms; n / esc (or the no button)
-    cancels. The screen is pushed, so its own Escape binding is found before
+    y (or the yes button) confirms; n / esc (or the no button) cancels.
+    Deliberately NO screen-level Enter binding, and "no" is focused on
+    mount: Enter is the very key that just submitted the command, so a
+    queued second Enter (terminal key repeat, a reflexive double-tap — the
+    exact accident class this gate exists to stop) must land on the SAFE
+    button, never confirm the destructive action. Confirming requires a
+    distinct, deliberate keypress: y, or tab to the yes button + enter.
+    The screen is pushed, so its own Escape binding is found before
     the app-level Esc-cancel binding — Esc here closes only the modal
     (pinned by the confirm-modal pilot test). Styling rides the OP-1 theme
     variables the App CSS already resolves ($surface/$panel/$warning/…).
@@ -338,9 +344,10 @@ class ConfirmScreen(ModalScreen[bool]):
     }
     """
 
+    # No "enter" binding on purpose — see the class docstring: Enter must
+    # only ever press the FOCUSED button (safe default: "no").
     BINDINGS = [
         Binding("y", "confirm", "yes", show=False),
-        Binding("enter", "confirm", "yes", show=False),
         Binding("n", "cancel", "no", show=False),
         Binding("escape", "cancel", "no", show=False),
     ]
@@ -357,12 +364,14 @@ class ConfirmScreen(ModalScreen[bool]):
             with Horizontal(id="confirm_buttons"):
                 yield Button("yes", id="confirm_yes")
                 yield Button("no", id="confirm_no")
-            yield Static("y/enter confirm · n/esc cancel", id="confirm_hint")
+            yield Static("y confirm · n/esc cancel · enter = focused button", id="confirm_hint")
 
     def on_mount(self) -> None:
-        # Focus "yes" so plain Enter confirms; the focused Button's own Enter
-        # binding wins over the screen-level one — same outcome either way.
-        self.query_one("#confirm_yes", Button).focus()
+        # Focus the SAFE button: the second Enter of an accidental double-tap
+        # (already queued behind the one that submitted the command) presses
+        # the focused widget, so it must cancel, never confirm — see the
+        # class docstring.
+        self.query_one("#confirm_no", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
@@ -433,11 +442,18 @@ class PlaylistInteractiveApp(App):
     status = reactive("idle")
     SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
-    # Statuses from which NEW user work may start. "cancelled" counts: the
-    # cancelled run's thread may still be unwinding (thread workers cannot be
-    # force-stopped), but its generation is stale so it can no longer touch
-    # the UI — the input gate must reopen immediately. Background auto-sync
-    # deliberately keeps waiting for TRUE "idle" (see _maybe_auto_sync).
+    # Statuses that count as "at rest" for the user-work gate. Status alone
+    # is NOT sufficient: _is_idle additionally requires zero in-flight
+    # user-work threads. After an Esc-cancel the status reads "cancelled"
+    # while the old thread may still be unwinding (thread workers cannot be
+    # force-stopped) — its generation is stale so it cannot touch the UI,
+    # but letting NEW work start would overlap it on the shared
+    # serialized-use sqlite connection (storage/db.py forbids overlapping
+    # queries across threads, and repos-owned transactions would interleave)
+    # and potentially on the same live Spotify playlist. The gate therefore
+    # stays closed until _worker_thread_exited restores true idle;
+    # background auto-sync waits for strict "idle" the same way
+    # (see _maybe_auto_sync).
     IDLE_STATUSES = frozenset({"idle", "cancelled"})
 
     def __init__(self, cli: PlaylistCLI, parser: argparse.ArgumentParser) -> None:
@@ -899,8 +915,7 @@ class PlaylistInteractiveApp(App):
         self._run_command(command, args)
 
     def _run_command(self, command: str, args: object) -> None:
-        if not self._is_idle():
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        if self._refuse_if_busy():
             return
         question = self._destructive_question(command, args)
         if question is None:
@@ -977,23 +992,56 @@ class PlaylistInteractiveApp(App):
 
     def _start_command(self, command: str, args: object) -> None:
         """Actually launch the (possibly just-confirmed) command worker."""
-        if not self._is_idle():
-            # Belt-and-braces: the modal round-trip could in principle race a
-            # freshly armed auto-sync; re-check rather than overlap workers.
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        # Belt-and-braces: the modal round-trip could in principle race a
+        # freshly armed auto-sync; re-check rather than overlap workers.
+        if self._refuse_if_busy():
             return
-        # Fresh error window + stage for this command. App-thread writes; a
-        # cancelled predecessor's worker thread may still be unwinding, but
-        # its increments are skipped by the staleness check in
-        # UILogHandler.emit, so the new window starts clean.
+        # Fresh error window + stage for this command. App-thread writes;
+        # the in-flight gate above guarantees no earlier user-work thread is
+        # still running (UILogHandler.emit drops stale increments as a second
+        # line of defence), so the new window starts clean.
         self._command_error_count = 0
         self._stage = ""
         self._run_started = time.monotonic()
         self._start_user_worker(f"running /{command}", lambda: self._execute_command(command, args))
 
     def _is_idle(self) -> bool:
-        """True when new user work may start (see IDLE_STATUSES)."""
-        return self.status in self.IDLE_STATUSES
+        """True when new user work may start: a rest status AND no user-work
+        thread still unwinding (see IDLE_STATUSES and _refuse_if_busy)."""
+        return self.status in self.IDLE_STATUSES and self._inflight_workers == 0
+
+    def _refuse_if_busy(self) -> bool:
+        """Gate for new user work: when blocked, log why and return True.
+
+        Two refusal flavours: a live command/auto-sync holds the gate, or an
+        Esc-cancelled worker's thread is still unwinding — running anything
+        new alongside it would interleave transactions on the shared
+        serialized-use sqlite connection (and could overlap live Spotify
+        mutations), so the gate reopens only at true idle
+        (_worker_thread_exited). The generation guard only suppresses the
+        old run's OUTPUT; this gate is what serializes its EFFECTS.
+        """
+        if self._is_idle():
+            return False
+        if self.status == "cancelled":
+            self.append_log(
+                Text(
+                    "Waiting for the cancelled command to finish unwinding — "
+                    "try again in a moment.",
+                    style="yellow",
+                )
+            )
+        elif self.status in self.IDLE_STATUSES:
+            # Microscopic window: _post_command already flipped the status to
+            # "idle" from the worker thread, but that thread's exit
+            # notification hasn't landed yet (_worker_thread_exited). Refuse
+            # honestly rather than assume the thread is past its shared work.
+            self.append_log(
+                Text("The previous command is still finishing — try again.", style="yellow")
+            )
+        else:
+            self.append_log(Text("Another command is already running.", style="yellow"))
+        return True
 
     def _start_user_worker(self, status: str, work: Callable[[], None]) -> None:
         """Start THE user-work thread worker (single, Esc-cancellable).
@@ -1071,7 +1119,8 @@ class PlaylistInteractiveApp(App):
             Text(
                 f"Cancelled {label}. The worker thread can't be force-stopped, so a "
                 "step already in flight (e.g. a network call) may finish in the "
-                "background; its output is discarded.",
+                "background; its output is discarded, and new commands wait "
+                "until it unwinds.",
                 style="yellow",
             )
         )
@@ -1988,8 +2037,7 @@ class PlaylistInteractiveApp(App):
         full result set) and the /results browser's dismiss callback (an
         explicit row-level subset).
         """
-        if not self._is_idle():
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        if self._refuse_if_busy():
             return
         if track_ids is None:
             track_ids = self._pending_payload.get("track_ids") or []
@@ -2020,8 +2068,7 @@ class PlaylistInteractiveApp(App):
         queries the shared sqlite connection synchronously on the app thread,
         so it must not open while a worker (command or auto-sync) is mid-write.
         """
-        if not self._is_idle():
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        if self._refuse_if_busy():
             return
 
         def _refocus(_result: object = None) -> None:
@@ -2044,8 +2091,7 @@ class PlaylistInteractiveApp(App):
         contract holds for the screen's whole lifetime. Writes happen only
         AFTER dismissal, via the existing _apply_search_results worker.
         """
-        if not self._is_idle():
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        if self._refuse_if_busy():
             return
         if not results_for_browse(self.cli):
             self.append_log(
@@ -2084,8 +2130,7 @@ class PlaylistInteractiveApp(App):
                 Text("No previous search to expand. Run /search <criteria> first.", style="yellow")
             )
             return
-        if not self._is_idle():
-            self.append_log(Text("Another command is already running.", style="yellow"))
+        if self._refuse_if_busy():
             return
         self.append_log(Text(f"Expanding search: {self.cli.last_search_query}", style="bold"))
         self._run_started = time.monotonic()

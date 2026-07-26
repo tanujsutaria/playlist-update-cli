@@ -1983,7 +1983,7 @@ class TestEscCancelUnit:
         assert "Cancelled /search" in text
         assert "background" in text  # honest thread-worker caveat
 
-    def test_gate_reopens_after_cancel_but_still_blocks_while_running(self, monkeypatch):
+    def test_gate_blocks_while_cancelled_thread_unwinds_then_reopens(self, monkeypatch):
         class GateApp(DummyApp):
             _run_command = PlaylistInteractiveApp._run_command
 
@@ -1993,12 +1993,56 @@ class TestEscCancelUnit:
         app._refresh_env_status()
         app.run_worker = lambda fn, thread=True: _FakeWorker()
 
-        app.status = "cancelled"  # a cancelled run's thread may still unwind
+        # Esc-cancelled run whose thread is still unwinding: new work must
+        # NOT start — it would overlap the stale thread on the shared
+        # serialized-use sqlite connection (and possibly the same playlist).
+        app.status = "cancelled"
+        app._inflight_workers = 1
+        app._run_generation = 3  # the cancelled run held a stale generation
         app._run_command("stats", object())
-        assert app.status == "running /stats"  # input unlocked immediately
+        assert app.status == "cancelled"  # gate stays closed
+        assert "Waiting for the cancelled command" in _logged_text(app)
 
-        app._run_command("stats", object())  # …but running still blocks
+        # The stale thread unwinds: true idle is restored, the gate reopens.
+        app._worker_thread_exited(2)
+        assert app.status == "idle"
+        app._run_command("stats", object())
+        assert app.status == "running /stats"
+
+        app._run_command("stats", object())  # …running still blocks
         assert "Another command is already running" in _logged_text(app)
+
+    def test_is_idle_requires_zero_inflight_threads(self, monkeypatch):
+        app = self._app(monkeypatch)
+        assert app._is_idle()
+        app._inflight_workers = 1
+        assert not app._is_idle()  # "idle" status alone is not enough
+        app.status = "cancelled"
+        assert not app._is_idle()
+        app._inflight_workers = 0
+        assert app._is_idle()  # rest status + fully unwound
+
+    def test_refuse_messages_distinguish_cancelled_from_finishing(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._inflight_workers = 1
+        app.status = "cancelled"
+        assert app._refuse_if_busy() is True
+        assert "Waiting for the cancelled command" in _logged_text(app)
+        app.logged.clear()
+        # _post_command already restored "idle" from the worker thread, but
+        # the thread's exit notification hasn't landed yet.
+        app.status = "idle"
+        assert app._refuse_if_busy() is True
+        assert "still finishing" in _logged_text(app)
+        app.logged.clear()
+        app.status = "running /stats"
+        assert app._refuse_if_busy() is True
+        assert "Another command is already running" in _logged_text(app)
+        app.logged.clear()
+        app._inflight_workers = 0
+        app.status = "idle"
+        assert app._refuse_if_busy() is False
+        assert app.logged == []
 
     def test_run_if_current_drops_stale_runs_current(self, monkeypatch):
         app = self._app(monkeypatch)
@@ -2224,15 +2268,14 @@ class TestEscCancelPilot:
                 assert app._active_worker is None
                 assert "Cancelled /stats" in _scrollback(app)
 
-                # Input unlocked: a second /stats is accepted immediately and
-                # runs to completion while the stale thread is still blocked.
+                # The gate stays CLOSED while the cancelled thread unwinds:
+                # a second /stats must not start a worker that would share
+                # the serialized-use sqlite connection with the stale thread.
                 app._submit_text("/stats")
-                for _ in range(500):
-                    if len(calls) == 2 and app.status == "idle":
-                        break
-                    await pilot.pause(0.01)
-                assert calls == ["stats", "stats"]
-                assert app.status == "idle"
+                await pilot.pause()
+                assert calls == ["stats"]  # nothing new dispatched
+                assert app.status == "cancelled"
+                assert "Waiting for the cancelled command" in _scrollback(app)
 
                 # Release the cancelled worker: its late output and completion
                 # must be suppressed, and true idle must survive its exit.
@@ -2242,12 +2285,25 @@ class TestEscCancelPilot:
                         break
                     await pilot.pause(0.01)
                 assert finished.is_set()
-                await pilot.pause()  # drain the stale worker's marshalled calls
+                for _ in range(500):  # drain the stale worker's exit callback
+                    if app.status == "idle" and app._inflight_workers == 0:
+                        break
+                    await pilot.pause(0.01)
                 text = _scrollback(app)
                 assert "stale output after cancel" not in text
-                assert text.count("finished in") == 1  # second run only
+                assert "finished in" not in text  # cancelled run stays silent
                 assert app.status == "idle"
                 assert app._inflight_workers == 0
+
+                # Gate reopened at true idle: the second /stats now runs.
+                app._submit_text("/stats")
+                for _ in range(500):
+                    if len(calls) == 2 and app.status == "idle":
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["stats", "stats"]
+                assert app.status == "idle"
+                assert _scrollback(app).count("finished in") == 1  # 2nd run only
 
         root = _logging.getLogger()
         saved_handlers = root.handlers[:]
@@ -2463,20 +2519,38 @@ class TestConfirmModalPilot:
                 assert isinstance(app.screen, ConfirmScreen)
                 await pilot.press("y")
                 for _ in range(500):
-                    if calls == ["rotate"] and app.status == "idle":
+                    if calls == ["rotate"] and app.status == "idle" and app._inflight_workers == 0:
                         break
                     await pilot.pause(0.01)
                 assert calls == ["rotate"]
                 assert app.status == "idle"
                 assert "/rotate finished in" in _scrollback(app)
 
-                # 3) Enter presses the focused yes-button: also confirms.
+                # 3) Enter must NOT confirm: "no" is focused on mount and
+                # the screen binds no Enter, so the queued second Enter of an
+                # accidental double-tap presses the SAFE button and cancels.
                 app._submit_text("/restore b1")
                 await pilot.pause()
                 assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("enter")  # the double-tap's second Enter
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == ["rotate"]  # restore never dispatched
+                assert "/restore cancelled — nothing changed." in _scrollback(app)
+
+                # 3b) The deliberate keyboard route to yes still works: tab
+                # moves focus to the yes button, enter presses it.
+                app._submit_text("/restore b1")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("tab")
                 await pilot.press("enter")
                 for _ in range(500):
-                    if calls == ["rotate", "restore"] and app.status == "idle":
+                    if (
+                        calls == ["rotate", "restore"]
+                        and app.status == "idle"
+                        and app._inflight_workers == 0
+                    ):
                         break
                     await pilot.pause(0.01)
                 assert calls == ["rotate", "restore"]
