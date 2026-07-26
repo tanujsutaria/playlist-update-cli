@@ -676,14 +676,6 @@ def _isolated_history(monkeypatch, tmp_path):
     monkeypatch.setenv("TUNR_HISTORY_PATH", str(tmp_path / "tunr_history"))
 
 
-@pytest.fixture(autouse=True)
-def _isolated_db(monkeypatch, tmp_path):
-    """ResultsScreen.__init__ resolves per-row Spotify URLs, which reaches a
-    real PlaylistCLI's lazy repos (the local-db fallback) — keep every test
-    off the repo's data/ dir."""
-    monkeypatch.setenv("TUNR_DB_PATH", str(tmp_path / "tunr.db"))
-
-
 def _make_app(monkeypatch):
     from arg_parse import setup_parsers
     from interactive_app import SPOTIFY_REQUIRED_KEYS, PlaylistInteractiveApp
