@@ -2260,3 +2260,247 @@ class TestEscCancelPilot:
             _ui.set_output_sink(None)
             _ui.set_preview_sink(None)
             _ui.set_status_sink(None)
+
+
+# ============================================================================
+# Destructive-command confirm modal (TUI dispatch path only)
+# ============================================================================
+
+
+class _ConfirmGateApp(DummyApp):
+    """DummyApp with the REAL _run_command so the modal gate is under test;
+    push_screen and _start_command are captured instead of executed."""
+
+    _run_command = PlaylistInteractiveApp._run_command
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.pushed = []
+        self.started = []
+
+    def push_screen(self, screen, callback=None):
+        self.pushed.append((screen, callback))
+
+    def _start_command(self, command, args):
+        self.started.append((command, args))
+
+    def _focus_input(self):
+        pass
+
+
+class TestDestructiveQuestion:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = DummyApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_destructive_commands_get_questions(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        assert "backup 'b1'" in question("restore", SimpleNamespace(backup_name="b1"))
+        assert "token" in question("auth-reset", SimpleNamespace(yes=False))
+        assert "rewrites" in question("update", SimpleNamespace(playlist="Chill", dry_run=False))
+        assert "Rotate" in question("rotate", SimpleNamespace(playlist="Chill"))
+        assert "Rotate" in question("rotate-played", SimpleNamespace(playlist="Chill"))
+        assert "mirrors the db" in question("sync", SimpleNamespace(playlist="Chill"))
+        assert "Permanently" in question("clean", SimpleNamespace(dry_run=False))
+
+    def test_dry_runs_are_not_gated(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        assert question("update", SimpleNamespace(playlist="Chill", dry_run=True)) is None
+        assert question("clean", SimpleNamespace(dry_run=True)) is None
+
+    def test_non_destructive_and_recovery_commands_are_not_gated(self, monkeypatch):
+        from types import SimpleNamespace
+
+        question = self._app(monkeypatch)._destructive_question
+        args = SimpleNamespace(playlist="Chill", backup_name="b1", top=5, offset=-1)
+        for command in (
+            "stats",
+            "view",
+            "plan",
+            "diff",
+            "backup",
+            "search",
+            "find",
+            "auth-status",
+            # Recovery commands stay friction-free on purpose:
+            "undo",
+            "restore-previous-rotation",
+        ):
+            assert question(command, args) is None, command
+
+
+class TestConfirmGateUnit:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _ConfirmGateApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def test_non_destructive_starts_without_modal(self, monkeypatch):
+        app = self._app(monkeypatch)
+        args = object()
+        app._run_command("stats", args)
+        assert app.pushed == []
+        assert app.started == [("stats", args)]
+
+    def test_destructive_waits_for_confirmation(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from interactive_app import ConfirmScreen
+
+        app = self._app(monkeypatch)
+        args = SimpleNamespace(playlist="Chill")
+        app._run_command("rotate", args)
+        assert app.started == []  # nothing runs until the modal answers
+        assert len(app.pushed) == 1
+        screen, callback = app.pushed[0]
+        assert isinstance(screen, ConfirmScreen)
+        callback(True)
+        assert app.started == [("rotate", args)]
+
+    def test_cancel_leaves_command_unrun_and_logs(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        app._run_command("restore", SimpleNamespace(backup_name="b1"))
+        _screen, callback = app.pushed[0]
+        callback(False)
+        assert app.started == []
+        assert "/restore cancelled — nothing changed." in _logged_text(app)
+
+    def test_confirmed_auth_reset_forces_yes(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        args = SimpleNamespace(yes=False)
+        app._run_command("auth-reset", args)
+        _screen, callback = app.pushed[0]
+        callback(True)
+        assert args.yes is True  # the modal IS the TUI confirmation
+        assert app.started == [("auth-reset", args)]
+
+    def test_busy_gate_precedes_modal(self, monkeypatch):
+        from types import SimpleNamespace
+
+        app = self._app(monkeypatch)
+        app.status = "running /stats"
+        app._run_command("rotate", SimpleNamespace(playlist="Chill"))
+        assert app.pushed == []
+        assert app.started == []
+        assert "Another command is already running" in _logged_text(app)
+
+
+# ---------------------------------------------------------------------------
+# Pilot: real modal end-to-end — confirm runs, cancel doesn't, and Esc in the
+# modal closes only the modal (never the app-level Esc-cancel binding).
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmModalPilot:
+    def test_confirm_cancel_and_esc_paths(self, monkeypatch):
+        import logging as _logging
+
+        from textual.widgets import RichLog
+
+        import interactive_app as ia
+        import ui as _ui
+        from interactive_app import ConfirmScreen
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        calls = []
+
+        def _dispatch(cli, command, args):
+            calls.append(command)
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+
+        def _scrollback(app) -> str:
+            log = app.query_one(RichLog)
+            return "\n".join(strip.text for strip in log.lines)
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+                # Spy on the app-level Esc cancel action: the modal's own
+                # Escape binding must win, so this must never fire.
+                cancel_calls = []
+                orig_cancel = app.action_cancel_command
+
+                def _spy_cancel():
+                    cancel_calls.append(1)
+                    orig_cancel()
+
+                app.action_cancel_command = _spy_cancel
+
+                # 1) Esc inside the modal closes ONLY the modal.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                assert calls == []  # nothing dispatched while the modal is up
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == []
+                assert cancel_calls == []  # app-level Esc binding never fired
+                assert app.status == "idle"
+                assert "/rotate cancelled — nothing changed." in _scrollback(app)
+
+                # 2) y confirms and the command actually runs.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("y")
+                for _ in range(500):
+                    if calls == ["rotate"] and app.status == "idle":
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["rotate"]
+                assert app.status == "idle"
+                assert "/rotate finished in" in _scrollback(app)
+
+                # 3) Enter presses the focused yes-button: also confirms.
+                app._submit_text("/restore b1")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("enter")
+                for _ in range(500):
+                    if calls == ["rotate", "restore"] and app.status == "idle":
+                        break
+                    await pilot.pause(0.01)
+                assert calls == ["rotate", "restore"]
+
+                # 4) n cancels: no further dispatch.
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen)
+                await pilot.press("n")
+                await pilot.pause()
+                assert not isinstance(app.screen, ConfirmScreen)
+                assert calls == ["rotate", "restore"]
+                assert app.status == "idle"
+
+        # on_mount replaces root logging handlers and points the ui sinks at
+        # this app; restore both afterwards (same pattern as the Esc pilot).
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _run_async(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)
+            _ui.set_status_sink(None)

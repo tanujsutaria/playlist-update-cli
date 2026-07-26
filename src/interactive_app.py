@@ -19,11 +19,11 @@ from rich.text import Text
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.command import DiscoveryHit, Hit, Hits, Provider
-from textual.containers import Container
+from textual.containers import Container, Horizontal
 from textual.reactive import reactive
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Button, Input, RichLog, Static
 from textual.worker import Worker
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
@@ -283,6 +283,96 @@ class UILogHandler(logging.Handler):
                 self.app._dispatch_ui(self.app.record_error, message)
         except Exception:
             self.handleError(record)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Generic yes/no modal gating destructive commands (TUI path only).
+
+    y / enter (or the yes button) confirms; n / esc (or the no button)
+    cancels. The screen is pushed, so its own Escape binding is found before
+    the app-level Esc-cancel binding — Esc here closes only the modal
+    (pinned by the confirm-modal pilot test). Styling rides the OP-1 theme
+    variables the App CSS already resolves ($surface/$panel/$warning/…).
+    """
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen #confirm_box {
+        width: 64;
+        max-width: 90%;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: solid $panel;
+    }
+    ConfirmScreen #confirm_title {
+        color: $warning;
+        text-style: bold;
+    }
+    ConfirmScreen #confirm_message {
+        margin-top: 1;
+        color: $foreground;
+    }
+    ConfirmScreen #confirm_buttons {
+        margin-top: 1;
+        height: auto;
+        align-horizontal: center;
+    }
+    ConfirmScreen Button {
+        margin: 0 2;
+        min-width: 8;
+        border: none;
+        background: $panel;
+        color: $foreground;
+    }
+    ConfirmScreen Button:focus {
+        background: $primary;
+        color: $background;
+        text-style: bold;
+    }
+    ConfirmScreen #confirm_hint {
+        margin-top: 1;
+        color: $secondary;
+    }
+    """
+
+    BINDINGS = [
+        Binding("y", "confirm", "yes", show=False),
+        Binding("enter", "confirm", "yes", show=False),
+        Binding("n", "cancel", "no", show=False),
+        Binding("escape", "cancel", "no", show=False),
+    ]
+
+    def __init__(self, title: str, question: str) -> None:
+        super().__init__()
+        self._title = title
+        self._question = question
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm_box"):
+            yield Static(self._title, id="confirm_title")
+            yield Static(self._question, id="confirm_message")
+            with Horizontal(id="confirm_buttons"):
+                yield Button("yes", id="confirm_yes")
+                yield Button("no", id="confirm_no")
+            yield Static("y/enter confirm · n/esc cancel", id="confirm_hint")
+
+    def on_mount(self) -> None:
+        # Focus "yes" so plain Enter confirms; the focused Button's own Enter
+        # binding wins over the screen-level one — same outcome either way.
+        self.query_one("#confirm_yes", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "confirm_yes")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class PlaylistInteractiveApp(App):
@@ -810,6 +900,86 @@ class PlaylistInteractiveApp(App):
 
     def _run_command(self, command: str, args: object) -> None:
         if not self._is_idle():
+            self.append_log(Text("Another command is already running.", style="yellow"))
+            return
+        question = self._destructive_question(command, args)
+        if question is None:
+            self._start_command(command, args)
+            return
+
+        # Destructive dispatch: interpose the confirm modal. TUI-only seam —
+        # the headless path (main.dispatch_command) never routes through here
+        # and keeps its behavior exactly as before.
+        def _decide(confirmed: "Optional[bool]" = None) -> None:
+            self._focus_input()
+            if not confirmed:
+                self.append_log(Text(f"/{command} cancelled — nothing changed.", style="dim"))
+                return
+            if command == "auth-reset":
+                # The modal IS the confirmation here: a confirmed TUI run
+                # acts instead of re-printing the "--yes to confirm" hint.
+                # (Headless auth-reset still requires --yes, unchanged.)
+                setattr(args, "yes", True)
+            self._start_command(command, args)
+
+        self.push_screen(ConfirmScreen(f"confirm /{command}", question), callback=_decide)
+
+    def _destructive_question(self, command: str, args: object) -> "Optional[str]":
+        """The confirm-modal question for a destructive dispatch, else None.
+
+        Gated (judged by what each handler does):
+        * restore — replaces the entire live data/ directory with a backup;
+        * auth-reset — deletes the cached Spotify token file;
+        * update (without --dry-run) — rewrites the real Spotify playlist;
+        * rotate / rotate-played — modify the real playlist (no dry-run mode);
+        * sync — adds AND removes real-playlist tracks to mirror the db;
+        * clean (without --dry-run) — permanently deletes rows from the db.
+
+        Deliberately NOT gated: undo and restore-previous-rotation (recovery
+        commands whose whole purpose is reverting a bad write — friction
+        there works against the user), backup/plan/diff and every read-only
+        command.
+        """
+        playlist = getattr(args, "playlist", "")
+        if command == "restore":
+            name = getattr(args, "backup_name", "")
+            return (
+                f"Replace the live data/ directory with backup '{name}'? "
+                "Current data is overwritten (current state is moved aside only "
+                "during the swap)."
+            )
+        if command == "auth-reset":
+            return (
+                "Delete the cached Spotify token? The next Spotify command "
+                "will re-open the consent screen."
+            )
+        if command == "update" and not getattr(args, "dry_run", False):
+            return (
+                f"Apply a fresh selection to Spotify playlist '{playlist}'? "
+                "This rewrites the live playlist (use --dry-run to preview)."
+            )
+        if command in ("rotate", "rotate-played"):
+            return (
+                f"Rotate played tracks out of Spotify playlist '{playlist}'? "
+                "This modifies the live playlist."
+            )
+        if command == "sync":
+            return (
+                f"Sync the whole database into Spotify playlist '{playlist}'? "
+                "Tracks are added AND removed so the playlist mirrors the db."
+            )
+        if command == "clean" and not getattr(args, "dry_run", False):
+            return (
+                "Permanently remove dead or over-popular songs from the local "
+                "database? (/clean --dry-run previews the removals.)"
+            )
+        return None
+
+    def _start_command(self, command: str, args: object) -> None:
+        """Actually launch the (possibly just-confirmed) command worker."""
+        if not self._is_idle():
+            # Belt-and-braces: the modal round-trip could in principle race a
+            # freshly armed auto-sync; re-check rather than overlap workers.
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         # Fresh error window + stage for this command. App-thread writes; a
