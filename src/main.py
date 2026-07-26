@@ -1,4 +1,5 @@
 import csv
+import difflib
 import json
 import logging
 import math
@@ -266,6 +267,119 @@ def _month_label(month: str) -> str:
 
 # Spelled-out wave counts for the ingest-history line (only fires at <= 4 waves).
 _WAVE_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
+
+
+# ---------------------------------------------------------------------------
+# Playlist-name resolver: fuzzy did-you-mean suggestions on a miss.
+#
+# Central seam shared by every playlist-taking command's not-found path
+# (update/rotate/sync/view/diff/extract/plan), so both the TUI and the
+# headless CLI render the same actionable error. SUGGEST-ONLY by contract:
+# a close match is only ever PRINTED — nothing here (or in any caller) may
+# substitute a guessed name or execute against it.
+# ---------------------------------------------------------------------------
+
+
+def suggest_playlist_names(name: str, candidates: List[str], limit: int = 3) -> List[str]:
+    """Close matches for a missing playlist name (case-insensitive, ranked).
+
+    Pure function over an explicit candidate list; duplicates that differ only
+    by case collapse to the first spelling seen. Exact matches never reach
+    this — callers only consult it after resolution already failed.
+    """
+    by_lower: Dict[str, str] = {}
+    for candidate in candidates:
+        if candidate:
+            by_lower.setdefault(candidate.lower(), candidate)
+    # cutoff 0.5 (below difflib's 0.6 default): playlist typos often drop or
+    # add whole words ("dailymix" vs "my daily mix"), which dilutes the ratio.
+    matches = difflib.get_close_matches(name.lower(), list(by_lower), n=limit, cutoff=0.5)
+    return [by_lower[match] for match in matches]
+
+
+def playlist_not_found_message(name: str, suggestions: List[str]) -> str:
+    """The actionable miss message (suggestions are display-only)."""
+    if suggestions:
+        listed = ", ".join(suggestions)
+        return (
+            f"no playlist '{name}' — did you mean: {listed}? "
+            "(suggestions only — rerun with the exact name)"
+        )
+    return (
+        f"no playlist '{name}' — no similar name known "
+        "(names come from your Spotify playlists, rotation history and the "
+        "/pull mirror; run /pull to refresh)"
+    )
+
+
+def collect_playlist_names(cli: "PlaylistCLI") -> List[str]:
+    """Every playlist name tunr knows about, for did-you-mean candidates.
+
+    Sources: the live Spotify cache when the manager is ALREADY initialized
+    (never lazy-inits it — that could launch the interactive OAuth flow from
+    a suggestion path), plus the rotation `playlists` table and the /pull
+    mirror (`spotify_playlists`) when the repos are ALREADY materialized —
+    the lazy `repos` property is never triggered just to suggest, so this
+    path can never create a database as a side effect. Best-effort: any
+    source that cannot be read is skipped — suggestions are advisory, never
+    worth failing over.
+    """
+    by_lower: Dict[str, str] = {}
+
+    def _add(value: Any) -> None:
+        if isinstance(value, str) and value:
+            by_lower.setdefault(value.lower(), value)
+
+    spotify = getattr(cli, "_spotify", None)
+    if spotify is not None:
+        cached = getattr(spotify, "playlists", None)
+        if isinstance(cached, dict):
+            for cached_name in cached:
+                _add(cached_name)
+    repos = getattr(cli, "_repos", None)
+    if repos is not None:
+        try:
+            for row in repos.conn.execute("SELECT name FROM playlists").fetchall():
+                _add(row["name"])
+            for mirrored in repos.spotify_playlists.list_all():
+                _add(mirrored.get("name"))
+        except Exception:
+            logger.debug("Could not collect playlist names for suggestions", exc_info=True)
+    return list(by_lower.values())
+
+
+def report_playlist_miss(cli: "PlaylistCLI", name: str) -> None:
+    """Render the not-found error + suggestions (the central miss path).
+
+    Keeps the historical `logger.error` signal (the TUI counts ERROR records
+    toward its honest "exited with errors" line; headless keeps its log line)
+    and adds the actionable red panel via ui.error.
+    """
+    logger.error(f"Playlist '{name}' not found")
+    error(
+        playlist_not_found_message(name, suggest_playlist_names(name, collect_playlist_names(cli)))
+    )
+
+
+def warn_if_unknown_playlist(cli: "PlaylistCLI", name: str) -> None:
+    """Non-blocking twin of ``report_playlist_miss`` for create-capable commands.
+
+    /update and /plan legitimately target brand-new names (update is the only
+    way a rotation playlist is born), so an unknown name must not fail — but a
+    near-miss of an EXISTING name is probably a typo about to create a junk
+    playlist. Warn with the suggestions and continue with the name as typed;
+    a genuinely new name (no close match) stays quiet.
+    """
+    candidates = collect_playlist_names(cli)
+    lowered = name.lower()
+    if any(candidate.lower() == lowered for candidate in candidates):
+        return
+    suggestions = suggest_playlist_names(name, candidates)
+    if suggestions:
+        warning(
+            f"'{name}' is a new playlist name — continuing with it as typed. "
+            f"Did you mean: {', '.join(suggestions)}?"
+        )
 
 
 def configure_logging(handler: Optional[logging.Handler] = None) -> None:
@@ -576,6 +690,11 @@ class PlaylistCLI:
             query: Optional theme query for building a playlist profile
         """
         try:
+            # Non-blocking near-miss check: /update on a brand-new name is the
+            # legitimate way to CREATE a rotation playlist, so a miss never
+            # refuses — but a close match to an existing name is probably a
+            # typo about to spawn a junk playlist, so say so first.
+            warn_if_unknown_playlist(self, playlist_name)
             rm = self._get_rotation_manager(playlist_name)
             score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
 
@@ -767,6 +886,9 @@ class PlaylistCLI:
         """View current playlist contents - only needs Spotify"""
         try:
             # Only initialize Spotify manager
+            if self.spotify.get_playlist_id(playlist_name) is None:
+                report_playlist_miss(self, playlist_name)
+                return
             tracks = self.spotify.get_playlist_tracks(playlist_name)
 
             section("Current Playlist", playlist_name)
@@ -2278,6 +2400,11 @@ class PlaylistCLI:
     def sync_playlist(self, playlist_name: str):
         """Sync a playlist with all songs in the database by adding new songs and removing songs no longer in the database"""
         try:
+            # Suggest-on-miss gate: without it a typo would sync the whole
+            # database into a brand-new misspelled playlist.
+            if self.spotify.get_playlist_id(playlist_name) is None:
+                report_playlist_miss(self, playlist_name)
+                return
             logger.info(f"Starting database sync with playlist '{playlist_name}'...")
 
             # Get all songs from database
@@ -2362,6 +2489,11 @@ class PlaylistCLI:
     def extract_playlist(self, playlist_name: str, output_file: str = None):
         """Extract playlist contents to a CSV file"""
         try:
+            # Distinguish "no such playlist" (miss + suggestions) from a
+            # playlist that exists but is empty (the message below).
+            if self.spotify.get_playlist_id(playlist_name) is None:
+                report_playlist_miss(self, playlist_name)
+                return False
             # Get tracks from playlist
             tracks = self.spotify.get_playlist_tracks(playlist_name)
 
@@ -3358,6 +3490,9 @@ class PlaylistCLI:
         """Rotate a playlist by removing tracks played since they were added."""
         section("Rotate (Played)", playlist_name)
         try:
+            if self.spotify.get_playlist_id(playlist_name) is None:
+                report_playlist_miss(self, playlist_name)
+                return
             tracks = self.spotify.get_playlist_tracks(playlist_name)
         except Exception as exc:
             warning(f"Failed to load playlist: {exc}")
@@ -4409,6 +4544,9 @@ class PlaylistCLI:
     ):
         """Preview future generations without updating Spotify."""
         try:
+            # Same non-blocking near-miss warning as /update: planning a
+            # not-yet-created playlist is legitimate (plan before create).
+            warn_if_unknown_playlist(self, playlist_name)
             rm = self._get_rotation_manager(playlist_name)
             score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
             plans = rm.simulate_generations(
@@ -4435,6 +4573,11 @@ class PlaylistCLI:
     ):
         """Show playlist changes before applying update."""
         try:
+            # The diff is against the LIVE playlist's current tracks; a miss
+            # would silently diff against nothing. Suggest instead.
+            if self.spotify.get_playlist_id(playlist_name) is None:
+                report_playlist_miss(self, playlist_name)
+                return
             rm = self._get_rotation_manager(playlist_name)
             logger.info(f"Selecting {song_count} songs for diff (fresh_days={fresh_days})...")
             score_config = PlaylistScoreConfig(strategy=score_strategy, query=query)
