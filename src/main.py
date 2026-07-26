@@ -89,6 +89,7 @@ from ui import (
     insight,
     json_output,
     key_value_table,
+    link_text,
     lollipop,
     notice,
     preview_table,
@@ -127,6 +128,27 @@ def format_count(value: float) -> str:
 
 # Display labels for the metric columns appended when a query requests metrics.
 _METRIC_LABELS = {"monthly_listeners": "Listeners", "similarity": "Sim"}
+
+
+def spotify_track_url(raw: Optional[str]) -> str:
+    """Offline: a stored ``tracks.spotify_id`` value -> an open.spotify.com URL.
+
+    Accepts the three shapes the column actually holds — a full http(s) URL,
+    a ``spotify:track:...`` URI, or a bare track id — and returns "" for
+    anything else (album/playlist URIs, empty values), so callers can feed
+    the result straight to ``link_text`` unguarded. Pure; never the network.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("http"):
+        return raw
+    if raw.startswith("spotify:track:"):
+        tail = raw.split(":")[-1]
+        return f"https://open.spotify.com/track/{tail}" if tail else ""
+    if ":" not in raw and "/" not in raw:
+        return f"https://open.spotify.com/track/{raw}"
+    return ""
 
 
 def _metric_label(name: str) -> str:
@@ -3671,7 +3693,12 @@ class PlaylistCLI:
                 removed_rows.append(
                     [
                         idx,
-                        track.get("name") or track_id,
+                        # Visible text unchanged; a Spotify identity adds an
+                        # OSC 8 hyperlink (terminals without it show the name).
+                        link_text(
+                            track.get("name") or track_id,
+                            spotify_track_url(track.get("spotify_id")),
+                        ),
                         artist_name or "",
                         added_at.isoformat() if added_at else "",
                         played_at.isoformat() if played_at else "",
@@ -3694,7 +3721,17 @@ class PlaylistCLI:
                     ]
                 )
             if added_rows:
-                table(["#", "Song", "Artist", "Spotify ID"], added_rows)
+                table(
+                    [
+                        ColumnSpec("#", justify="right", style="dim"),
+                        # The row carries its Spotify id in column 3 — the song
+                        # name links to it, visible text unchanged.
+                        ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
+                        "Artist",
+                        "Spotify ID",
+                    ],
+                    added_rows,
+                )
         else:
             warning("Failed to update playlist.")
 
@@ -3828,17 +3865,7 @@ class PlaylistCLI:
         except Exception as exc:
             logger.debug("spotify_url_for_track lookup failed for %s: %s", track_id, exc)
             return ""
-        raw = (record or {}).get("spotify_id") or ""
-        if not raw:
-            return ""
-        url = self._spotify_url_from_uri(raw)
-        if url == raw and not raw.startswith("http"):
-            # Bare Spotify track id (no scheme/URI prefix) — build the URL
-            # directly; anything else unrecognized is not a usable link.
-            if ":" not in raw and "/" not in raw:
-                return f"https://open.spotify.com/track/{raw}"
-            return ""
-        return url
+        return spotify_track_url((record or {}).get("spotify_id"))
 
     def _obscurity_mode(self) -> str:
         mode = (os.getenv("OBSCURITY_VALIDATION_MODE") or "strict").lower()
@@ -5198,7 +5225,14 @@ def _present_debug_last_search(payload: dict) -> None:
             track = candidate.get("track") or {}
             artist_label = track.get("artist_name") or track.get("artist_id") or ""
             label = f"{track.get('name', '')} — {artist_label}".strip(" —")
-            preview_rows.append([idx, label, candidate.get("track_id") or ""])
+            preview_rows.append(
+                [
+                    idx,
+                    # Visible label unchanged; a known Spotify id adds a hyperlink.
+                    link_text(label, spotify_track_url(track.get("spotify_id"))),
+                    candidate.get("track_id") or "",
+                ]
+            )
         subsection("Top Results (IDs)")
         table(["#", "Track", "Track ID"], preview_rows)
 

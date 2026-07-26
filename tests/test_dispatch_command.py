@@ -522,3 +522,44 @@ class TestNoisyLoggerSilencing:
                 logging.getLogger(name).setLevel(level)
             root.handlers = saved_root_handlers
             root.setLevel(saved_root_level)
+
+
+# ---- linked track tables ----
+class TestDebugTablesCarrySpotifyLinks:
+    """Track tables that carry Spotify ids render the track name as an OSC 8
+    hyperlink — visible text unchanged, rows without an id stay plain."""
+
+    def test_top_results_track_cell_links_known_spotify_id(self):
+        from rich.table import Table
+
+        import ui
+
+        payload = {
+            "run": {"run_id": "r1"},
+            "candidates": [
+                {
+                    "track_id": "a|||one",
+                    "track": {"name": "One", "artist_name": "A", "spotify_id": "spotify:track:abc"},
+                },
+                {
+                    "track_id": "b|||two",
+                    "track": {"name": "Two", "artist_name": "B", "spotify_id": None},
+                },
+            ],
+            "summary": {},
+        }
+        captured = []
+        ui.set_output_sink(captured.append)
+        try:
+            main_module._present_debug_last_search(payload)
+        finally:
+            ui.set_output_sink(None)
+        top_results = [r for r in captured if isinstance(r, Table)][-1]
+        linked_cell, plain_cell = list(top_results.columns[1].cells)
+        assert linked_cell.plain == "One — A"  # visible text is just the label
+        assert [
+            span.style.link for span in linked_cell.spans if getattr(span.style, "link", None)
+        ] == ["https://open.spotify.com/track/abc"]
+        # No Spotify identity -> no link span anywhere on the cell.
+        assert plain_cell.plain == "Two — B"
+        assert not [span for span in plain_cell.spans if getattr(span.style, "link", None)]
