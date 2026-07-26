@@ -17,12 +17,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult, SystemCommand
+from textual.binding import Binding
 from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.theme import Theme
 from textual.widgets import Input, RichLog, Static
+from textual.worker import Worker
 
 from arg_parse import HelpText, parse_tokens, setup_parsers, unknown_command_message
 from completions import TunrSuggester
@@ -255,8 +257,14 @@ class UILogHandler(logging.Handler):
                 # thread in _execute_command AFTER dispatch returns. The
                 # one-command-at-a-time `status` gate means those never
                 # overlap, and the int increment itself is GIL-atomic — no
-                # lock needed.
-                self.app._command_error_count += 1
+                # lock needed. Esc-to-cancel addendum: a cancelled run's
+                # thread may log ERRORs after a NEW command started; its
+                # thread-bound generation is stale, so the increment is
+                # skipped and the new command's error window stays clean
+                # (its scrollback line is dropped by the same generation
+                # guard inside _dispatch_ui).
+                if not self.app._calling_thread_is_stale():
+                    self.app._command_error_count += 1
             elif record.levelno >= logging.WARNING:
                 style = "yellow"
             elif record.levelno >= logging.INFO:
@@ -312,6 +320,12 @@ class PlaylistInteractiveApp(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_log", "Clear output"),
+        # Esc cancels the running command (a no-op when idle). The app
+        # composes no Footer, so show=False just records intent. Pushed
+        # screens are unaffected: the command palette, /dash and /results all
+        # bind Escape on their own screen, and the active screen's bindings
+        # are found before this app-level one (pinned by the Esc pilot test).
+        Binding("escape", "cancel_command", "Cancel command", show=False),
     ]
 
     # ctrl+p command palette: the stock providers plus the tunr command
@@ -322,6 +336,13 @@ class PlaylistInteractiveApp(App):
     # verbatim, and the chrome follows TE's lowercase convention.
     status = reactive("idle")
     SPINNER_FRAMES = ["|", "/", "-", "\\"]
+
+    # Statuses from which NEW user work may start. "cancelled" counts: the
+    # cancelled run's thread may still be unwinding (thread workers cannot be
+    # force-stopped), but its generation is stale so it can no longer touch
+    # the UI — the input gate must reopen immediately. Background auto-sync
+    # deliberately keeps waiting for TRUE "idle" (see _maybe_auto_sync).
+    IDLE_STATUSES = frozenset({"idle", "cancelled"})
 
     def __init__(self, cli: PlaylistCLI, parser: argparse.ArgumentParser) -> None:
         super().__init__()
@@ -352,6 +373,21 @@ class PlaylistInteractiveApp(App):
         # rendered live in the top bar while a command runs.
         self._stage: str = ""
         self._app_thread_id: Optional[int] = None
+        # Esc-to-cancel plumbing. `_run_generation` is bumped on the app
+        # thread at every user-work start AND at every cancel; each worker
+        # thread captures the value at start (thread-local `_worker_gen`) and
+        # every UI callback it marshals is re-checked on the app-thread side
+        # (_run_if_current) — a stale (cancelled) worker can therefore never
+        # write late output into the scrollback or flip status.
+        self._run_generation = 0
+        self._worker_gen = threading.local()
+        # The single in-flight user-work worker (commands, /expand, applying
+        # search results) — the target of Esc. Auto-sync never sets it.
+        self._active_worker: Optional[Worker] = None
+        # User-work threads still unwinding (a cancelled one keeps running
+        # until its current step completes). True idle is restored only when
+        # this reaches zero — see _worker_thread_exited.
+        self._inflight_workers = 0
         # Background listen-sync: warn once, then stay quiet on repeat failures.
         self._auto_sync_warned = False
         # Log the "no cached token" skip once per session, not every interval.
@@ -423,6 +459,16 @@ class PlaylistInteractiveApp(App):
         self._update_input_placeholder()
 
     def _emit_preview(self, renderable) -> None:
+        """ui.set_preview_sink handler: marshal to the app thread, guarded.
+
+        Routed through _dispatch_ui like the output sink, so a preview
+        emitted by a worker thread lands on the app thread — and a stale
+        (cancelled) worker's late preview is dropped instead of resurrecting
+        the pane the cancel action just cleared.
+        """
+        self._dispatch_ui(self._apply_preview, renderable)
+
+    def _apply_preview(self, renderable) -> None:
         if not self._mounted:
             return
         preview = self.query_one("#search_preview", Static)
@@ -435,8 +481,9 @@ class PlaylistInteractiveApp(App):
 
     def watch_status(self, value: str) -> None:
         # Busy means "any non-idle work", not just statuses that happen to
-        # start with "running" (e.g. "applying search results").
-        busy = value not in {"idle", "setup required"} and not self._setup_mode
+        # start with "running" (e.g. "applying search results"). "cancelled"
+        # is a rest state: nothing the user is waiting on, so no spinner.
+        busy = value not in {"idle", "setup required", "cancelled"} and not self._setup_mode
         if busy:
             self._start_spinner()
         else:
@@ -512,11 +559,52 @@ class PlaylistInteractiveApp(App):
         ``call_from_thread`` raises RuntimeError when invoked *from* the app
         thread (Textual 8.x), so UI-thread callers (e.g. /debug handlers that
         emit through the ui sinks) must call directly instead.
+
+        Stale-worker guard: a call originating from a user-work thread
+        carries the run generation that thread captured at start
+        (_run_user_work binds it thread-locally); _run_if_current re-checks
+        it on the app-thread side, so everything a cancelled run emits after
+        Esc — scrollback lines, log records, stage/preview updates, its own
+        _post_command — is dropped instead of rendered late. Callers with no
+        bound generation (the app thread, auto-sync) are never guarded.
         """
+        gen = getattr(self._worker_gen, "gen", None)
+        if gen is None:
+            self._dispatch_ui_unguarded(fn, *args)
+        else:
+            self._dispatch_ui_unguarded(self._run_if_current, gen, fn, *args)
+
+    def _dispatch_ui_unguarded(self, fn: Callable, *args: object) -> None:
+        """The raw thread-marshalling half of _dispatch_ui (no staleness check)."""
         if self._app_thread_id is None or threading.get_ident() == self._app_thread_id:
             fn(*args)
         else:
             self.call_from_thread(fn, *args)
+
+    def _run_if_current(self, gen: int, fn: Callable, *args: object) -> None:
+        """App-thread side of the stale-worker guard.
+
+        Runs `fn` only when the emitting worker's generation is still the
+        current one. Generation bumps happen exclusively on the app thread
+        (start + cancel), and this check runs on the app thread too, so
+        there is no window in which a cancelled worker's callback can slip
+        through after action_cancel_command has returned.
+        """
+        if gen != self._run_generation:
+            return
+        fn(*args)
+
+    def _calling_thread_is_stale(self) -> bool:
+        """True when the calling thread belongs to a cancelled (stale) run.
+
+        Worker-thread-side convenience for non-UI effects (toasts, the error
+        counter). The read of `_run_generation` is GIL-atomic; the tiny race
+        against a concurrent cancel is harmless for these best-effort
+        consumers — everything UI-visible goes through _run_if_current, which
+        is race-free.
+        """
+        gen = getattr(self._worker_gen, "gen", None)
+        return gen is not None and gen != self._run_generation
 
     def _emit_renderable(self, renderable) -> None:
         self._dispatch_ui(self.append_log, renderable)
@@ -715,17 +803,102 @@ class PlaylistInteractiveApp(App):
         self._run_command(command, args)
 
     def _run_command(self, command: str, args: object) -> None:
-        if self.status != "idle":
+        if not self._is_idle():
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
-        # Fresh error window + stage for this command. App-thread writes; the
-        # handler's worker-thread increments cannot overlap because the worker
-        # has not started yet and the `status` gate above serializes commands.
+        # Fresh error window + stage for this command. App-thread writes; a
+        # cancelled predecessor's worker thread may still be unwinding, but
+        # its increments are skipped by the staleness check in
+        # UILogHandler.emit, so the new window starts clean.
         self._command_error_count = 0
         self._stage = ""
         self._run_started = time.monotonic()
-        self.status = f"running /{command}"
-        self.run_worker(lambda: self._execute_command(command, args), thread=True)
+        self._start_user_worker(f"running /{command}", lambda: self._execute_command(command, args))
+
+    def _is_idle(self) -> bool:
+        """True when new user work may start (see IDLE_STATUSES)."""
+        return self.status in self.IDLE_STATUSES
+
+    def _start_user_worker(self, status: str, work: Callable[[], None]) -> None:
+        """Start THE user-work thread worker (single, Esc-cancellable).
+
+        All three launch sites (_run_command, _expand_search,
+        _apply_search_results) funnel through here so every user-visible run
+        gets the same cancellation contract: a fresh generation, the
+        in-flight counter, and the _active_worker handle Esc targets.
+        """
+        self._run_generation += 1
+        gen = self._run_generation
+        self._inflight_workers += 1
+        self.status = status
+        self._active_worker = self.run_worker(lambda: self._run_user_work(gen, work), thread=True)
+
+    def _run_user_work(self, gen: int, work: Callable[[], None]) -> None:
+        """Thread-side wrapper for every user-work worker.
+
+        Binds the run generation to this thread (read back by _dispatch_ui
+        and _calling_thread_is_stale), clears it on the way out — executor
+        threads are pooled and reused — and always delivers the unguarded
+        exit notification so the in-flight count stays truthful.
+        """
+        self._worker_gen.gen = gen
+        try:
+            work()
+        finally:
+            self._worker_gen.gen = None
+            self._dispatch_ui_unguarded(self._worker_thread_exited, gen)
+
+    def _worker_thread_exited(self, gen: int) -> None:
+        """App-thread bookkeeping for a user-work thread that fully unwound.
+
+        Deliberately UNGUARDED: this is the one callback a stale (cancelled)
+        worker may still deliver, and it only maintains counters — it never
+        writes output. When the last in-flight thread exits while the status
+        is still "cancelled", true idle is restored quietly (re-arming
+        background auto-sync, which waits for genuine idleness).
+        """
+        self._inflight_workers = max(0, self._inflight_workers - 1)
+        if gen == self._run_generation:
+            self._active_worker = None
+        if self._inflight_workers == 0 and self.status == "cancelled":
+            self._set_idle()
+
+    def action_cancel_command(self) -> None:
+        """Esc: cancel the running user command; a no-op when idle.
+
+        Thread workers cannot be force-killed, so cancellation is
+        cooperative: cancel() flags the worker (any handler polling
+        get_current_worker().is_cancelled can stop early) and the generation
+        bump makes every UI callback the old run marshals stale — dropped by
+        _run_if_current — so late output can never reach the scrollback and
+        the finished/failed lines, toasts and status flips of the cancelled
+        run are all suppressed. The thread itself may still finish its
+        current step (e.g. a network call) in the background;
+        _worker_thread_exited restores true idle once it unwinds.
+        """
+        worker = self._active_worker
+        if worker is None:
+            return  # idle (pushed screens own their Esc before this binding)
+        label = self.status
+        if label.startswith("running "):
+            label = label[len("running ") :]
+        self._active_worker = None
+        self._run_generation += 1  # everything the old run marshals is now stale
+        worker.cancel()
+        if not getattr(self.cli, "last_search_preview_persist", False):
+            clear_preview()
+        self._run_started = None
+        self._stage = ""
+        self._last_run_note = f"last: {label} cancelled"
+        self.status = "cancelled"
+        self.append_log(
+            Text(
+                f"Cancelled {label}. The worker thread can't be force-stopped, so a "
+                "step already in flight (e.g. a network call) may finish in the "
+                "background; its output is discarded.",
+                style="yellow",
+            )
+        )
 
     def _execute_command(self, command: str, args: object) -> None:
         failed = False
@@ -733,7 +906,7 @@ class PlaylistInteractiveApp(App):
             rc = dispatch_command(self.cli, command, args)
             if rc != 0:
                 failed = True
-                self.call_from_thread(
+                self._dispatch_ui(
                     self.append_log,
                     Text(
                         f"/{command} exited with errors — run /debug errors for details.",
@@ -749,7 +922,7 @@ class PlaylistInteractiveApp(App):
                 failed = True
                 count = self._command_error_count
                 noun = "error" if count == 1 else "errors"
-                self.call_from_thread(
+                self._dispatch_ui(
                     self.append_log,
                     Text(
                         f"/{command} exited with errors ({count} {noun} logged) "
@@ -760,7 +933,7 @@ class PlaylistInteractiveApp(App):
         except Exception as exc:
             failed = True
             logger.exception("Command failed: /%s", command)
-            self.call_from_thread(
+            self._dispatch_ui(
                 self.append_log,
                 Panel(
                     Text(f"Command /{command} failed: {exc}", style="red"),
@@ -769,11 +942,16 @@ class PlaylistInteractiveApp(App):
                 ),
             )
         finally:
+            # Both are stale-guarded: a cancelled run's completion lines,
+            # toast and _post_command (status flip + "finished" line) are
+            # all suppressed — the cancel line already told the truth.
             self._notify_command_result(command, failed)
-            self.call_from_thread(self._post_command, command, failed)
+            self._dispatch_ui(self._post_command, command, failed)
 
     def _notify_command_result(self, command: str, failed: bool) -> None:
         """Emit at most one toast per command: error on failure, info when slow."""
+        if self._calling_thread_is_stale():
+            return  # cancelled run: no late toast
         elapsed = 0.0
         if self._run_started is not None:
             elapsed = time.monotonic() - self._run_started
@@ -851,6 +1029,11 @@ class PlaylistInteractiveApp(App):
         contract documented in storage/db.py. Together these guarantee user
         work and the auto-sync never overlap on the single shared connection.
         """
+        # Strict "idle" on purpose (NOT _is_idle): after an Esc-cancel the
+        # status reads "cancelled" while the cancelled worker's thread may
+        # still be unwinding on the shared sqlite connection. Background work
+        # can afford to wait for genuine idleness (_worker_thread_exited
+        # restores it), so it never risks overlapping that tail.
         if self._setup_mode or self.status != "idle":
             return
         if len(self.screen_stack) > 1:
@@ -1629,7 +1812,7 @@ class PlaylistInteractiveApp(App):
         full result set) and the /results browser's dismiss callback (an
         explicit row-level subset).
         """
-        if self.status != "idle":
+        if not self._is_idle():
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         if track_ids is None:
@@ -1648,11 +1831,10 @@ class PlaylistInteractiveApp(App):
                         return
                     self.cli.add_search_to_playlist(playlist_name, track_ids)
             finally:
-                self.call_from_thread(self._set_idle)
+                self._dispatch_ui(self._set_idle)
 
         self._run_started = time.monotonic()
-        self.status = "applying search results"
-        self.run_worker(_worker, thread=True)
+        self._start_user_worker("applying search results", _worker)
         self._clear_pending()
 
     def _open_dashboard(self) -> None:
@@ -1662,7 +1844,7 @@ class PlaylistInteractiveApp(App):
         queries the shared sqlite connection synchronously on the app thread,
         so it must not open while a worker (command or auto-sync) is mid-write.
         """
-        if self.status != "idle":
+        if not self._is_idle():
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
 
@@ -1686,7 +1868,7 @@ class PlaylistInteractiveApp(App):
         contract holds for the screen's whole lifetime. Writes happen only
         AFTER dismissal, via the existing _apply_search_results worker.
         """
-        if self.status != "idle":
+        if not self._is_idle():
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         if not results_for_browse(self.cli):
@@ -1718,19 +1900,18 @@ class PlaylistInteractiveApp(App):
                 Text("No previous search to expand. Run /search <criteria> first.", style="yellow")
             )
             return
-        if self.status != "idle":
+        if not self._is_idle():
             self.append_log(Text("Another command is already running.", style="yellow"))
             return
         self.append_log(Text(f"Expanding search: {self.cli.last_search_query}", style="bold"))
         self._run_started = time.monotonic()
-        self.status = "running /expand"
-        self.run_worker(lambda: self._execute_expand(), thread=True)
+        self._start_user_worker("running /expand", self._execute_expand)
 
     def _execute_expand(self) -> None:
         try:
             self.cli.search_songs(self.cli.last_search_query, expanded=True)
         finally:
-            self.call_from_thread(self._set_idle)
+            self._dispatch_ui(self._set_idle)
 
     def _clear_pending(self) -> None:
         self._pending_action = None
