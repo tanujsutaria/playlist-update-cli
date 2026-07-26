@@ -102,6 +102,14 @@ SPOTIFY_SCOPES = [
     "user-top-read",
 ]
 
+# The env keys Spotify auth requires. The interactive setup gate and /status
+# check these NAMES only — the values are never displayed anywhere.
+SPOTIFY_ENV_KEYS = (
+    "SPOTIFY_CLIENT_ID",
+    "SPOTIFY_CLIENT_SECRET",
+    "SPOTIFY_REDIRECT_URI",
+)
+
 SCOPE_REAUTH_HINT = (
     "Spotify denied this request for a missing permission (scope). The app's "
     "requested scopes changed since you last authorized, so your cached token is "
@@ -229,6 +237,31 @@ def get_cached_token_info() -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error reading cached token: {e}")
         return None
+
+
+def cached_token_summary() -> Optional[Dict[str, Any]]:
+    """Offline, metadata-only view of the cached Spotify token file.
+
+    Unlike :func:`get_cached_token_info` (which goes through spotipy's
+    validate path and silently REFRESHES an expired token over the network),
+    this reads the cache file only — it can never make a network call.
+    Only non-secret metadata leaves this function (expiry + scope + whether
+    a refresh token exists); the token strings themselves are never returned
+    and must never be printed. Returns ``None`` when no token is cached (or
+    the file is unreadable).
+    """
+    try:
+        token_info = _get_cache_handler().get_cached_token()
+    except Exception:
+        logger.debug("Could not read the cached token file.", exc_info=True)
+        return None
+    if not token_info:
+        return None
+    return {
+        "expires_at": token_info.get("expires_at"),
+        "scope": token_info.get("scope"),
+        "has_refresh_token": bool(token_info.get("refresh_token")),
+    }
 
 
 def refresh_cached_token() -> Optional[Dict[str, Any]]:
