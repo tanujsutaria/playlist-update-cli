@@ -139,8 +139,10 @@ class TestMaybeAutoSync:
         app._maybe_auto_sync()
         app.cli.sync_listen_history.assert_not_called()
 
-    def test_user_commands_blocked_while_auto_sync_holds_gate(self, monkeypatch):
-        """_run_command refuses while auto-sync is mid-flight (same status gate)."""
+    def test_user_commands_queue_while_auto_sync_holds_gate(self, monkeypatch):
+        """_run_command must not START work while auto-sync is mid-flight
+        (same status gate); the submission waits in the single-slot queue
+        and dequeues when auto-sync releases the gate."""
         app = _make_app(monkeypatch)
         dispatched = []
         app.run_worker = lambda work, *a, **k: dispatched.append(work)  # don't run
@@ -149,9 +151,16 @@ class TestMaybeAutoSync:
         assert app.status == "auto-sync"
 
         app._run_command("stats", object())
-        # Refused: no second worker dispatched, and the refusal line was logged.
+        # Held, not started: no second worker dispatched; the queue line logged.
         assert len(dispatched) == 1
-        assert any("already running" in str(entry) for entry in app.logged)
+        assert app._queued_command is not None
+        assert any("Queued /stats" in str(entry) for entry in app.logged)
+
+        # Auto-sync teardown restores idle and drains the queue.
+        app._finish_auto_sync()
+        assert app._queued_command is None
+        assert app.status == "running /stats"
+        assert len(dispatched) == 2
 
     def test_finish_does_not_clobber_other_status(self, monkeypatch):
         app = _make_app(monkeypatch)

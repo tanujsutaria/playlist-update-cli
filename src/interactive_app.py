@@ -41,6 +41,7 @@ from ui import (
     ACCENT_BLUE,
     SUBSECTION_STYLE,
     clear_preview,
+    error_panel,
     info,
     json_output,
     key_value_table,
@@ -506,6 +507,10 @@ class PlaylistInteractiveApp(App):
         # until its current step completes). True idle is restored only when
         # this reaches zero — see _worker_thread_exited.
         self._inflight_workers = 0
+        # Single-slot command queue: ONE command submitted while work is in
+        # flight waits here and starts only at TRUE idle (_maybe_dequeue).
+        # A second submission while the slot is full is refused outright.
+        self._queued_command: "Optional[Tuple[str, object]]" = None
         # Background listen-sync: warn once, then stay quiet on repeat failures.
         self._auto_sync_warned = False
         # Log the "no cached token" skip once per session, not every interval.
@@ -887,20 +892,14 @@ class PlaylistInteractiveApp(App):
         try:
             tokens = shlex.split(text)
         except ValueError as exc:
-            self.append_log(
-                Panel(
-                    Text(f"Invalid command syntax: {exc}", style="red"),
-                    title="Error",
-                    border_style="red",
-                )
-            )
+            self.append_log(error_panel(f"Invalid command syntax: {exc}"))
             return
         command, args, error = parse_tokens(tokens, extra_commands=self._meta_command_names())
         if error:
             if isinstance(error, HelpText):
                 self.append_log(Panel(Text(str(error)), title="Help", border_style=ACCENT_BLUE))
             else:
-                self.append_log(Panel(Text(error, style="red"), title="Error", border_style="red"))
+                self.append_log(error_panel(error))
             return
         if command == "interactive":
             self.append_log(Text("Already in interactive mode.", style="yellow"))
@@ -908,20 +907,53 @@ class PlaylistInteractiveApp(App):
         if self._setup_mode and command not in COMMANDS_ALLOWED_WITHOUT_SPOTIFY:
             missing = ", ".join(self._missing_spotify_keys)
             self.append_log(
-                Panel(
-                    Text(
-                        f"Spotify keys missing: {missing}\nRun /setup for instructions.",
-                        style="red",
-                    ),
+                error_panel(
+                    f"Spotify keys missing: {missing}\nRun /setup for instructions.",
                     title="Setup Required",
-                    border_style="red",
                 )
             )
             return
+        if command in ("search", "find") and not self._search_providers_available():
+            return
         self._run_command(command, args)
 
+    def _search_providers_available(self) -> bool:
+        """Pre-flight gate for /search and /find: fail fast when no deep-search
+        provider is configured, instead of failing minutes into the pipeline.
+
+        Uses the SAME detection the pipeline itself uses
+        (web_search.detect_search_commands — run_deep_search raises
+        ProviderConfigError off the identical check, and /status and /env
+        report from it too), so this gate can never disagree with the run.
+        TUI-only seam: the headless path (main.dispatch_command) is unchanged.
+        """
+        if detect_search_commands():
+            return True
+        self.append_log(
+            error_panel(
+                "No deep-search provider configured — /search and /find need one.\n"
+                "Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY (or a WEB_SEARCH_CLAUDE_CMD / "
+                "WEB_SEARCH_CODEX_CMD / WEB_SEARCH_CMD override) in config/.env, then "
+                "restart tunr. /env shows what is detected.",
+                title="Search needs a provider",
+            )
+        )
+        return False
+
     def _run_command(self, command: str, args: object) -> None:
-        if self._refuse_if_busy():
+        if not self._is_idle():
+            # Work in flight (a running/unwinding user worker or auto-sync):
+            # hold the submission in the one-deep queue instead of refusing.
+            # Any OTHER non-idle state (e.g. the "setup required" rest state)
+            # keeps the flat refusal — a queue there would never drain.
+            if (
+                self._inflight_workers > 0
+                or self._active_worker is not None
+                or self.status == "auto-sync"
+            ):
+                self._enqueue_command(command, args)
+            else:
+                self._refuse_if_busy()
             return
         question = self._destructive_question(command, args)
         if question is None:
@@ -1049,6 +1081,59 @@ class PlaylistInteractiveApp(App):
             self.append_log(Text("Another command is already running.", style="yellow"))
         return True
 
+    def _enqueue_command(self, command: str, args: object) -> None:
+        """Hold ONE submitted command until true idle (the single-slot queue).
+
+        The slot is advisory state only: nothing here starts work, so every
+        serialization invariant (_is_idle, the unwind gate, the generation
+        guard) is untouched. Destructive commands are deliberately NOT
+        confirmed here — their ConfirmScreen fires at dequeue time
+        (_maybe_dequeue -> _run_command), when they are actually about to
+        start, so the user confirms against the real moment of execution.
+        A second submission while the slot is full is refused in the same
+        honest style as the old always-refuse gate.
+        """
+        if self._queued_command is not None:
+            queued_name = self._queued_command[0]
+            self.append_log(
+                Text(
+                    f"Another command is already running and /{queued_name} is queued — "
+                    "the queue holds one command. Wait, or press Esc to cancel both.",
+                    style="yellow",
+                )
+            )
+            return
+        self._queued_command = (command, args)
+        self._update_top_bar()
+        self.append_log(
+            Text(
+                f"Queued /{command} — it starts when the current work finishes. "
+                "Esc cancels the running command and drops the queue.",
+                style="yellow",
+            )
+        )
+
+    def _maybe_dequeue(self) -> None:
+        """Start the queued command iff TRUE idle has been restored.
+
+        Called from the two places idleness is genuinely restored: the
+        user-work thread's exit notification (_worker_thread_exited) and
+        auto-sync teardown (_finish_auto_sync). The _is_idle() check is the
+        SAME gate _run_command enforces, so while an Esc-cancelled worker is
+        still unwinding (status "cancelled", in-flight > 0) nothing dequeues
+        — the queued command would otherwise overlap the stale thread on the
+        shared serialized-use sqlite connection. Dequeueing re-enters
+        _run_command, so a destructive queued command gets its ConfirmScreen
+        now — at start time, not at enqueue time.
+        """
+        if self._queued_command is None or not self._is_idle():
+            return
+        command, args = self._queued_command
+        self._queued_command = None
+        self._update_top_bar()
+        self.append_log(Text(f"Starting queued /{command}.", style="dim"))
+        self._run_command(command, args)
+
     def _start_user_worker(self, status: str, work: Callable[[], None]) -> None:
         """Start THE user-work thread worker (single, Esc-cancellable).
 
@@ -1082,19 +1167,25 @@ class PlaylistInteractiveApp(App):
         """App-thread bookkeeping for a user-work thread that fully unwound.
 
         Deliberately UNGUARDED: this is the one callback a stale (cancelled)
-        worker may still deliver, and it only maintains counters — it never
-        writes output. When the last in-flight thread exits while the status
-        is still "cancelled", true idle is restored quietly (re-arming
-        background auto-sync, which waits for genuine idleness).
+        worker may still deliver, and it only maintains counters and the
+        queue — it never writes output on the OLD run's behalf. When the
+        last in-flight thread exits while the status is still "cancelled",
+        true idle is restored quietly (re-arming background auto-sync, which
+        waits for genuine idleness). Restoring true idle is also the moment
+        the single-slot queue may drain: _maybe_dequeue re-checks _is_idle,
+        so a stale exit that does NOT restore idle (another worker still in
+        flight, or a new command already running) dequeues nothing.
         """
         self._inflight_workers = max(0, self._inflight_workers - 1)
         if gen == self._run_generation:
             self._active_worker = None
         if self._inflight_workers == 0 and self.status == "cancelled":
             self._set_idle()
+        self._maybe_dequeue()
 
     def action_cancel_command(self) -> None:
-        """Esc: cancel the running user command; a no-op when idle.
+        """Esc: cancel the running user command AND drop the queued one;
+        a no-op when idle with an empty queue.
 
         Thread workers cannot be force-killed, so cancellation is
         cooperative: cancel() flags the worker (any handler polling
@@ -1108,7 +1199,18 @@ class PlaylistInteractiveApp(App):
         """
         worker = self._active_worker
         if worker is None:
+            # No live user worker to cancel. A command queued behind
+            # BACKGROUND work (auto-sync, or a cancelled worker still
+            # unwinding) can still be discarded here; with an empty queue
+            # this stays the strict no-op it always was.
+            if self._queued_command is not None:
+                dropped_name = self._queued_command[0]
+                self._queued_command = None
+                self._update_top_bar()
+                self.append_log(Text(f"Dropped queued /{dropped_name}.", style="yellow"))
             return  # idle (pushed screens own their Esc before this binding)
+        dropped = self._queued_command[0] if self._queued_command is not None else None
+        self._queued_command = None  # Esc clears the queue along with the run
         label = self.status
         if label.startswith("running "):
             label = label[len("running ") :]
@@ -1130,6 +1232,10 @@ class PlaylistInteractiveApp(App):
                 style="yellow",
             )
         )
+        if dropped is not None:
+            # Say BOTH: the cancel line above covers the running command; this
+            # one covers the queued command that will now never start.
+            self.append_log(Text(f"Dropped queued /{dropped} as well.", style="yellow"))
 
     def _execute_command(self, command: str, args: object) -> None:
         failed = False
@@ -1166,11 +1272,7 @@ class PlaylistInteractiveApp(App):
             logger.exception("Command failed: /%s", command)
             self._dispatch_ui(
                 self.append_log,
-                Panel(
-                    Text(f"Command /{command} failed: {exc}", style="red"),
-                    title="Error",
-                    border_style="red",
-                ),
+                error_panel(f"Command /{command} failed: {exc}"),
             )
         finally:
             # Both are stale-guarded: a cancelled run's completion lines,
@@ -1267,6 +1369,11 @@ class PlaylistInteractiveApp(App):
         # restores it), so it never risks overlapping that tail.
         if self._setup_mode or self.status != "idle":
             return
+        if self._queued_command is not None:
+            # Defence-in-depth: a queued user command owns the next idle slot
+            # (dequeue is synchronous with idle restoration, so this state
+            # should be unobservable — never bet the gate on "should").
+            return
         if len(self.screen_stack) > 1:
             return  # a modal screen (/dash) is reading the shared connection
         if self._auto_sync_scope_blocked:
@@ -1326,6 +1433,10 @@ class PlaylistInteractiveApp(App):
         # Release the gate only if auto-sync still holds it.
         if self.status == "auto-sync":
             self.status = "idle"
+        # A command submitted while auto-sync held the gate waits in the
+        # single-slot queue; auto-sync teardown is an idle-restoration point,
+        # so drain it here (same _is_idle re-check as everywhere else).
+        self._maybe_dequeue()
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -1545,7 +1656,7 @@ class PlaylistInteractiveApp(App):
         candidates = [cmd for cmd, _ in self._command_summaries()]
         candidates.extend(self._meta_command_names())
         message = unknown_command_message(name, candidates)
-        self.append_log(Panel(Text(message, style="red"), title="Error", border_style="red"))
+        self.append_log(error_panel(message))
 
     def _update_top_bar(self) -> None:
         if not self._mounted:
@@ -1577,6 +1688,10 @@ class PlaylistInteractiveApp(App):
         if self._stage and self.status != "idle":
             # Live stage readout, e.g. "running /search · extract 87/120".
             status_label = f"{status_label} · {self._stage}"
+        if self._queued_command is not None and self.status != "idle":
+            # The single-slot queue is visible for its whole lifetime,
+            # e.g. "running /search · queued: /stats".
+            status_label = f"{status_label} · queued: /{self._queued_command[0]}"
         if self._spinner_timer is not None:
             status_label = f"{self.SPINNER_FRAMES[self._spinner_index]} {status_label}"
         if self.status != "idle" and self._run_started is not None:
@@ -1646,13 +1761,7 @@ class PlaylistInteractiveApp(App):
         try:
             tokens = shlex.split(raw)
         except ValueError as exc:
-            self.append_log(
-                Panel(
-                    Text(f"Invalid debug command: {exc}", style="red"),
-                    title="Error",
-                    border_style="red",
-                )
-            )
+            self.append_log(error_panel(f"Invalid debug command: {exc}"))
             return
         if not tokens:
             return

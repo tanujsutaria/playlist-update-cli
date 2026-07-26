@@ -364,6 +364,9 @@ class TestArgparseCommandRouting:
         assert "list-backups" in app.commands
 
     def test_search_dispatched(self, monkeypatch):
+        # Pin the provider pre-flight open: this test is about ROUTING, and
+        # must not depend on API keys present in the developer/CI env.
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"claude": "cmd"})
         app = _make_app(monkeypatch)
         app._handle_command("/search indie rock")
         assert "search" in app.commands
@@ -494,6 +497,9 @@ class TestSetupModeGating:
         assert "stats" in app.commands
 
     def test_setup_mode_allows_search(self, monkeypatch):
+        # Providers pinned on: the subject here is the setup-mode gate, not
+        # the provider pre-flight (covered by TestSearchProviderPreflight).
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"claude": "cmd"})
         app = _make_app(monkeypatch, with_spotify=False)
         app._handle_command("/search jazz")
         assert "search" in app.commands
@@ -1983,7 +1989,7 @@ class TestEscCancelUnit:
         assert "Cancelled /search" in text
         assert "background" in text  # honest thread-worker caveat
 
-    def test_gate_blocks_while_cancelled_thread_unwinds_then_reopens(self, monkeypatch):
+    def test_gate_blocks_while_cancelled_thread_unwinds_then_queues(self, monkeypatch):
         class GateApp(DummyApp):
             _run_command = PlaylistInteractiveApp._run_command
 
@@ -1996,21 +2002,28 @@ class TestEscCancelUnit:
         # Esc-cancelled run whose thread is still unwinding: new work must
         # NOT start — it would overlap the stale thread on the shared
         # serialized-use sqlite connection (and possibly the same playlist).
+        # It is HELD in the single-slot queue instead of refused.
         app.status = "cancelled"
         app._inflight_workers = 1
         app._run_generation = 3  # the cancelled run held a stale generation
         app._run_command("stats", object())
-        assert app.status == "cancelled"  # gate stays closed
-        assert "Waiting for the cancelled command" in _logged_text(app)
+        assert app.status == "cancelled"  # gate stays closed — nothing started
+        assert app._queued_command is not None
+        assert "Queued /stats" in _logged_text(app)
 
-        # The stale thread unwinds: true idle is restored, the gate reopens.
+        # The stale thread unwinds: true idle is restored and the queued
+        # command starts THROUGH the same gate (dequeue-at-true-idle).
         app._worker_thread_exited(2)
-        assert app.status == "idle"
-        app._run_command("stats", object())
         assert app.status == "running /stats"
+        assert app._queued_command is None
+        assert "Starting queued /stats" in _logged_text(app)
 
-        app._run_command("stats", object())  # …running still blocks
-        assert "Another command is already running" in _logged_text(app)
+        # …running: the next submission takes the (now empty) queue slot,
+        # and a second one is refused while the slot is full.
+        app._run_command("stats", object())
+        assert app._queued_command is not None
+        app._run_command("stats", object())
+        assert "/stats is queued" in _logged_text(app)
 
     def test_is_idle_requires_zero_inflight_threads(self, monkeypatch):
         app = self._app(monkeypatch)
@@ -2269,41 +2282,39 @@ class TestEscCancelPilot:
                 assert "Cancelled /stats" in _scrollback(app)
 
                 # The gate stays CLOSED while the cancelled thread unwinds:
-                # a second /stats must not start a worker that would share
+                # a second /stats must not START a worker that would share
                 # the serialized-use sqlite connection with the stale thread.
+                # It is held in the single-slot queue instead.
                 app._submit_text("/stats")
                 await pilot.pause()
                 assert calls == ["stats"]  # nothing new dispatched
                 assert app.status == "cancelled"
-                assert "Waiting for the cancelled command" in _scrollback(app)
+                assert app._queued_command is not None
+                assert "Queued /stats" in _scrollback(app)
 
                 # Release the cancelled worker: its late output and completion
-                # must be suppressed, and true idle must survive its exit.
+                # must be suppressed, and once true idle is restored the
+                # queued /stats starts on its own — never a moment earlier.
                 gate.set()
                 for _ in range(500):
                     if finished.is_set():
                         break
                     await pilot.pause(0.01)
                 assert finished.is_set()
-                for _ in range(500):  # drain the stale worker's exit callback
-                    if app.status == "idle" and app._inflight_workers == 0:
+                for _ in range(500):  # drain: stale exit -> true idle -> dequeue
+                    if len(calls) == 2 and app.status == "idle" and app._inflight_workers == 0:
                         break
                     await pilot.pause(0.01)
                 text = _scrollback(app)
                 assert "stale output after cancel" not in text
-                assert "finished in" not in text  # cancelled run stays silent
+                assert calls == ["stats", "stats"]  # the queued run, nothing else
+                assert app._queued_command is None
+                assert "Starting queued /stats" in text
                 assert app.status == "idle"
                 assert app._inflight_workers == 0
-
-                # Gate reopened at true idle: the second /stats now runs.
-                app._submit_text("/stats")
-                for _ in range(500):
-                    if len(calls) == 2 and app.status == "idle":
-                        break
-                    await pilot.pause(0.01)
-                assert calls == ["stats", "stats"]
-                assert app.status == "idle"
-                assert _scrollback(app).count("finished in") == 1  # 2nd run only
+                # Exactly one completion line: the cancelled run stays silent,
+                # the dequeued run reports normally.
+                assert text.count("finished in") == 1
 
         root = _logging.getLogger()
         saved_handlers = root.handlers[:]
@@ -2578,3 +2589,426 @@ class TestConfirmModalPilot:
             _ui.set_output_sink(None)
             _ui.set_preview_sink(None)
             _ui.set_status_sink(None)
+
+
+# ============================================================================
+# Single-slot command queue: enqueue, refusal, dequeue-at-true-idle, Esc
+# ============================================================================
+
+
+class _QueueApp(DummyApp):
+    """DummyApp with the REAL queue machinery under test.
+
+    `_run_command` is the real gate; workers are faked and `_start_command` /
+    `push_screen` are captured, so tests can observe exactly what would start
+    (and which modal would be shown) without Textual running.
+    """
+
+    _run_command = PlaylistInteractiveApp._run_command
+
+    def __init__(self, cli, parser):
+        super().__init__(cli=cli, parser=parser)
+        self.pushed = []
+        self.started = []
+
+    def run_worker(self, fn, thread=True):
+        return _FakeWorker()
+
+    def push_screen(self, screen, callback=None):
+        self.pushed.append((screen, callback))
+
+    def _start_command(self, command, args):
+        self.started.append((command, args))
+
+    def _focus_input(self):
+        pass
+
+
+class TestCommandQueueUnit:
+    def _app(self, monkeypatch):
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        app = _QueueApp(cli=PlaylistCLI(), parser=setup_parsers())
+        app._refresh_env_status()
+        return app
+
+    def _busy(self, app):
+        """State exactly as _start_user_worker leaves it mid-run."""
+        app.status = "running /search"
+        app._inflight_workers = 1
+        app._active_worker = _FakeWorker()
+
+    def test_submission_while_running_enqueues(self, monkeypatch):
+        app = self._app(monkeypatch)
+        self._busy(app)
+        args = object()
+        app._run_command("stats", args)
+        assert app._queued_command == ("stats", args)
+        assert app.started == []  # queued, not started
+        assert "Queued /stats" in _logged_text(app)
+
+    def test_second_submission_while_queued_is_refused(self, monkeypatch):
+        app = self._app(monkeypatch)
+        self._busy(app)
+        app._run_command("stats", object())
+        app.logged.clear()
+        app._run_command("profile", object())
+        assert app._queued_command[0] == "stats"  # slot unchanged
+        assert app.started == []
+        text = _logged_text(app)
+        assert "Another command is already running" in text  # existing honest style
+        assert "/stats is queued" in text
+
+    def test_queued_command_starts_only_at_true_idle(self, monkeypatch):
+        app = self._app(monkeypatch)
+        self._busy(app)
+        args = object()
+        app._run_command("stats", args)
+        # Worker-side completion restores the status first (_post_command)…
+        app._post_command("search")
+        assert app.status == "idle"
+        assert app.started == []  # …but the thread has not exited: still held
+        # …and only the exit notification (TRUE idle) dequeues.
+        app._worker_thread_exited(app._run_generation)
+        assert app.started == [("stats", args)]
+        assert app._queued_command is None
+        assert "Starting queued /stats" in _logged_text(app)
+
+    def test_nothing_dequeues_while_cancelled_worker_unwinds(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.status = "cancelled"
+        app._inflight_workers = 2  # two stale threads still unwinding
+        app._run_command("stats", object())
+        assert app._queued_command is not None
+        app._worker_thread_exited(0)
+        assert app.status == "cancelled"  # one thread left: not true idle
+        assert app.started == []
+        assert app._queued_command is not None
+        app._worker_thread_exited(0)  # last thread unwinds -> true idle
+        assert app._queued_command is None
+        assert app.started and app.started[0][0] == "stats"
+
+    def test_escape_cancels_running_and_clears_queue_saying_both(self, monkeypatch):
+        app = self._app(monkeypatch)
+        self._busy(app)
+        worker = app._active_worker
+        app._run_command("stats", object())
+        app.action_cancel_command()
+        assert worker.cancelled is True
+        assert app.status == "cancelled"
+        assert app._queued_command is None
+        text = _logged_text(app)
+        assert "Cancelled /search" in text  # says the run was cancelled…
+        assert "Dropped queued /stats as well." in text  # …AND the queue cleared
+
+    def test_escape_with_only_queued_command_drops_it(self, monkeypatch):
+        # Queued behind auto-sync: no user worker to cancel, but Esc still
+        # clears the slot instead of silently ignoring the keypress.
+        app = self._app(monkeypatch)
+        app.status = "auto-sync"
+        app._run_command("stats", object())
+        assert app._queued_command is not None
+        app.action_cancel_command()
+        assert app._queued_command is None
+        assert "Dropped queued /stats." in _logged_text(app)
+        assert app.status == "auto-sync"  # background work untouched
+
+    def test_escape_idle_empty_queue_still_noop(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.action_cancel_command()
+        assert app.logged == []
+
+    def test_queued_destructive_confirms_at_dequeue_not_enqueue(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from interactive_app import ConfirmScreen
+
+        app = self._app(monkeypatch)
+        self._busy(app)
+        args = SimpleNamespace(playlist="Chill")
+        app._run_command("rotate", args)
+        assert app.pushed == []  # NO modal at enqueue time
+        assert app._queued_command == ("rotate", args)
+        # Cancel-unwind path to true idle: modal must appear only now.
+        app.status = "cancelled"
+        app._active_worker = None
+        app._worker_thread_exited(0)
+        assert app.started == []  # nothing runs before the answer
+        assert len(app.pushed) == 1
+        screen, callback = app.pushed[0]
+        assert isinstance(screen, ConfirmScreen)
+        callback(True)
+        assert app.started == [("rotate", args)]
+
+    def test_auto_sync_finish_dequeues(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app.status = "auto-sync"
+        args = object()
+        app._run_command("stats", args)
+        assert app._queued_command == ("stats", args)
+        app._finish_auto_sync()
+        assert app.status == "idle"
+        assert app.started == [("stats", args)]
+        assert app._queued_command is None
+
+    def test_auto_sync_stands_down_while_a_command_is_queued(self, monkeypatch):
+        app = self._app(monkeypatch)
+        app._queued_command = ("stats", object())
+        launched = []
+        app.run_worker = lambda *a, **k: launched.append(1)
+        app._maybe_auto_sync()
+        assert launched == []
+        assert app.status == "idle"
+
+
+# ---------------------------------------------------------------------------
+# Pilot: queue lifecycle end-to-end — visible status, refusal, auto-start at
+# true idle, ConfirmScreen at dequeue, Esc clearing both. Timing is owned by
+# the test via threading.Events (same pattern as the Esc pilot).
+# ---------------------------------------------------------------------------
+
+
+class TestCommandQueuePilot:
+    def test_queue_lifecycle_end_to_end(self, monkeypatch):
+        import logging as _logging
+        import threading as _threading
+        from io import StringIO
+
+        from rich.console import Console
+        from textual.widgets import RichLog
+
+        import interactive_app as ia
+        import ui as _ui
+        from interactive_app import ConfirmScreen
+
+        for key in SPOTIFY_REQUIRED_KEYS:
+            monkeypatch.setenv(key, "test_value")
+        monkeypatch.setenv("TUNR_AUTO_SYNC_MINUTES", "0")  # keep the run inert
+
+        holders = {}
+        calls = []
+
+        def _arm():
+            holders["gate"] = _threading.Event()
+            holders["entered"] = _threading.Event()
+
+        def _dispatch(cli, command, args):
+            calls.append(command)
+            if command == "stats":
+                holders["entered"].set()
+                holders["gate"].wait(timeout=10)
+            return 0
+
+        monkeypatch.setattr(ia, "dispatch_command", _dispatch)
+
+        def _scrollback(app) -> str:
+            log = app.query_one(RichLog)
+            return "\n".join(strip.text for strip in log.lines)
+
+        def _bar_text(app) -> str:
+            buf = StringIO()
+            Console(file=buf, width=100).print(app._render_top_bar())
+            return buf.getvalue()
+
+        async def drive():
+            app = PlaylistInteractiveApp(cli=PlaylistCLI(), parser=setup_parsers())
+            async with app.run_test(size=(100, 30)) as pilot:
+
+                async def _wait(predicate):
+                    for _ in range(500):
+                        if predicate():
+                            return
+                        await pilot.pause(0.01)
+                    raise AssertionError("condition never became true")
+
+                # Round 1 — enqueue -> visible status -> refusal -> runs at idle.
+                _arm()
+                app._submit_text("/stats")
+                await _wait(holders["entered"].is_set)
+                assert app.status == "running /stats"
+
+                app._submit_text("/profile")
+                await pilot.pause()
+                assert app._queued_command is not None
+                assert app._queued_command[0] == "profile"
+                assert "Queued /profile" in _scrollback(app)
+                assert "queued: /profile" in _bar_text(app)  # status shows it
+
+                app._submit_text("/taste")  # second submission: refused
+                await pilot.pause()
+                assert app._queued_command[0] == "profile"
+                assert "/profile is queued" in _scrollback(app)
+                assert "taste" not in calls
+
+                holders["gate"].set()
+                await _wait(
+                    lambda: (
+                        calls == ["stats", "profile"]
+                        and app.status == "idle"
+                        and app._inflight_workers == 0
+                    )
+                )
+                assert "Starting queued /profile" in _scrollback(app)
+                assert app._queued_command is None
+
+                # Round 2 — queued destructive command confirms at DEQUEUE.
+                _arm()
+                app._submit_text("/stats")
+                await _wait(holders["entered"].is_set)
+                app._submit_text("/rotate Chill")
+                await pilot.pause()
+                assert app._queued_command[0] == "rotate"
+                assert not isinstance(app.screen, ConfirmScreen)  # not at enqueue
+                holders["gate"].set()
+                await _wait(lambda: isinstance(app.screen, ConfirmScreen))
+                assert calls.count("rotate") == 0  # modal up, nothing dispatched
+                await pilot.press("y")
+                await _wait(
+                    lambda: (
+                        calls.count("rotate") == 1
+                        and app.status == "idle"
+                        and app._inflight_workers == 0
+                    )
+                )
+
+                # Round 3 — Esc cancels the running command AND clears the queue.
+                _arm()
+                app._submit_text("/stats")
+                await _wait(holders["entered"].is_set)
+                app._submit_text("/profile")
+                await pilot.pause()
+                assert app._queued_command is not None
+                await pilot.press("escape")
+                assert app.status == "cancelled"
+                assert app._queued_command is None
+                scrollback = _scrollback(app)
+                assert "Cancelled /stats" in scrollback  # says the cancel…
+                assert "Dropped queued /profile as well." in scrollback  # …and the drop
+                holders["gate"].set()
+                await _wait(lambda: app.status == "idle" and app._inflight_workers == 0)
+                assert calls.count("profile") == 1  # round 1 only — never revived
+
+        root = _logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+        try:
+            _run_async(drive())
+        finally:
+            root.handlers = saved_handlers
+            root.setLevel(saved_level)
+            _ui.set_output_sink(None)
+            _ui.set_preview_sink(None)
+            _ui.set_status_sink(None)
+
+
+# ============================================================================
+# /search & /find pre-flight provider gate
+# ============================================================================
+
+
+class TestSearchProviderPreflight:
+    def test_search_blocked_without_providers(self, monkeypatch):
+        from rich.panel import Panel
+
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
+        app = _make_app(monkeypatch)
+        app._handle_command("/search chill jazz")
+        assert app.commands == []  # fail fast: never dispatched
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "Search needs a provider"
+        assert panel.border_style == "red"
+        text = _logged_text(app)
+        assert "ANTHROPIC_API_KEY" in text
+        assert "OPENAI_API_KEY" in text
+        assert "/env" in text  # actionable: where to verify
+
+    def test_find_blocked_without_providers(self, monkeypatch):
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
+        app = _make_app(monkeypatch)
+        app._handle_command("/find upbeat indie")
+        assert app.commands == []
+        assert "Search needs a provider" in _logged_text(app)
+
+    def test_search_dispatches_with_providers(self, monkeypatch):
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"codex": "cmd"})
+        app = _make_app(monkeypatch)
+        app._handle_command("/search chill jazz")
+        assert "search" in app.commands
+        assert "Search needs a provider" not in _logged_text(app)
+
+    def test_find_dispatches_with_providers(self, monkeypatch):
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"claude": "cmd"})
+        app = _make_app(monkeypatch)
+        app._handle_command("/find upbeat indie")
+        assert "find" in app.commands
+
+    def test_non_search_commands_never_gated(self, monkeypatch):
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
+        app = _make_app(monkeypatch)
+        app._handle_command("/stats")
+        assert "stats" in app.commands
+
+
+# ============================================================================
+# Error chrome: every inline red panel goes through ui.error_panel
+# ============================================================================
+
+
+class TestErrorChromeUnified:
+    def test_error_panel_factory_defines_the_chrome(self):
+        from rich.panel import Panel
+        from rich.text import Text as RichText
+
+        from ui import error_panel
+
+        panel = error_panel("boom")
+        assert isinstance(panel, Panel)
+        assert panel.title == "Error"
+        assert panel.border_style == "red"
+        assert isinstance(panel.renderable, RichText)
+        assert panel.renderable.plain == "boom"
+        assert panel.renderable.style == "red"
+        assert error_panel("x", title="Custom").title == "Custom"
+
+    def test_ui_error_routes_factory_chrome_to_sink(self):
+        import ui as _ui
+
+        captured = []
+        _ui.set_output_sink(captured.append)
+        try:
+            _ui.error("bad thing")
+        finally:
+            _ui.set_output_sink(None)
+        assert len(captured) == 1
+        panel = captured[0]
+        assert panel.title == "Error"
+        assert panel.border_style == "red"
+        assert panel.renderable.plain == "bad thing"
+
+    def test_shlex_and_unknown_command_sites_share_chrome(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch)
+        app._handle_command("/update 'oops")  # shlex error site
+        shlex_panel = app.logged[-1]
+        app._handle_command("/definitely-not-a-command x")  # parse error site
+        parse_panel = app.logged[-1]
+        for panel in (shlex_panel, parse_panel):
+            assert isinstance(panel, Panel)
+            assert panel.title == "Error"
+            assert panel.border_style == "red"
+        assert "Invalid command syntax" in _logged_text(app)
+
+    def test_setup_required_site_keeps_its_title_and_info(self, monkeypatch):
+        from rich.panel import Panel
+
+        app = _make_app(monkeypatch, with_spotify=False)
+        app._handle_command('/view "Test"')
+        panel = app.logged[-1]
+        assert isinstance(panel, Panel)
+        assert panel.title == "Setup Required"
+        assert panel.border_style == "red"
+        text = _logged_text(app)
+        assert "Spotify keys missing" in text  # every original detail kept
+        assert "/setup" in text
