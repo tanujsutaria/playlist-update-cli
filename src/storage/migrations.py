@@ -48,10 +48,10 @@ def _apply_statements(conn: sqlite3.Connection, statements: Iterable[str]) -> No
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = _get_version(conn)
-    if version >= LATEST_VERSION:
-        return
     if version > LATEST_VERSION:
         raise RuntimeError(f"Unsupported schema version {version}.")
+    if version == LATEST_VERSION:
+        return
 
     if version == 0:
         _apply_statements(conn, initial_schema())
@@ -82,3 +82,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         version = 7
 
     _set_version(conn, LATEST_VERSION)
+    # Durability: connections are opened in the default legacy autocommit mode
+    # (db.py sets no isolation_level), where the sqlite3 driver implicitly opens
+    # a transaction before DML but not before DDL. The ladder above is pure DDL
+    # and autocommits statement-by-statement, while _set_version's DELETE+INSERT
+    # start an implicit transaction that would be rolled back on close unless we
+    # commit it here — leaving the DDL applied but the version row stale.
+    conn.commit()

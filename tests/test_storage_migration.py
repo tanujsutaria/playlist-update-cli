@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import pickle
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Sequence
 
+import pytest
+
 from models import PlaylistHistory, Song
 from storage.db import Database
 from storage.legacy_migrate import migrate_legacy
-from storage.migrations import ensure_schema
+from storage.migrations import LATEST_VERSION, ensure_schema
 from storage.repos import Repositories
 
 
@@ -58,6 +61,67 @@ def test_schema_v4_tables_and_version(tmp_path: Path) -> None:
     # Idempotent: re-running on a fully-migrated db is a no-op.
     ensure_schema(conn)
     assert _schema_version(conn) == 7
+
+
+def test_schema_version_committed_to_disk(tmp_path: Path) -> None:
+    """The final version row must survive the connection that wrote it.
+
+    Regression: ensure_schema used to write the version row (DML, which opens an
+    implicit transaction under the default legacy autocommit mode) without ever
+    committing, so the DDL persisted but the version row was rolled back on
+    close. A brand-new raw connection to the file is the only honest check.
+    """
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    ensure_schema(db.connect())
+    db.close()
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        assert _schema_version(raw) == LATEST_VERSION
+    finally:
+        raw.close()
+
+
+def test_reopen_does_not_replay_migration_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fully-migrated file must short-circuit before any DDL is replayed."""
+    import storage.migrations as migrations_mod
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    ensure_schema(db.connect())
+    db.close()
+
+    calls: List[object] = []
+    real_apply = migrations_mod._apply_statements
+
+    def spy(conn: sqlite3.Connection, statements: object) -> None:
+        calls.append(statements)
+        real_apply(conn, statements)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(migrations_mod, "_apply_statements", spy)
+
+    reopened = Database(db_path)
+    conn = reopened.connect()
+    ensure_schema(conn)
+    assert calls == []
+    assert _schema_version(conn) == LATEST_VERSION
+    reopened.close()
+
+
+def test_future_schema_version_raises(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    conn = db.connect()
+    ensure_schema(conn)
+    conn.execute("UPDATE schema_version SET version = ?;", (LATEST_VERSION + 1,))
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="Unsupported schema version"):
+        ensure_schema(conn)
+    db.close()
 
 
 def _write_legacy_fixtures(data_dir: Path) -> None:
