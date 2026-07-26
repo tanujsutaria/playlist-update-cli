@@ -16,7 +16,14 @@ Three layers, deliberately separable:
   readout, footer key hints, and per-tab empty states.
 
 Data is recomputed synchronously on mount and on tab/range change — the
-corpus is ~1.3k tracks, well under any latency that would warrant a worker.
+providers are COUNT/GROUP BY queries plus one pass over the ~1.2k enriched
+context rows, well under any latency that would warrant a worker even with
+the ~15k-row library mirror underneath.
+
+Scope doctrine (see `scopes.py`): taste facets aggregate the CURATED CORE
+only — mirror rows never dilute a share — coverage panels name the mirror
+denominator explicitly, and plays captions lead with the counted-play hero
+number and the ledger's start date (never lifetime listening).
 """
 
 from __future__ import annotations
@@ -35,7 +42,8 @@ from textual.screen import Screen
 from textual.widget import Widget
 from textual.widgets import Static
 
-from plays import listening_clock, play_counts, plays_meta, top_played
+from plays import daily_counts, listening_clock, play_counts, plays_meta, top_played
+from scopes import curated_scope_caption, fmt_n, library_scopes, mirror_scope_caption
 from storage.repos import Repositories
 from taste_facets import decade_histogram, facet_track_counts, fold_genre, taste_title
 from ui import ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_WHITE, CAPTION_STYLE, hbar
@@ -60,6 +68,19 @@ TabData = Tuple[List[Row], str]
 # Plays ranges, in r-key cycling order. "all" means no cutoff.
 RANGE_KEYS: Tuple[str, ...] = ("all", "90d", "30d", "7d")
 _RANGE_DAYS: Dict[str, int] = {"90d": 90, "30d": 30, "7d": 7}
+
+# Small-N honesty gates for the plays tab — thresholds, not hardcoded
+# smallness, so the view grows panels as the ledger accrues instead of ever
+# implying signal a ~50-event window cannot carry:
+#   * below SHARE_MIN_PLAYS counted plays, NO share-of-listening percentages
+#     anywhere (a 3-play "6%" is noise wearing a suit);
+#   * below CLOCK_MIN_PLAYS, no day-part listening clock;
+#   * per-day bars appear only once the ledger spans DAY_BARS_MIN_DAYS
+#     distinct days, windowed to the most recent DAY_BARS_WINDOW.
+SHARE_MIN_PLAYS = 200
+CLOCK_MIN_PLAYS = 100
+DAY_BARS_MIN_DAYS = 5
+DAY_BARS_WINDOW = 14
 
 
 def range_cutoff(range_key: str, now: Optional[datetime] = None) -> Optional[str]:
@@ -96,7 +117,12 @@ def _context_pairs(conn: sqlite3.Connection) -> List[Tuple[str, str]]:
 
 
 def taste_data(cli: SupportsRepos, limit: int = 6) -> TabData:
-    """Top moods + top genres (tracks tagged), via the taste_facets counters."""
+    """Top moods + top genres (tracks tagged), via the taste_facets counters.
+
+    Scoped to the CURATED CORE deliberately: `_context_pairs` only returns
+    enriched tracks, so raw library-mirror rows can never dilute a facet
+    share, and every share names that denominator.
+    """
     conn = cli.repos.conn
     pairs = _context_pairs(conn)
     enriched = len(pairs)
@@ -112,11 +138,12 @@ def taste_data(cli: SupportsRepos, limit: int = 6) -> TabData:
                     {
                         "group": group,
                         "share": _pct(count, enriched),
-                        "extra": f"{group[:-1]} · {count} of {enriched} enriched tracks",
+                        "extra": f"{group[:-1]} · {count} of {fmt_n(enriched)} enriched tracks",
                     },
                 )
             )
-    caption = f"{enriched} enriched tracks · tags from /enrich web context — semantic, not acoustic"
+    scopes = library_scopes(conn)
+    caption = f"{curated_scope_caption(scopes)} · tags from /enrich — semantic, not acoustic"
     headline = taste_title(mood_counts, genre_counts)
     if headline:
         caption = f"{headline} · {caption}"
@@ -148,7 +175,7 @@ def stats_data(cli: SupportsRepos, limit: int = 8) -> TabData:
                 {
                     "group": "decades",
                     "share": _pct(count, datable),
-                    "extra": f"of {datable} datable tracks",
+                    "extra": f"of {datable} datable tracks · curated core",
                 },
             )
         )
@@ -173,13 +200,14 @@ def stats_data(cli: SupportsRepos, limit: int = 8) -> TabData:
                 {
                     "group": "coverage",
                     "share": _pct(have, total),
-                    "extra": f"{have}/{total} tracks have it",
+                    "extra": f"{fmt_n(have)} of {fmt_n(total)} mirror tracks have it",
                 },
             )
         )
+    scopes = library_scopes(conn)
     caption = (
         f"{datable}/{len(pairs)} enriched tracks datable · {unbucketable} defied parsing"
-        f" · coverage counts join live tracks only"
+        f" · coverage vs the {mirror_scope_caption(scopes)}"
     )
     return rows, caption
 
@@ -190,15 +218,24 @@ def plays_data(
     limit: int = 10,
     now: Optional[datetime] = None,
 ) -> TabData:
-    """Top-played tracks + day-part listening clock for one range.
+    """Top-played tracks for one range, plus panels the ledger has EARNED.
 
     Counts follow the canonical play rule (sub-30s events never count) and
     are FLOOR estimates: ``recently_played`` polling only sees what played
-    while tunr was open — the caption discloses exactly that.
+    while tunr was open — the caption discloses exactly that, leads with the
+    hero number, and names the window start (never lifetime listening).
+
+    Small-N honesty (the ledger starts near-empty and only grows via
+    /listen-sync polling): share-of-listening percentages appear only at
+    ``SHARE_MIN_PLAYS`` counted plays, per-day bars only once the ledger
+    spans ``DAY_BARS_MIN_DAYS`` days, and the day-part clock only at
+    ``CLOCK_MIN_PLAYS`` — below each threshold the panel is absent, never
+    faked.
     """
     conn = cli.repos.conn
     since = range_cutoff(range_key, now=now)
     counted = sum(play_counts(conn, since=since).values())
+    show_shares = counted >= SHARE_MIN_PLAYS
     rows: List[Row] = []
     for track in top_played(conn, limit=limit, since=since):
         name = str(track["name"] or track["track_id"])
@@ -211,14 +248,28 @@ def plays_data(
                 float(track["plays"]),
                 {
                     "group": "tracks",
-                    "share": _pct(float(track["plays"]), counted),
+                    "share": _pct(float(track["plays"]), counted) if show_shares else "",
                     "extra": f"last played {last_played}" if last_played else "",
                 },
             )
         )
-    clock = listening_clock(conn, since=since)
-    clock_total = sum(clock)
-    if clock_total > 0:
+    daily = daily_counts(conn, since=since)
+    if len(daily) >= DAY_BARS_MIN_DAYS:
+        for day, day_plays in daily[-DAY_BARS_WINDOW:]:
+            rows.append(
+                (
+                    day,
+                    float(day_plays),
+                    {
+                        "group": "days",
+                        "share": "",
+                        "extra": "plays that utc day · gap days not drawn",
+                    },
+                )
+            )
+    if counted >= CLOCK_MIN_PLAYS:
+        clock = listening_clock(conn, since=since)
+        clock_total = sum(clock)
         day_parts: Sequence[Tuple[str, int, int]] = (
             ("night 00-06", 0, 6),
             ("morning 06-12", 6, 12),
@@ -233,7 +284,7 @@ def plays_data(
                     float(bucket),
                     {
                         "group": "clock",
-                        "share": _pct(bucket, clock_total),
+                        "share": _pct(bucket, clock_total) if show_shares else "",
                         "extra": "plays by utc hour",
                     },
                 )
@@ -244,8 +295,8 @@ def plays_data(
     else:
         since_date = str(meta["first_played_at"] or "")[:10] or "—"
     caption = (
-        f"from {counted} events since {since_date} · gaps while tunr closed"
-        f" · ≥30s plays only, floor estimates"
+        f"{counted} plays since {since_date} · grows via /listen-sync"
+        f" · ≥30s plays only, floor estimates · gaps while tunr closed"
     )
     return rows, caption
 

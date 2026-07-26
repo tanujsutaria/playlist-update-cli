@@ -98,12 +98,23 @@ def seeded_cli(tmp_path):
 
 class TestShowProfile:
     def test_reports_library_and_coverage(self, seeded_cli, capsys):
-        seeded_cli.show_profile(top=10)
-        out = capsys.readouterr().out
+        payload = seeded_cli.show_profile(top=10)
+        out = _flat(capsys.readouterr().out)
         assert "Library Profile" in out
-        # 6 tracks, 3 distinct rotated, 3 never rotated -> both halves are 50%.
-        assert "Never rotated" in out
-        assert "50%" in out
+        # The masthead names the scopes as stat tiles, mirror caption on the
+        # rule (the "— /enrich grows this" tail may ellipsize at 80 cols).
+        assert "library mirror · 6 tracks · 0% enriched" in out
+        assert "curated core" in out
+        assert "rotated" in out
+        # Additive payload fragment: every scope count, defined once.
+        assert payload["scopes"] == {
+            "mirror": 6,
+            "curated": 0,
+            "embedded": 0,
+            "sonic": 0,
+            "liked": 0,
+            "rotation": 3,
+        }
 
     def test_top_artist_is_charted(self, seeded_cli, capsys):
         seeded_cli.show_profile(top=10)
@@ -131,7 +142,8 @@ class TestShowProfile:
         seeded_cli.show_profile(top=10)
         out = _flat(capsys.readouterr().out)
         assert "rotation runway" in out
-        assert "3 played · 3 in the crate" in out
+        # No curated core in this fixture -> the runway scopes to the library.
+        assert "3/6 library played · 3 in the crate" in out
 
 
 class TestArtistConcentration:
@@ -164,7 +176,8 @@ class TestArtistConcentration:
         assert "2 tracks" in out
         assert "4+ tracks" in out
         # 6 artists, 12 tracks: the top 10 artists ARE all of them -> 100%.
-        assert "your top 10 artists hold 12 tracks — 100.0% of the library" in out
+        # The share names its denominator scope — the library mirror.
+        assert "your top 10 artists hold 12 tracks — 100.0% of the 12-track library mirror" in out
         assert "concentrated on favorites" in out
         assert payload["concentration"]["buckets"] == [
             {"tracks_per_artist": 1, "artists": 4},
@@ -231,7 +244,7 @@ class TestBackfillRunway:
         payload = seeded_cli.show_profile(top=10)
         out = _flat(capsys.readouterr().out)
         assert "Backfill runway" in out
-        assert "6 tracks awaiting embeddings" in out
+        assert "6 not yet embedded" in out
         assert "6 unenriched" in out
         assert "6 without sonic data" in out
         assert "6 missing spotify ids" in out

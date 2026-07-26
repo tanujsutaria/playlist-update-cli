@@ -15,6 +15,7 @@ import pytest
 
 from plays import (
     PLAY_MS_THRESHOLD,
+    daily_counts,
     listening_clock,
     parse_played_at,
     play_counts,
@@ -140,6 +141,26 @@ class TestTopPlayed:
 # ---------------------------------------------------------------------------
 # listening_clock / weekday_histogram
 # ---------------------------------------------------------------------------
+
+
+class TestDailyCounts:
+    def test_groups_by_utc_day_ascending_with_play_rule(self, conn):
+        track = _seed_track(conn, "Artist A", "Song")
+        _add_event(conn, "e1", track, "2026-06-02T10:00:00Z")
+        _add_event(conn, "e2", track, "2026-06-02T22:00:00Z")
+        _add_event(conn, "e3", track, "2026-06-01T09:00:00Z")
+        _add_event(conn, "skip", track, "2026-06-01T10:00:00Z", ms_played=5_000)  # never counts
+        assert daily_counts(conn) == [("2026-06-01", 1), ("2026-06-02", 2)]
+
+    def test_since_filter_and_gap_days_absent(self, conn):
+        track = _seed_track(conn, "Artist A", "Song")
+        _add_event(conn, "e1", track, "2026-06-01T10:00:00Z")
+        _add_event(conn, "e2", track, "2026-06-05T10:00:00Z")  # 3-day gap: no zero rows
+        assert daily_counts(conn) == [("2026-06-01", 1), ("2026-06-05", 1)]
+        assert daily_counts(conn, since="2026-06-02T00:00:00Z") == [("2026-06-05", 1)]
+
+    def test_empty_ledger(self, conn):
+        assert daily_counts(conn) == []
 
 
 class TestClockAndWeekday:
