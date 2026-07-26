@@ -913,32 +913,44 @@ class PlaylistInteractiveApp(App):
                 )
             )
             return
-        if command in ("search", "find") and not self._search_providers_available():
-            return
+        if command in ("search", "find"):
+            self._warn_if_search_providers_missing()
         self._run_command(command, args)
 
-    def _search_providers_available(self) -> bool:
-        """Pre-flight gate for /search and /find: fail fast when no deep-search
-        provider is configured, instead of failing minutes into the pipeline.
+    def _warn_if_search_providers_missing(self) -> None:
+        """Advisory pre-flight for /search and /find: when no deep-search
+        provider is detected, say so up front — but still dispatch.
 
-        Uses the SAME detection the pipeline itself uses
-        (web_search.detect_search_commands — run_deep_search raises
-        ProviderConfigError off the identical check, and /status and /env
-        report from it too), so this gate can never disagree with the run.
-        TUI-only seam: the headless path (main.dispatch_command) is unchanged.
+        Warn-don't-block, because the pipeline can serve a previously-cached
+        query with zero providers (SearchPipeline.run consults its SQLite
+        cache BEFORE run_providers), and a provider-less fresh run already
+        fails fast inside the pipeline with ProviderConfigError off the
+        identical detection (web_search.detect_search_commands — /status and
+        /env report from it too). Never refusing keeps the TUI's outcomes
+        identical to the headless path (main.dispatch_command has no gate).
+
+        A cache-aware hard block was considered and rejected: probing the
+        cache here would read the shared SQLite connection from the UI thread
+        while a worker may hold it, violating the serialized-use contract
+        documented in storage/db.py.
         """
         if detect_search_commands():
-            return True
+            return
         self.append_log(
-            error_panel(
-                "No deep-search provider configured — /search and /find need one.\n"
-                "Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY (or a WEB_SEARCH_CLAUDE_CMD / "
-                "WEB_SEARCH_CODEX_CMD / WEB_SEARCH_CMD override) in config/.env, then "
-                "restart tunr. /env shows what is detected.",
-                title="Search needs a provider",
+            Panel(
+                Text(
+                    "No deep-search provider detected — a fresh /search or /find "
+                    "will fail; only a previously-cached query can be served.\n"
+                    "Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY (or a "
+                    "WEB_SEARCH_CLAUDE_CMD / WEB_SEARCH_CODEX_CMD / WEB_SEARCH_CMD "
+                    "override) in config/.env, then restart tunr. /env shows what "
+                    "is detected.",
+                    style="yellow",
+                ),
+                title="No search provider detected",
+                border_style="yellow",
             )
         )
-        return False
 
     def _run_command(self, command: str, args: object) -> None:
         if not self._is_idle():

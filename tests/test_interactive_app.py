@@ -526,6 +526,11 @@ class TestSetupModeGating:
 
     def test_setup_mode_allows_all_whitelisted(self, monkeypatch):
         """Every command in COMMANDS_ALLOWED_WITHOUT_SPOTIFY should be allowed."""
+        # Providers pinned OFF: reproduces keyless GitHub CI (ci.yml passes no
+        # API-key secrets), so this loop is provider-agnostic no matter what
+        # the developer shell exports — the /search//find pre-flight is
+        # advisory and must never block a whitelisted command.
+        monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
         for cmd in COMMANDS_ALLOWED_WITHOUT_SPOTIFY:
             app = _make_app(monkeypatch, with_spotify=False)
             # Some commands need args, provide minimal ones
@@ -2902,52 +2907,60 @@ class TestCommandQueuePilot:
 
 
 # ============================================================================
-# /search & /find pre-flight provider gate
+# /search & /find advisory provider pre-flight (warn, never block)
 # ============================================================================
 
 
 class TestSearchProviderPreflight:
-    def test_search_blocked_without_providers(self, monkeypatch):
+    def test_search_warns_but_dispatches_without_providers(self, monkeypatch):
         from rich.panel import Panel
 
         monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
         app = _make_app(monkeypatch)
         app._handle_command("/search chill jazz")
-        assert app.commands == []  # fail fast: never dispatched
-        panel = app.logged[-1]
-        assert isinstance(panel, Panel)
-        assert panel.title == "Search needs a provider"
-        assert panel.border_style == "red"
+        # Advisory only: the pipeline can serve a previously-cached query with
+        # zero providers (its cache check precedes run_providers), and a fresh
+        # run fails fast in-pipeline with ProviderConfigError — so the
+        # submission must still dispatch, keeping TUI outcomes identical to
+        # the headless path.
+        assert "search" in app.commands
+        panels = [p for p in app.logged if isinstance(p, Panel)]
+        assert panels, "expected an advisory panel"
+        panel = panels[-1]
+        assert panel.title == "No search provider detected"
+        assert panel.border_style == "yellow"  # warning chrome, not error red
         text = _logged_text(app)
+        assert "cached" in text  # explains why it still dispatched
         assert "ANTHROPIC_API_KEY" in text
         assert "OPENAI_API_KEY" in text
         assert "/env" in text  # actionable: where to verify
 
-    def test_find_blocked_without_providers(self, monkeypatch):
+    def test_find_warns_but_dispatches_without_providers(self, monkeypatch):
         monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
         app = _make_app(monkeypatch)
         app._handle_command("/find upbeat indie")
-        assert app.commands == []
-        assert "Search needs a provider" in _logged_text(app)
+        assert "find" in app.commands
+        assert "No search provider detected" in _logged_text(app)
 
-    def test_search_dispatches_with_providers(self, monkeypatch):
+    def test_search_dispatches_clean_with_providers(self, monkeypatch):
         monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"codex": "cmd"})
         app = _make_app(monkeypatch)
         app._handle_command("/search chill jazz")
         assert "search" in app.commands
-        assert "Search needs a provider" not in _logged_text(app)
+        assert "No search provider detected" not in _logged_text(app)
 
-    def test_find_dispatches_with_providers(self, monkeypatch):
+    def test_find_dispatches_clean_with_providers(self, monkeypatch):
         monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {"claude": "cmd"})
         app = _make_app(monkeypatch)
         app._handle_command("/find upbeat indie")
         assert "find" in app.commands
 
-    def test_non_search_commands_never_gated(self, monkeypatch):
+    def test_non_search_commands_never_warned(self, monkeypatch):
         monkeypatch.setattr("interactive_app.detect_search_commands", lambda: {})
         app = _make_app(monkeypatch)
         app._handle_command("/stats")
         assert "stats" in app.commands
+        assert "No search provider detected" not in _logged_text(app)
 
 
 # ============================================================================
