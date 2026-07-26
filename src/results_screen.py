@@ -20,7 +20,11 @@ Three layers, deliberately separable (same doctrine as dashboard.py):
   round-trips through the main app's Input or its ``_pending_action`` wizard.
   Row actions stay offline: ``c`` copies the track id (OSC-52 clipboard),
   ``o`` prints the cached Spotify link to the scrollback — never the browser,
-  never the network.
+  never the network. Rows with a resolvable Spotify identity (cached row
+  first, then the local db record) render the track name as an OSC 8
+  terminal hyperlink — the visible text is unchanged, so terminals without
+  hyperlink support still identify the track — and the detail headline
+  carries the same link.
 
 Ordering: when the last discovery command was /find, ``cli.last_find_ranked``
 holds the taste-ranked rows (a fresh /search clears it), and the browser shows
@@ -41,7 +45,7 @@ from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import DataTable, Input, Static
 
-from ui import ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_WHITE, CAPTION_STYLE
+from ui import ACCENT_BLUE, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_WHITE, CAPTION_STYLE, link_text
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +181,25 @@ def spotify_url_for_item(item: ResultItem) -> str:
     return ""
 
 
+def resolve_spotify_url(cli: Any, item: ResultItem) -> str:
+    """The row's Spotify URL, fully offline: the cached row first
+    (`spotify_url_for_item`), then the local db record via the duck-typed
+    ``cli.spotify_url_for_track`` — never the network. "" when neither side
+    knows a Spotify identity; a failing db lookup degrades to "" too.
+    """
+    url = spotify_url_for_item(item)
+    if url:
+        return url
+    track_id = track_id_of(item)
+    lookup = getattr(cli, "spotify_url_for_track", None)
+    if track_id and callable(lookup):
+        try:
+            return str(lookup(track_id) or "")
+        except Exception:
+            logger.debug("spotify url lookup failed for %s", track_id, exc_info=True)
+    return ""
+
+
 def prefill_for_item(item: ResultItem) -> str:
     """The editable slash command Enter hands back to the app for one row.
 
@@ -258,6 +281,10 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
         self.cli = cli
         self.results: List[Dict[str, Any]] = results_for_browse(cli)
         self.selected: Set[int] = set()
+        # Resolved once up front (offline: cached row, then local db) so the
+        # table build, the detail headline, and the `o` action all agree on
+        # each row's link without repeating db reads on every cursor move.
+        self.row_urls: List[str] = [resolve_spotify_url(cli, item) for item in self.results]
 
     # ------------------------------------------------------------------
     # Layout
@@ -279,7 +306,14 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
             for header in headers:
                 table.add_column(header)
             for index, row in enumerate(rows):
-                table.add_row(" ", *row, key=str(index))
+                cells: List[Any] = list(row)
+                # The song cell (column 1 of the pure rows) becomes a terminal
+                # hyperlink when the row has a Spotify identity — visible text
+                # unchanged, so it still identifies the track without OSC 8.
+                url = self.row_urls[index] if index < len(self.row_urls) else ""
+                if url and len(cells) > 1:
+                    cells[1] = link_text(cells[1], url)
+                table.add_row(" ", *cells, key=str(index))
         self.query_one("#results_top", Static).update(self._render_top())
         self.query_one("#results_footer", Static).update(self._render_footer())
         if self.results:
@@ -363,7 +397,12 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
         readout = Text()
         song = str(item.get("song") or item.get("name") or "")
         artist = str(item.get("artist") or "")
-        readout.append(_clip(f"{song} — {artist}", 70), style=f"bold {ACCENT_WHITE}")
+        url = self.row_urls[index] if index < len(self.row_urls) else ""
+        # link_text with a falsy url is a plain styled Text — headline text is
+        # identical either way; a known Spotify identity just makes it a link.
+        readout.append_text(
+            link_text(_clip(f"{song} — {artist}", 70), url, style=f"bold {ACCENT_WHITE}")
+        )
         readout.append("  ")
         readout.append(_fmt_score(item), style=f"bold {ACCENT_ORANGE}")
         providers = item.get("providers") or []
@@ -448,18 +487,9 @@ class ResultsScreen(Screen[Optional[ResultsAction]]):
         if index is None:
             return
         item = self.results[index]
-        url = spotify_url_for_item(item)
-        if not url:
-            # Cached rows usually carry no URL (attaching one is a network
-            # step) — fall back to the local db record, never the network.
-            track_id = track_id_of(item)
-            lookup = getattr(self.cli, "spotify_url_for_track", None)
-            if track_id and callable(lookup):
-                try:
-                    url = lookup(track_id) or ""
-                except Exception:
-                    logger.debug("spotify url lookup failed for %s", track_id, exc_info=True)
-                    url = ""
+        # Same resolution the table/detail used (cached row, then local db) —
+        # precomputed once in __init__ via resolve_spotify_url.
+        url = self.row_urls[index] if index < len(self.row_urls) else ""
         if not url:
             self._set_status(
                 Text(

@@ -1050,3 +1050,152 @@ class TestChromeFitWidth:
         avail = ui.console.options.max_width
         assert panel.width == min(cell_len(caption) + 6, avail)
         assert panel.subtitle is not None
+
+
+class TestColumnSpec:
+    """The typed per-column API for `table`/`preview_table`. Additive: plain
+    string headers keep the legacy behavior byte-for-byte, and Text cells
+    always pass through untouched (identity), spec column or not."""
+
+    def _capture(self, headers, rows):
+        captured = []
+        ui.set_output_sink(captured.append)
+        ui.table(headers, rows)
+        return captured[0]
+
+    def test_old_signature_still_works(self, reset_sinks):
+        tbl = self._capture(["Name", "Count"], [["alpha", 1]])
+        assert [col.header for col in tbl.columns] == ["Name", "Count"]
+        assert list(tbl.columns[1].cells) == ["1"]  # str coercion unchanged
+        assert tbl.columns[0].justify == "left"
+
+    def test_specs_mix_with_plain_strings(self, reset_sinks):
+        tbl = self._capture(
+            ["#", ui.ColumnSpec("Score", metric=True), "Note"],
+            [[1, "0.933", "ok"]],
+        )
+        assert [col.header for col in tbl.columns] == ["#", "Score", "Note"]
+        assert list(tbl.columns[0].cells) == ["1"]
+        assert list(tbl.columns[2].cells) == ["ok"]
+
+    def test_metric_column_right_justified_bold_values(self, reset_sinks):
+        tbl = self._capture([ui.ColumnSpec("Score", metric=True)], [["0.933"]])
+        assert tbl.columns[0].justify == "right"
+        cell = list(tbl.columns[0].cells)[0]
+        assert isinstance(cell, Text)
+        assert cell.plain == "0.933"
+        assert cell.style == ui.VALUE_STYLE
+
+    def test_explicit_justify_wins_over_metric_default(self, reset_sinks):
+        tbl = self._capture([ui.ColumnSpec("Score", justify="center", metric=True)], [["1"]])
+        assert tbl.columns[0].justify == "center"
+
+    def test_column_style_applied_to_plain_cells(self, reset_sinks):
+        tbl = self._capture([ui.ColumnSpec("#", justify="right", style="dim")], [[7]])
+        assert tbl.columns[0].justify == "right"
+        cell = list(tbl.columns[0].cells)[0]
+        assert cell.plain == "7"
+        assert cell.style == "dim"
+
+    def test_metric_colorer_styles_per_cell_with_fallback(self, reset_sinks):
+        spec = ui.ColumnSpec(
+            "Listeners",
+            metric=lambda value: "green" if float(value) < 10000 else None,
+        )
+        tbl = self._capture([spec], [[8200], [50000]])
+        cells = list(tbl.columns[0].cells)
+        assert cells[0].style == "green"  # satisfied bound -> colorer's style
+        assert cells[1].style == ui.VALUE_STYLE  # None -> metric bold fallback
+        assert tbl.columns[0].justify == "right"  # a callable is still a metric
+
+    def test_text_cells_pass_through_untouched_in_spec_columns(self, reset_sinks):
+        cell = Text("8.2k", style="green")
+        tbl = self._capture([ui.ColumnSpec("Listeners", metric=True, style="red")], [[cell]])
+        assert list(tbl.columns[0].cells)[0] is cell  # identity, styles intact
+
+    def test_width_hints_forwarded(self, reset_sinks):
+        tbl = self._capture(
+            [ui.ColumnSpec("Track", width=12), ui.ColumnSpec("Tag", max_width=8, no_wrap=True)],
+            [["a", "b"]],
+        )
+        assert tbl.columns[0].width == 12
+        assert tbl.columns[1].max_width == 8
+        assert tbl.columns[1].no_wrap is True
+        assert tbl.columns[1].overflow == "ellipsis"  # cropping is visible
+
+    def test_link_builder_wraps_plain_cell_in_link_style(self, reset_sinks):
+        spec = ui.ColumnSpec(
+            "Song",
+            link=lambda cell, row: f"https://open.spotify.com/track/{row[1]}",
+        )
+        tbl = self._capture([spec, "ID"], [["Aligned", "abc123"]])
+        cell = list(tbl.columns[0].cells)[0]
+        assert isinstance(cell, Text)
+        assert cell.plain == "Aligned"  # visible text unchanged
+        links = [span.style.link for span in cell.spans if getattr(span.style, "link", None)]
+        assert links == ["https://open.spotify.com/track/abc123"]
+
+    def test_link_on_text_cell_copies_never_mutates(self, reset_sinks):
+        original = Text("Aligned", style="green")
+        spec = ui.ColumnSpec("Song", link=lambda cell, row: "https://x")
+        tbl = self._capture([spec], [[original]])
+        cell = list(tbl.columns[0].cells)[0]
+        assert cell is not original
+        assert original.spans == []  # the caller's Text is untouched
+        assert cell.plain == "Aligned"
+        assert any(getattr(span.style, "link", None) == "https://x" for span in cell.spans)
+        assert cell.style == "green"  # pre-existing styling preserved
+
+    def test_link_builder_none_result_means_no_link(self, reset_sinks):
+        spec = ui.ColumnSpec("Song", link=lambda cell, row: None)
+        tbl = self._capture([spec], [["Aligned"]])
+        assert list(tbl.columns[0].cells)[0] == "Aligned"  # plain str, legacy path
+
+    def test_link_url_never_leaks_into_plain_text_output(self, reset_sinks, monkeypatch):
+        # A non-terminal console (pipes, redirects — force_terminal=False also
+        # defeats the CI runner's FORCE_COLOR): the link must degrade to the
+        # bare label. The URL is STYLE, never literal text.
+        from io import StringIO
+
+        from rich.console import Console
+
+        buf = StringIO()
+        monkeypatch.setattr(ui, "console", Console(file=buf, width=80, force_terminal=False))
+        url = "https://open.spotify.com/track/abc123"
+        spec = ui.ColumnSpec("Song", link=lambda cell, row: url)
+        ui.table([spec, "Artist"], [["Aligned", "Result Artist"]])
+        out = buf.getvalue()
+        assert "Aligned" in out  # the label still identifies the track
+        assert url not in out
+        assert "\x1b]8" not in out  # no raw OSC 8 codes in plain output
+
+    def test_row_longer_than_headers_keeps_legacy_coercion(self, reset_sinks):
+        tbl = self._capture([ui.ColumnSpec("#", style="dim")], [[1, "extra"]])
+        assert list(tbl.columns[1].cells) == ["extra"]
+
+    def test_preview_table_honors_specs(self, reset_sinks):
+        captured = []
+        ui.set_preview_sink(captured.append)
+        ui.preview_table([ui.ColumnSpec("Score", metric=True)], [["0.9"]])
+        tbl = captured[0]
+        assert tbl.columns[0].justify == "right"
+        assert list(tbl.columns[0].cells)[0].style == ui.VALUE_STYLE
+
+
+class TestLinkText:
+    def test_label_unchanged_and_link_carried_as_style(self):
+        text = ui.link_text("Aligned", "https://open.spotify.com/track/abc")
+        assert text.plain == "Aligned"
+        assert any(
+            getattr(span.style, "link", None) == "https://open.spotify.com/track/abc"
+            for span in text.spans
+        )
+
+    def test_falsy_url_yields_plain_text(self):
+        assert ui.link_text("Aligned", "").spans == []
+        assert ui.link_text("Aligned", None).plain == "Aligned"
+
+    def test_base_style_preserved_alongside_link(self):
+        text = ui.link_text("Aligned", "https://x", style="bold")
+        assert text.style == "bold"
+        assert any(getattr(span.style, "link", None) == "https://x" for span in text.spans)

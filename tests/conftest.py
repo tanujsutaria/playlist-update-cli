@@ -46,6 +46,28 @@ if "sentence_transformers" not in sys.modules:
 from models import PlaylistHistory, RotationStats, Song  # noqa: E402
 
 # =============================================================================
+# Global Isolation Fixtures
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db_path(monkeypatch, tmp_path):
+    """Point every test at a throwaway SQLite path, never the repo's data/.
+
+    `storage.db.get_db_path` falls back to `<repo_root>/data/tunr.db` when
+    TUNR_DB_PATH is unset, and `Database.connect()` opens that path *writable*
+    (WAL + the `ensure_schema` DDL ladder replays on every open). Seemingly
+    UI-only code reaches it — e.g. `ResultsScreen.__init__` resolves per-row
+    Spotify URLs through a real `PlaylistCLI`'s lazy repos — so isolation must
+    be suite-wide, not per-file: any test that constructs a real `PlaylistCLI`
+    without this guard would touch the user's live database mid-suite. Tests
+    that need a specific db path still win by calling `monkeypatch.setenv`
+    (or passing an explicit path) themselves.
+    """
+    monkeypatch.setenv("TUNR_DB_PATH", str(tmp_path / "tunr.db"))
+
+
+# =============================================================================
 # Sample Data Fixtures
 # =============================================================================
 

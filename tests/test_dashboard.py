@@ -16,7 +16,11 @@ from types import SimpleNamespace
 import pytest
 
 from dashboard import (
+    CLOCK_MIN_PLAYS,
+    DAY_BARS_MIN_DAYS,
+    DAY_BARS_WINDOW,
     RANGE_KEYS,
+    SHARE_MIN_PLAYS,
     DashboardScreen,
     InteractiveBarChart,
     plays_data,
@@ -181,13 +185,28 @@ class TestTasteData:
         assert by_label[("moods", "dreamy")] == 2.0
         assert by_label[("genres", "shoegaze")] == 2.0
         assert ("moods", "upbeat") in by_label
-        assert "enriched tracks" in caption
+        assert "curated core · 3 enriched tracks" in caption
         assert "/enrich" in caption
 
     def test_share_uses_enriched_denominator(self, seeded_cli):
         rows, _ = taste_data(seeded_cli)
         detail = next(d for label, _, d in rows if label == "dreamy")
         assert detail["share"] == "67%"  # 2 of 3 enriched tracks
+        assert detail["extra"] == "mood · 2 of 3 enriched tracks"
+
+    def test_mirror_rows_never_dilute_shares(self, seeded_cli):
+        """Raw library-mirror rows (tracks with NO context) must not change a
+        single facet count, share, or the named denominator — the taste tab
+        scopes to the curated core deliberately."""
+        before, _ = taste_data(seeded_cli)
+        conn = seeded_cli.repos.conn
+        for i in range(50):  # a mirror wave dwarfing the 3-track curated core
+            _seed_track(conn, f"Mirror Artist {i}", f"mirror song {i}", spotify_id=f"m{i}")
+        after, caption = taste_data(seeded_cli)
+        assert after == before  # counts AND shares identical
+        assert "curated core · 3 enriched tracks" in caption  # denominator unmoved
+        detail = next(d for label, _, d in after if label == "dreamy")
+        assert detail["share"] == "67%"  # of enriched, never of the 53-row mirror
 
     def test_empty_library(self, empty_cli):
         rows, _ = taste_data(empty_cli)
@@ -213,6 +232,18 @@ class TestStatsData:
         assert by_label[("coverage", "spotify id")] == 2.0
         assert "3/3 enriched tracks datable" in caption
 
+    def test_scope_labels_name_their_denominators(self, seeded_cli):
+        """Every stats row names its population: decades are curated-core
+        claims, coverage rows are mirror claims, and the caption carries the
+        mirror scope + the /enrich growth pointer."""
+        rows, caption = stats_data(seeded_cli)
+        decade_extra = next(d["extra"] for _, _, d in rows if d["group"] == "decades")
+        assert decade_extra == "of 3 datable tracks · curated core"
+        context_extra = next(d["extra"] for label, _, d in rows if label == "context")
+        assert context_extra == "3 of 3 mirror tracks have it"
+        assert "coverage vs the library mirror · 3 tracks · 100% enriched" in caption
+        assert "/enrich grows this" in caption
+
     def test_empty_library(self, empty_cli):
         rows, _ = stats_data(empty_cli)
         assert rows == []
@@ -223,6 +254,20 @@ class TestStatsData:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def grown_cli():
+    """A ledger past every small-N threshold: 210 counted plays spread over
+    7 UTC days (and every day part), all on one track."""
+    conn = _connect()
+    hot = _seed_track(conn, "Artist A", "hot song", spotify_id="sp1")
+    event = 0
+    for day in range(1, 8):  # 2026-06-01 .. 2026-06-07
+        for k in range(30):  # 30 plays per day -> 210 counted
+            _add_event(conn, f"g{event}", hot, f"2026-06-{day:02d}T{(k * 5) % 24:02d}:10:00Z")
+            event += 1
+    return SimpleNamespace(repos=Repositories(conn))
+
+
 class TestPlaysData:
     def test_sub_30s_events_never_count(self, seeded_cli):
         rows, _ = plays_data(seeded_cli, "all", now=NOW)
@@ -231,30 +276,61 @@ class TestPlaysData:
         # cold song's only counted play is the old one; the 5s skip is excluded.
         assert tracks["cold song — artist b"] == 1.0
 
-    def test_clock_day_parts(self, seeded_cli):
+    def test_small_ledger_earns_no_shares_no_clock_no_day_bars(self, seeded_cli):
+        """4 counted plays over 4 days: top tracks only — NO share-of-listening
+        percentages, no day-part clock, no per-day bars. Absent, never faked."""
+        assert 4 < min(SHARE_MIN_PLAYS, CLOCK_MIN_PLAYS) and 4 < DAY_BARS_MIN_DAYS
         rows, _ = plays_data(seeded_cli, "all", now=NOW)
-        clock = {label: value for label, value, d in rows if d["group"] == "clock"}
-        assert clock["night 00-06"] == 1.0
-        assert clock["morning 06-12"] == 1.0
-        assert clock["afternoon 12-18"] == 1.0
-        assert clock["evening 18-24"] == 1.0
+        assert {d["group"] for _, _, d in rows} == {"tracks"}
+        assert all(d["share"] == "" for _, _, d in rows)
+
+    def test_grown_ledger_unlocks_day_bars_clock_and_shares(self, grown_cli):
+        rows, caption = plays_data(grown_cli, "all", now=NOW)
+        assert {d["group"] for _, _, d in rows} == {"tracks", "days", "clock"}
+        days = [(label, value) for label, value, d in rows if d["group"] == "days"]
+        assert len(days) == 7
+        assert days[0] == ("2026-06-01", 30.0)  # per-day counts, ascending
+        assert all(d["share"] == "" for _, _, d in rows if d["group"] == "days")
+        # Shares are earned at SHARE_MIN_PLAYS — and only then.
+        assert next(d["share"] for _, _, d in rows if d["group"] == "tracks") == "100%"
+        clock_shares = [d["share"] for _, _, d in rows if d["group"] == "clock"]
+        assert clock_shares and all(s.endswith("%") for s in clock_shares)
+        assert caption.startswith("210 plays since 2026-06-01")
+
+    def test_day_bars_window_caps_at_most_recent(self):
+        """A long ledger shows only the last DAY_BARS_WINDOW days of bars."""
+        conn = _connect()
+        hot = _seed_track(conn, "Artist A", "hot song")
+        for day in range(1, 21):  # 20 days, one play each
+            _add_event(conn, f"w{day}", hot, f"2026-05-{day:02d}T12:00:00Z")
+        cli = SimpleNamespace(repos=Repositories(conn))
+        rows, _ = plays_data(cli, "all", now=NOW)
+        days = [label for label, _, d in rows if d["group"] == "days"]
+        assert len(days) == DAY_BARS_WINDOW
+        assert days[0] == f"2026-05-{21 - DAY_BARS_WINDOW:02d}"
+        assert days[-1] == "2026-05-20"
+        # 20 counted plays: day bars are earned (span), shares/clock are not.
+        assert all(d["share"] == "" for _, _, d in rows)
+        assert not any(d["group"] == "clock" for _, _, d in rows)
 
     def test_range_cutoff_filters_events(self, seeded_cli):
         rows, caption = plays_data(seeded_cli, "7d", now=NOW)
         tracks = {label: value for label, value, d in rows if d["group"] == "tracks"}
         # Only the 2d and 1d plays fall inside the 7d window.
         assert tracks == {"hot song — artist a": 2.0}
-        assert caption.startswith("from 2 events since 2026-06-03 · gaps while tunr closed")
+        assert caption.startswith("2 plays since 2026-06-03 · grows via /listen-sync")
 
     def test_caption_discloses_provenance(self, seeded_cli):
         _, caption = plays_data(seeded_cli, "all", now=NOW)
-        # 4 counted plays; ledger starts at the oldest event.
-        assert caption.startswith("from 4 events since 2026-03-02 · gaps while tunr closed")
+        # Hero number first; the ledger's start date, never lifetime listening.
+        assert caption.startswith("4 plays since 2026-03-02 · grows via /listen-sync")
         assert "floor estimates" in caption
+        assert "gaps while tunr closed" in caption
 
     def test_empty_ledger(self, empty_cli):
         rows, caption = plays_data(empty_cli, "all", now=NOW)
         assert rows == []
+        assert caption.startswith("0 plays since —")
         assert "gaps while tunr closed" in caption
 
 
@@ -395,7 +471,8 @@ class TestDashboardScreen:
             groups_by_tab[tab] = {d["group"] for _, _, d in rows}
         assert groups_by_tab["taste"] == {"moods", "genres"}
         assert groups_by_tab["stats"] == {"decades", "coverage"}
-        assert groups_by_tab["plays"] == {"tracks", "clock"}
+        # A 4-play ledger has earned no clock/day-bar panels — tracks only.
+        assert groups_by_tab["plays"] == {"tracks"}
 
     def test_per_tab_empty_states(self):
         messages = DashboardScreen.EMPTY_MESSAGES

@@ -125,10 +125,51 @@ class TestShowTaste:
         assert "Distinct artists" in out
 
     def test_prefers_recent_plays_when_present(self, tmp_path, capsys):
+        from main import TASTE_SEED_FLOOR
+
         cli = _seed(tmp_path, with_listens=True)
+        # The plays seed only wins at TASTE_SEED_FLOOR embedded tracks — pad
+        # the played-and-embedded population past it.
+        conn = cli.repos.conn
+        for i in range(TASTE_SEED_FLOOR):
+            tid = f"filler|||track {i}"
+            conn.execute("INSERT OR IGNORE INTO artists (artist_id, name) VALUES ('filler','F')")
+            conn.execute(
+                "INSERT INTO tracks (track_id, name, artist_id, status) "
+                "VALUES (?, ?, 'filler', 'candidate')",
+                (tid, f"Track {i}"),
+            )
+            vec = [1.0, 0.1 * i, 0.0, 0.0]
+            conn.execute(
+                "INSERT INTO track_embeddings "
+                "(track_id, model_name, embedding_blob, embedding_dim, embedding_norm) "
+                "VALUES (?, 'all-mpnet-base-v2', ?, 4, ?)",
+                (tid, encode_vector(vec), vector_norm(vec)),
+            )
+            conn.execute(
+                "INSERT INTO listen_events (event_id, track_id, played_at, source) "
+                "VALUES (?, ?, ?, 'recently_played')",
+                (f"fill{i}", tid, f"2026-05-2{i % 10}T00:00:00Z"),
+            )
+        conn.commit()
         cli.show_taste(top=4)
         out = capsys.readouterr().out
         assert "recent plays" in out  # listen_events takes priority over rotation
+
+    def test_starved_plays_seed_falls_back_and_discloses(self, tmp_path, capsys):
+        """The live-data regression: a handful of embedded plays (below
+        TASTE_SEED_FLOOR) must NOT bail /taste out with 'not enough embedded
+        tracks' — it falls through to rotation and says why."""
+        from main import TASTE_SEED_FLOOR
+
+        cli = _seed(tmp_path, with_listens=True)  # 4 embedded plays < floor
+        assert len(EMB) < TASTE_SEED_FLOOR
+        payload = cli.show_taste(top=4)
+        out = capsys.readouterr().out
+        assert payload is not None
+        assert payload["source"] == "your rotation"
+        assert "Recent plays carry too few embedded tracks" in out
+        assert "Not enough embedded tracks" not in out
 
     def test_too_few_tracks_message(self, tmp_path, capsys):
         db = Database(tmp_path / "sparse.db")

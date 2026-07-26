@@ -15,12 +15,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from main import PlaylistCLI
+from main import PlaylistCLI, spotify_track_url
 from results_screen import (
     MAX_FIELD_CHARS,
     ResultsAction,
     ResultsScreen,
     prefill_for_item,
+    resolve_spotify_url,
     results_for_browse,
     rows_for_table,
     spotify_url_for_item,
@@ -206,6 +207,68 @@ class TestSpotifyUrlForTrack:
         assert self._cli(None).spotify_url_for_track("a|||b") == ""
         assert self._cli({"spotify_id": None}).spotify_url_for_track("a|||b") == ""
         assert self._cli({"spotify_id": "x"}).spotify_url_for_track("") == ""
+
+
+class TestSpotifyTrackUrlNormalizer:
+    """main.spotify_track_url — the pure tracks.spotify_id -> URL normalizer
+    shared by spotify_url_for_track and every linked track table."""
+
+    def test_bare_id(self):
+        assert (
+            spotify_track_url("3n3Ppam7vgaVa1iaRUc9Lp")
+            == "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp"
+        )
+
+    def test_track_uri(self):
+        assert spotify_track_url("spotify:track:abc") == "https://open.spotify.com/track/abc"
+
+    def test_http_url_passthrough(self):
+        assert spotify_track_url("https://open.spotify.com/track/z") == (
+            "https://open.spotify.com/track/z"
+        )
+
+    def test_non_track_uri_rejected(self):
+        assert spotify_track_url("spotify:album:zzz") == ""
+        assert spotify_track_url("spotify:track:") == ""
+
+    def test_empty_and_none(self):
+        assert spotify_track_url("") == ""
+        assert spotify_track_url(None) == ""
+        assert spotify_track_url("  ") == ""
+
+
+class TestResolveSpotifyUrl:
+    """The offline row-url resolution the browser table/detail/`o` share."""
+
+    def test_cached_row_wins_over_db(self):
+        cli = _stub_cli(url="https://open.spotify.com/track/from-db")
+        item = {"spotify_uri": "spotify:track:cached"}
+        assert resolve_spotify_url(cli, item) == "https://open.spotify.com/track/cached"
+
+    def test_db_fallback_when_row_has_no_url(self):
+        cli = _stub_cli(url="https://open.spotify.com/track/from-db")
+        item = {"song": "Aligned", "artist": "Result Artist"}
+        assert resolve_spotify_url(cli, item) == "https://open.spotify.com/track/from-db"
+
+    def test_empty_when_nobody_knows(self):
+        cli = _stub_cli(url="")
+        assert resolve_spotify_url(cli, {"song": "A", "artist": "B"}) == ""
+
+    def test_failing_db_lookup_degrades_to_empty(self):
+        def _boom(track_id):
+            raise RuntimeError("db unavailable")
+
+        cli = _stub_cli()
+        cli.spotify_url_for_track = _boom
+        assert resolve_spotify_url(cli, {"song": "A", "artist": "B"}) == ""
+
+    def test_unresolvable_track_id_skips_the_lookup(self):
+        calls = []
+
+        cli = _stub_cli()
+        cli.spotify_url_for_track = lambda track_id: calls.append(track_id) or "https://x"
+        assert resolve_spotify_url(cli, {"song": "OnlyASong"}) == ""
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -674,3 +737,104 @@ class TestResultsMetaCommand:
         app = _make_app(monkeypatch)
         app._handle_command("/help results")
         assert "Browse the last /search or /find results" in _logged_text(app)
+
+
+# ---------------------------------------------------------------------------
+# Clickable Spotify links: the song cell and the detail headline carry an
+# OSC 8 hyperlink when a Spotify identity resolves — visible text unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _link_urls(text):
+    """Every URL carried by a Rich Text's link spans."""
+    return [
+        span.style.link
+        for span in text.spans
+        if not isinstance(span.style, str) and span.style.link
+    ]
+
+
+class TestRowLinksPilot:
+    URL = "https://open.spotify.com/track/abc"
+
+    def test_song_cell_and_detail_headline_carry_hyperlink(self):
+        from rich.text import Text as RichText
+        from textual.coordinate import Coordinate
+        from textual.widgets import DataTable, Static
+
+        cli = _stub_cli(results=[dict(r) for r in RESULTS], url=self.URL)
+
+        async def drive():
+            app = _smoke_app()
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = ResultsScreen(cli)
+                await app.push_screen(screen)
+                await pilot.pause()
+                table = screen.query_one(DataTable)
+                # Columns: selection marker, #, song, ... — song is index 2.
+                cell = table.get_cell_at(Coordinate(0, 2))
+                assert isinstance(cell, RichText)
+                assert cell.plain == "Aligned"  # visible text is JUST the name
+                assert _link_urls(cell) == [self.URL]
+                # The detail headline (set by on_mount's _show_detail) is the
+                # same link; its visible text still identifies the track.
+                detail = screen.query_one("#results_detail", Static).content
+                assert isinstance(detail, RichText)
+                assert detail.plain.startswith("Aligned — Result Artist")
+                assert self.URL in _link_urls(detail)
+                await pilot.press("escape")
+                await pilot.pause()
+
+        _drive(drive())
+
+    def test_rows_without_spotify_identity_render_plain(self):
+        from textual.coordinate import Coordinate
+        from textual.widgets import DataTable
+
+        cli = _stub_cli(results=[dict(r) for r in RESULTS], url="")
+
+        async def drive():
+            app = _smoke_app()
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = ResultsScreen(cli)
+                await app.push_screen(screen)
+                await pilot.pause()
+                assert screen.row_urls == ["", "", ""]
+                cell = screen.query_one(DataTable).get_cell_at(Coordinate(0, 2))
+                # No identity -> the pure rows_for_table string, no link wrap.
+                assert cell == "Aligned"
+                await pilot.press("escape")
+                await pilot.pause()
+
+        _drive(drive())
+
+    def test_link_never_leaks_into_rendered_plain_text(self):
+        """The results-table pin: rendering the linked song cell to a
+        non-terminal console yields the bare name — the URL and the OSC 8
+        codes are style, never literal text."""
+        from io import StringIO
+
+        from rich.console import Console
+        from textual.coordinate import Coordinate
+        from textual.widgets import DataTable
+
+        cli = _stub_cli(results=[dict(r) for r in RESULTS], url=self.URL)
+        rendered = {}
+
+        async def drive():
+            app = _smoke_app()
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = ResultsScreen(cli)
+                await app.push_screen(screen)
+                await pilot.pause()
+                rendered["cell"] = screen.query_one(DataTable).get_cell_at(Coordinate(0, 2))
+                await pilot.press("escape")
+                await pilot.pause()
+
+        _drive(drive())
+        buf = StringIO()
+        Console(file=buf, width=80, force_terminal=False).print(rendered["cell"])
+        out = buf.getvalue()
+        assert "Aligned" in out
+        assert self.URL not in out
+        assert "\x1b]8" not in out

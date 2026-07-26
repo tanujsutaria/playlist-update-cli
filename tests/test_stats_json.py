@@ -205,11 +205,18 @@ class TestStatsDashboardRendering:
         cli.show_stats()
         out = _flat(capsys.readouterr().out)
         assert "Database Stats" in out  # the pinned classic table stays
+        assert "The data, scoped" in out  # scope tiles precede any share claim
+        assert "curated core" in out
+        assert "library mirror" in out
+        # No ledger in this fixture: the plays scope says how to start one.
+        assert "plays · none yet — /listen-sync starts the ledger" in out
         assert "Data Coverage" in out
+        assert "of the 4-track library mirror" in out  # the panel names its denominator
         assert "1/4" in out  # embeddings coverage
-        assert "grey = not there yet · sonic comes from AcousticBrainz lookups" in out
+        assert "grey = not there yet · /enrich grows context+embeddings · sonic via /sonic" in out
         assert "Backfill queue" in out
         assert "embeddings missing" in out
+        assert "a curation runway, not a processing queue" in out
         assert "no AcousticBrainz match; never inferred" in out
 
     def test_sound_section_gated_below_ten_sonic_rows(self, tmp_path, capsys):
@@ -230,6 +237,8 @@ class TestStatsDashboardRendering:
         cli.show_stats()
         out = _flat(capsys.readouterr().out)
         assert "Library DNA" in out
+        # Scope rides the section rule; provenance gets its own caption line.
+        assert "curated core · 6 enriched tracks" in out
         assert "tags from /enrich web context — semantic, not acoustic" in out
 
     def test_era_caption_examples_quoted_apostrophe_proof(self, tmp_path, capsys):
@@ -279,8 +288,10 @@ class TestStatsDashboardRendering:
         payload = cli.show_stats()
         out = _flat(capsys.readouterr().out)
         assert "The sound, measured" in out
-        assert "Tempo distribution · 12/12 tracks (AcousticBrainz)" in out
-        assert "median 120 BPM" in out
+        # The denominator is the SONIC scope (tracks measured), never the
+        # library mirror — the caption names how the mirror relates.
+        assert "Tempo distribution · 12/12 sonic tracks (AcousticBrainz)" in out
+        assert "median 120 BPM · sonic scope: 12 of 12 mirror tracks measured" in out
         assert "Common keys: A major (12)" in out
         assert payload["sonic"] == {
             "tracks": 12,
@@ -315,7 +326,7 @@ class TestStatsDashboardRendering:
         cli = _cli_over(conn)
         payload = cli.show_stats()
         out = _flat(capsys.readouterr().out)
-        assert "Tempo distribution · 12/14 tracks (AcousticBrainz)" in out
+        assert "Tempo distribution · 12/14 sonic tracks (AcousticBrainz)" in out
         assert "2 tracks without AB tempo excluded" in out
         assert payload["sonic"]["tracks"] == 14
         assert payload["sonic"]["bpm_tracks"] == 12

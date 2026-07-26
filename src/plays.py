@@ -108,6 +108,32 @@ def top_played(
     ]
 
 
+def daily_counts(
+    conn: sqlite3.Connection,
+    since: Optional[str] = None,
+) -> List[Tuple[str, int]]:
+    """Plays per UTC calendar day: ``[('2026-07-24', 12), …]`` ascending by day.
+
+    The day is the ``played_at`` date prefix (UTC — the stored form), the play
+    rule applies, and days with zero plays simply don't appear (the ledger has
+    gaps while tunr is closed; fabricating zero-days would imply coverage).
+    Events without a ``played_at`` are skipped.
+    """
+    clause, params = _since_clause(since)
+    rows = conn.execute(
+        f"""
+        SELECT substr(played_at, 1, 10) AS day, COUNT(*) AS plays
+        FROM listen_events
+        WHERE {_PLAY_PREDICATE}{clause}
+          AND played_at IS NOT NULL AND length(played_at) >= 10
+        GROUP BY day
+        ORDER BY day ASC;
+        """,
+        params,
+    ).fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
 def _played_at_values(conn: sqlite3.Connection, since: Optional[str]) -> List[Optional[str]]:
     clause, params = _since_clause(since)
     rows = conn.execute(

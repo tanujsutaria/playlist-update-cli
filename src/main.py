@@ -28,8 +28,17 @@ from nextgen.enrich import enrich_tracks
 from nextgen.pipeline import SearchPipeline, SearchResult
 from nextgen.providers import ProviderConfigError
 from nextgen.scoring import SearchScoreConfig
-from plays import PLAY_MS_THRESHOLD
+from plays import PLAY_MS_THRESHOLD, plays_meta
 from rotation_manager import RotationManager
+from scopes import (
+    LibraryScopes,
+    curated_scope_caption,
+    fmt_n,
+    library_scopes,
+    mirror_scope_caption,
+    plays_scope_caption,
+    scopes_payload,
+)
 from scoring import PlaylistScoreConfig
 from song_store import SongStore
 from spotify_manager import (
@@ -62,6 +71,7 @@ from taste_facets import (
 from ui import (
     FILL_STYLE,
     MARKER_STYLE,
+    ColumnSpec,
     bar_chart,
     caption,
     chart_panel,
@@ -79,6 +89,7 @@ from ui import (
     insight,
     json_output,
     key_value_table,
+    link_text,
     lollipop,
     notice,
     preview_table,
@@ -119,6 +130,27 @@ def format_count(value: float) -> str:
 _METRIC_LABELS = {"monthly_listeners": "Listeners", "similarity": "Sim"}
 
 
+def spotify_track_url(raw: Optional[str]) -> str:
+    """Offline: a stored ``tracks.spotify_id`` value -> an open.spotify.com URL.
+
+    Accepts the three shapes the column actually holds — a full http(s) URL,
+    a ``spotify:track:...`` URI, or a bare track id — and returns "" for
+    anything else (album/playlist URIs, empty values), so callers can feed
+    the result straight to ``link_text`` unguarded. Pure; never the network.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("http"):
+        return raw
+    if raw.startswith("spotify:track:"):
+        tail = raw.split(":")[-1]
+        return f"https://open.spotify.com/track/{tail}" if tail else ""
+    if ":" not in raw and "/" not in raw:
+        return f"https://open.spotify.com/track/{raw}"
+    return ""
+
+
 def _metric_label(name: str) -> str:
     return _METRIC_LABELS.get(name, name.replace("_", " ").title())
 
@@ -151,18 +183,24 @@ def _coverage_and_backfill(conn: Any) -> Tuple[Dict[str, Dict[str, int]], Dict[s
     return coverage, backfill
 
 
-def _render_backfill_runway(backfill: Dict[str, int]) -> None:
+def _render_backfill_runway(
+    backfill: Dict[str, int], scopes: Optional[LibraryScopes] = None
+) -> None:
     """Render the backfill gaps + per-gap remedies block (shared by /profile
     and /status), from a ``_coverage_and_backfill`` gap dict.
 
-    Sonic is deliberately excluded from any "complete" claim — AcousticBrainz
-    coverage is partial by nature and never inferred. Remedies are per-gap:
-    /enrich closes context+embedding gaps only; sonic comes from /sonic;
-    spotify ids resolve when tracks are re-matched, not via /enrich.
+    Gap counts are mirror-scoped (they come from ``total - have`` over all
+    live tracks), so when ``scopes`` shows a mirror that dwarfs the curated
+    core the panel leads with that scope truth: the raw mirror is unenriched
+    BY DESIGN — a curation runway, not a processing queue. Sonic is
+    deliberately excluded from any "complete" claim — AcousticBrainz coverage
+    is partial by nature and never inferred. Remedies are per-gap: /enrich
+    closes context+embedding gaps only; sonic comes from /sonic; spotify ids
+    resolve when tracks are re-matched, not via /enrich.
     """
     gap_parts: List[str] = []
     if backfill["missing_embeddings"]:
-        gap_parts.append(f"{backfill['missing_embeddings']} tracks awaiting embeddings")
+        gap_parts.append(f"{backfill['missing_embeddings']} not yet embedded")
     if backfill["missing_context"]:
         gap_parts.append(f"{backfill['missing_context']} unenriched")
     if backfill["missing_sonic"]:
@@ -190,11 +228,19 @@ def _render_backfill_runway(backfill: Dict[str, int]) -> None:
         remedies.append("/sonic fetches AcousticBrainz features (partial by nature)")
     if backfill["missing_spotify_id"]:
         remedies.append("spotify ids resolve on the next playlist match")
+    lines: List[Text] = []
+    if scopes is not None and 0 < scopes.curated < scopes.mirror:
+        lines.append(
+            Text(
+                f"curated core {fmt_n(scopes.curated)} of {fmt_n(scopes.mirror)} mirror "
+                "tracks — the raw mirror is unenriched by design, not a queue",
+                style="dim",
+            )
+        )
+    lines.append(Text(" · ".join(gap_parts)))
+    lines.append(Text(" · ".join(remedies), style="dim"))
     ink_panel(
-        Group(
-            Text(" · ".join(gap_parts)),
-            Text(" · ".join(remedies), style="dim"),
-        ),
+        Group(*lines),
         title="Backfill runway",
     )
 
@@ -266,6 +312,13 @@ def _month_label(month: str) -> str:
 
 # Spelled-out wave counts for the ingest-history line (only fires at <= 4 waves).
 _WAVE_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
+
+# The recent-plays taste seed must carry at least this many EMBEDDED tracks
+# to define taste; below it, /taste falls through to rotation/library rather
+# than profiling a starved handful (see `PlaylistCLI._taste_seed`). A
+# threshold, not hardcoded smallness: the seed upgrades itself as
+# /listen-sync plays accrue embeddings via /enrich.
+TASTE_SEED_FLOOR = 10
 
 
 def configure_logging(handler: Optional[logging.Handler] = None) -> None:
@@ -816,6 +869,7 @@ class PlaylistCLI:
             if not total_tracks:
                 notice("No tracks in your library yet. Try /ingest or /search to add some.")
                 return {
+                    "scopes": scopes_payload(library_scopes(conn)),
                     "tracks": 0,
                     "artists": 0,
                     "rotated": 0,
@@ -846,34 +900,56 @@ class PlaylistCLI:
                 "c"
             ]
             never = total_tracks - rotated
+            scopes = library_scopes(conn)
 
-            def _pct(part: int) -> str:
-                return f"{part} ({part / total_tracks * 100:.0f}%)"
-
-            section("Library Profile")
-            key_value_table(
+            # Scope tiles, not a stat table: the first thing the profile says
+            # is WHICH populations exist (single-number stories -> stat tiles).
+            section("Library Profile", mirror_scope_caption(scopes))
+            stat_cards(
                 [
-                    ["Tracks", total_tracks],
-                    ["Artists", total_artists],
-                    ["Rotated at least once", _pct(rotated)],
-                    ["Never rotated", _pct(never)],
-                    ["Rotation generations", generations],
-                ]
+                    ("library mirror", fmt_n(scopes.mirror), "raw /pull import"),
+                    ("curated core", fmt_n(scopes.curated), "/enrich grows it"),
+                    ("artists", fmt_n(total_artists), "library mirror"),
+                    ("rotated", fmt_n(rotated), f"{generations} generations"),
+                ],
+                width=22,
             )
             # Rotation runway: played vs crate as one stacked bar — the grey
             # remainder IS the never-rotated mass, drawn, never hidden.
-            # Sized to stay one line at an 80-col console (label 19 + bar 26 +
-            # detail ≤ 33 cells).
+            # Denominator honesty: rotation history predates the mirror import
+            # and draws from curated tracks, so the runway is scoped to the
+            # CURATED CORE whenever one exists — 180 rotated vs a 15k mirror
+            # would be an invisible sliver implying rotation starves. Sized to
+            # stay one line at a ~100-col console.
+            if scopes.curated:
+                rotated_pool = conn.execute(
+                    "SELECT COUNT(DISTINCT gt.track_id) AS c FROM generation_tracks gt "
+                    "JOIN track_context tc ON tc.track_id = gt.track_id"
+                ).fetchone()["c"]
+                pool, pool_label = scopes.curated, "curated core"
+            else:
+                rotated_pool, pool, pool_label = rotated, total_tracks, "library"
+            crate = pool - rotated_pool
+            pool_word = "curated" if pool_label == "curated core" else "library"
             text_line(
                 Text("  rotation runway  ", style="dim"),
-                stacked_bar([(rotated / total_tracks, FILL_STYLE)], 26),
-                Text(f"  {rotated} played · {never} in the crate", style="dim"),
+                stacked_bar([(rotated_pool / pool, FILL_STYLE)], 26),
+                Text(
+                    f"  {rotated_pool}/{fmt_n(pool)} {pool_word} played · {crate} in the crate",
+                    style="dim",
+                ),
             )
-            if never:
-                info(
-                    f"{never} of your {total_tracks} tracks have never been rotated "
-                    f"— plenty of unused library to draw from."
-                )
+            if crate > 0:
+                if pool_label == "curated core":
+                    info(
+                        f"{crate} curated tracks have never been rotated — room to "
+                        "rotate before reaching into the mirror."
+                    )
+                else:
+                    info(
+                        f"{crate} of your {pool} tracks have never been rotated "
+                        f"— plenty of unused library to draw from."
+                    )
 
             # Artist concentration: how many artists contribute 1/2/3/4+ tracks,
             # plus the top-10 artists' share of the whole library.
@@ -918,7 +994,7 @@ class PlaylistCLI:
                 )
                 caption(
                     f"your top 10 artists hold {top10_tracks} tracks — "
-                    f"{top10_share_pct:.1f}% of the library "
+                    f"{top10_share_pct:.1f}% of the {fmt_n(total_tracks)}-track library mirror "
                     f"· {_concentration_verdict(top10_share_pct)}"
                 )
 
@@ -935,7 +1011,7 @@ class PlaylistCLI:
                 (top,),
             ).fetchall()
             if artist_rows:
-                section("Top artists", f"by track count (top {len(artist_rows)})")
+                section("Top artists", f"by track count · library mirror (top {len(artist_rows)})")
                 bar_chart(
                     [display_name(r["name"]) for r in artist_rows],
                     [r["c"] for r in artist_rows],
@@ -982,6 +1058,10 @@ class PlaylistCLI:
             if months:
                 section("Ingest history")
                 bar_chart([m for m, _ in months], [n for _, n in months], width=24)
+                caption(
+                    "tracks first seen per month · library mirror — "
+                    "/pull mirror imports land here too"
+                )
                 # "Waves" phrasing only while the history really is a handful of
                 # batches — beyond that, the chart speaks for itself.
                 if distinct_months == 1:
@@ -996,9 +1076,10 @@ class PlaylistCLI:
             # Backfill runway: the same JOIN-counted gaps /stats reports,
             # rendered by the helper /status shares.
             coverage, backfill = _coverage_and_backfill(conn)
-            _render_backfill_runway(backfill)
+            _render_backfill_runway(backfill, scopes)
 
             return {
+                "scopes": scopes_payload(scopes),
                 "tracks": total_tracks,
                 "artists": total_artists,
                 "rotated": rotated,
@@ -1034,8 +1115,16 @@ class PlaylistCLI:
         """Return (rows, source_label) of embedded tracks that define current taste.
 
         Prefers real listening (listen_events), falls back to rotation membership,
-        then the whole library. Uses JOINs (not Python IN-lists) so it stays correct
-        even when the seed is the full corpus (past SQLite's bound-variable limit).
+        then the whole library. The plays seed only wins with at least
+        ``TASTE_SEED_FLOOR`` embedded tracks: recent plays are mostly raw
+        library-mirror rows without embeddings, so the plays∩embeddings JOIN
+        can be a handful of tracks — too starved to define taste while a
+        thousand-track embedded core sits below it (the pre-floor behavior
+        collapsed /taste to "not enough embedded tracks (2)"). Rotation is
+        deliberate curation and is never mirror-starved, so any non-empty
+        rotation seed still wins over the library average. Uses JOINs (not
+        Python IN-lists) so it stays correct even when the seed is the full
+        corpus (past SQLite's bound-variable limit).
         """
         conn = self.repos.conn
         if conn.execute("SELECT 1 FROM listen_events LIMIT 1").fetchone():
@@ -1044,7 +1133,7 @@ class PlaylistCLI:
                 "FROM track_embeddings te JOIN listen_events le ON le.track_id = te.track_id "
                 "GROUP BY te.track_id ORDER BY MAX(le.played_at) DESC LIMIT 200"
             ).fetchall()
-            if rows:
+            if len(rows) >= TASTE_SEED_FLOOR:
                 return rows, "recent plays"
         if conn.execute("SELECT 1 FROM generation_tracks LIMIT 1").fetchone():
             rows = conn.execute(
@@ -1100,9 +1189,21 @@ class PlaylistCLI:
             if len(seed) < 3:
                 info(
                     f"Not enough embedded tracks ({len(seed)}) to profile your taste yet — "
-                    "try /ingest or /search to add more."
+                    "/enrich embeds tracks as it curates them."
                 )
                 return None
+            # Disclose a starved-and-skipped plays seed: with a raw library
+            # mirror underneath, recent plays often lack embeddings, so the
+            # seed silently falling back to rotation/library needs saying.
+            if (
+                source != "recent plays"
+                and conn.execute("SELECT 1 FROM listen_events LIMIT 1").fetchone()
+            ):
+                notice(
+                    f"Recent plays carry too few embedded tracks to seed taste "
+                    f"(floor: {TASTE_SEED_FLOOR}) — profiling {source} instead; "
+                    "/listen-sync + /enrich grow the plays seed."
+                )
 
             centroid = taste_centroid(vec for _, vec in seed)
             cnorm = vector_norm(centroid) or 1.0
@@ -1358,7 +1459,12 @@ class PlaylistCLI:
                     display_rows.append(cells)
                 return display_rows
 
-            headers = ["#", "Track", "Artist", "Tags"] + (["●"] if show_sonic_col else [])
+            headers = [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Track",
+                "Artist",
+                "Tags",
+            ] + ([ColumnSpec("●", justify="center")] if show_sonic_col else [])
             ranking_caption = "ranked by closeness to your taste centroid · "
             if show_sonic_col:
                 ranking_caption += f"● sonic-informed ({sonic_count}/{len(seed)}) · "
@@ -1811,7 +1917,7 @@ class PlaylistCLI:
         try:
             # Database stats
             db_stats = self.db.get_stats()
-            section("Database Stats")
+            section("Database Stats", "storage · counts the whole library mirror")
             key_value_table(
                 [
                     ["Total songs", db_stats["total_songs"]],
@@ -1976,9 +2082,11 @@ class PlaylistCLI:
             logger.debug("Library extras unavailable; rendering classic stats only.")
             return {}
 
+        scopes = library_scopes(conn)
         payload: Dict[str, Any] = {
             "coverage": coverage,
             "backfill": backfill,
+            "scopes": scopes_payload(scopes),
             "facets": None,
             "decades": None,
             "sonic": None,
@@ -1988,8 +2096,34 @@ class PlaylistCLI:
             notice("Library is empty — /ingest or /search to begin.")
             return payload
 
+        # The data, scoped: which populations exist, before any share is
+        # claimed against them (single-number stories -> stat tiles).
+        meta = plays_meta(conn)
+        counted_plays = int(meta["counted_plays"])
+        plays_since = str(meta["first_played_at"] or "")[:10]
+        payload["plays"] = {
+            "counted_plays": counted_plays,
+            "first_played_at": meta["first_played_at"],
+            "last_played_at": meta["last_played_at"],
+        }
+        section("The data, scoped")
+        stat_cards(
+            [
+                ("curated core", fmt_n(scopes.curated), "enriched tracks"),
+                ("library mirror", fmt_n(scopes.mirror), "raw /pull import"),
+                ("liked", fmt_n(scopes.liked), "spotify hearts"),
+                (
+                    "plays",
+                    fmt_n(counted_plays),
+                    f"since {plays_since}" if plays_since else "run /listen-sync",
+                ),
+            ],
+            width=22,
+        )
+        caption(f"{mirror_scope_caption(scopes)} · {plays_scope_caption(meta['first_played_at'])}")
+
         # Data coverage: the grey segment IS the missing data.
-        section("Data Coverage")
+        section("Data Coverage", f"of the {fmt_n(total)}-track library mirror")
         coverage_panel(
             None,
             [
@@ -1998,7 +2132,7 @@ class PlaylistCLI:
                 ("context", coverage["context"]["have"], total),
                 ("sonic", coverage["sonic"]["have"], total),
             ],
-            caption="grey = not there yet · sonic comes from AcousticBrainz lookups",
+            caption="grey = not there yet · /enrich grows context+embeddings · sonic via /sonic",
         )
 
         # Backfill queue: descriptive, not prescriptive. Sonic is excluded from
@@ -2023,12 +2157,12 @@ class PlaylistCLI:
                     [
                         "embeddings missing",
                         backfill["missing_embeddings"],
-                        "recent ingests awaiting embedding backfill",
+                        "not yet embedded — /enrich embeds as it curates",
                     ],
                     [
                         "context missing",
                         backfill["missing_context"],
-                        "legacy tracks — their embeddings are titles+artists only",
+                        "unenriched — a curation runway, not a processing queue",
                     ],
                     [
                         "sonic missing",
@@ -2038,13 +2172,13 @@ class PlaylistCLI:
                     [
                         "spotify id missing",
                         backfill["missing_spotify_id"],
-                        "recent ingests not yet resolved",
+                        "not yet resolved to spotify",
                     ],
                 ]
                 if row[1]
             ]
             subsection("Backfill queue")
-            table(["gap", "tracks", "note"], queue_rows)
+            table(["gap", ColumnSpec("tracks", metric=True), "note"], queue_rows)
 
         # Library DNA: enriched-facet aggregations over every context row.
         # JOIN-scoped to live tracks — the same doctrine as the coverage
@@ -2075,14 +2209,16 @@ class PlaylistCLI:
             post_2010 = sum(n for d, n in decade_buckets if int(d[:-1]) >= 2010)
             post_2010_pct = post_2010 / datable * 100 if datable else 0.0
 
+            enriched_n = len(ctx_pairs)
+            of_core = f"of {fmt_n(enriched_n)} enriched"
             dna_blocks: List[Tuple[str, List[Tuple[str, int]], Optional[str]]] = []
             if _contributing("genres") >= 5:
                 dna_blocks.append(
-                    ("Genres", genre_counts[:8], f"tracks tagged · {len(genre_counts)} labels")
+                    ("Genres", genre_counts[:8], f"{of_core} · {len(genre_counts)} labels")
                 )
             if _contributing("moods") >= 5:
                 dna_blocks.append(
-                    ("Moods", mood_counts[:8], f"tracks tagged · {len(mood_counts)} distinct")
+                    ("Moods", mood_counts[:8], f"{of_core} · {len(mood_counts)} distinct")
                 )
             extra_blocks: List[Tuple[str, List[Tuple[str, int]], Optional[str]]] = []
             if _contributing("themes") >= 5:
@@ -2090,7 +2226,7 @@ class PlaylistCLI:
                     (
                         "Recurring themes",
                         theme_counts[:8],
-                        f"tracks tagged · {len(theme_counts)} distinct",
+                        f"{of_core} · {len(theme_counts)} distinct",
                     )
                 )
             if _contributing("instrumentation") >= 5:
@@ -2099,9 +2235,12 @@ class PlaylistCLI:
                 )
 
             if dna_blocks or extra_blocks or datable >= 5:
-                # Provenance up front: these tags are /enrich web context,
-                # not Spotify metadata and not audio analysis.
-                section("Library DNA", "tags from /enrich web context — semantic, not acoustic")
+                # Scope on the rule, provenance on its own wrap-safe caption
+                # line: tags are /enrich web context (not Spotify metadata,
+                # not audio analysis), counted over the curated core only —
+                # mirror rows never dilute a facet share.
+                section("Library DNA", curated_scope_caption(scopes))
+                caption("tags from /enrich web context — semantic, not acoustic")
             if dna_blocks:
                 facet_columns(dna_blocks)
                 caption(
@@ -2134,16 +2273,16 @@ class PlaylistCLI:
                         candidate = f"{era_caption} ({shown}, ...)"
                         if len(candidate) <= 70:
                             era_caption = candidate
-                chart_panel("When your library lives", decade_buckets, caption=era_caption)
+                chart_panel("When your curated core lives", decade_buckets, caption=era_caption)
                 if datable >= 50:
                     if post_2010_pct >= 50:
                         info(
-                            f"Your library skews {post_2010_pct:.0f}% post-2010 "
+                            f"Your curated core skews {post_2010_pct:.0f}% post-2010 "
                             f"({post_2010} of {datable} datable tracks)."
                         )
                     else:
                         info(
-                            f"Your library skews {100 - post_2010_pct:.0f}% pre-2010 "
+                            f"Your curated core skews {100 - post_2010_pct:.0f}% pre-2010 "
                             f"({datable - post_2010} of {datable} datable tracks)."
                         )
 
@@ -2186,14 +2325,17 @@ class PlaylistCLI:
                 # len(vecs): sonic rows without an AB tempo are excluded from
                 # the buckets, so they must be excluded from the claim too.
                 no_tempo = len(vecs) - len(bpms)
-                tempo_caption = f"median {median_bpm} BPM"
+                tempo_caption = (
+                    f"median {median_bpm} BPM · sonic scope: "
+                    f"{len(vecs)} of {fmt_n(total)} mirror tracks measured"
+                )
                 if no_tempo:
                     tempo_caption += (
                         f" · {no_tempo} track{'s' if no_tempo != 1 else ''} "
                         "without AB tempo excluded"
                     )
                 chart_panel(
-                    f"Tempo distribution · {len(bpms)}/{total} tracks (AcousticBrainz)",
+                    f"Tempo distribution · {len(bpms)}/{len(vecs)} sonic tracks (AcousticBrainz)",
                     [(f"{lo}–{lo + 19}", n) for lo, n in histogram],
                     caption=tempo_caption,
                 )
@@ -2713,7 +2855,14 @@ class PlaylistCLI:
             ]
 
         if live_mode == "compact":
-            live_base_headers = ["#", "Song", "Artist", "Score", "Strict", "Sources"]
+            live_base_headers: List[object] = [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Song",
+                "Artist",
+                ColumnSpec("Score", metric=True),
+                ColumnSpec("Strict", metric=True),
+                ColumnSpec("Sources", metric=True),
+            ]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
                 return [
@@ -2727,15 +2876,15 @@ class PlaylistCLI:
 
         else:
             live_base_headers = [
-                "#",
+                ColumnSpec("#", justify="right", style="dim"),
                 "Song",
                 "Artist",
                 "Year",
-                "Score",
-                "Strict",
+                ColumnSpec("Score", metric=True),
+                ColumnSpec("Strict", metric=True),
                 "Status",
-                "Providers",
-                "Sources",
+                ColumnSpec("Providers", metric=True),
+                ColumnSpec("Sources", metric=True),
             ]
 
             def _live_row(item: SearchResult, rank: int) -> List[object]:
@@ -2752,7 +2901,11 @@ class PlaylistCLI:
                 ] + _metric_cells(item)
 
         def _live_headers() -> List[object]:
-            return list(live_base_headers) + [_metric_label(m) for m in _requested_metrics()]
+            # Metric cells arrive pre-styled from _metric_cell (Text passthrough);
+            # the spec only right-aligns the column.
+            return list(live_base_headers) + [
+                ColumnSpec(_metric_label(m), justify="right") for m in _requested_metrics()
+            ]
 
         def _page_slice(rows: List[List[object]]) -> List[List[object]]:
             start = (live_page - 1) * live_page_size
@@ -2840,7 +2993,11 @@ class PlaylistCLI:
         # grows one column per requested metric — the values the constraint
         # filter actually enforced, styled by _metric_cell.
         requested_metrics = _requested_metrics()
-        metric_headers = [_metric_label(m) for m in requested_metrics]
+        # Pre-styled Text cells (see _metric_cell) pass through; the specs
+        # right-align the numeric columns.
+        metric_headers: List[object] = [
+            ColumnSpec(_metric_label(m), justify="right") for m in requested_metrics
+        ]
         rows = []
         for idx, item in enumerate(results, 1):
             rows.append(
@@ -2862,17 +3019,24 @@ class PlaylistCLI:
             )
 
         headers = [
-            "#",
+            ColumnSpec("#", justify="right", style="dim"),
             "Song",
             "Artist",
             "Year",
-            "Score",
-            "Strict",
+            ColumnSpec("Score", metric=True),
+            ColumnSpec("Strict", metric=True),
             "Status",
-            "Providers",
-            "Sources",
+            ColumnSpec("Providers", metric=True),
+            ColumnSpec("Sources", metric=True),
         ] + metric_headers
-        compact_headers = ["#", "Song", "Artist", "Score", "Strict", "Status"] + metric_headers
+        compact_headers = [
+            ColumnSpec("#", justify="right", style="dim"),
+            "Song",
+            "Artist",
+            ColumnSpec("Score", metric=True),
+            ColumnSpec("Strict", metric=True),
+            "Status",
+        ] + metric_headers
 
         def _compact_rows() -> List[List[object]]:
             # Base full-row layout is 9 cells; metric cells start at index 9.
@@ -3529,7 +3693,12 @@ class PlaylistCLI:
                 removed_rows.append(
                     [
                         idx,
-                        track.get("name") or track_id,
+                        # Visible text unchanged; a Spotify identity adds an
+                        # OSC 8 hyperlink (terminals without it show the name).
+                        link_text(
+                            track.get("name") or track_id,
+                            spotify_track_url(track.get("spotify_id")),
+                        ),
                         artist_name or "",
                         added_at.isoformat() if added_at else "",
                         played_at.isoformat() if played_at else "",
@@ -3552,7 +3721,17 @@ class PlaylistCLI:
                     ]
                 )
             if added_rows:
-                table(["#", "Song", "Artist", "Spotify ID"], added_rows)
+                table(
+                    [
+                        ColumnSpec("#", justify="right", style="dim"),
+                        # The row carries its Spotify id in column 3 — the song
+                        # name links to it, visible text unchanged.
+                        ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
+                        "Artist",
+                        "Spotify ID",
+                    ],
+                    added_rows,
+                )
         else:
             warning("Failed to update playlist.")
 
@@ -3686,17 +3865,7 @@ class PlaylistCLI:
         except Exception as exc:
             logger.debug("spotify_url_for_track lookup failed for %s: %s", track_id, exc)
             return ""
-        raw = (record or {}).get("spotify_id") or ""
-        if not raw:
-            return ""
-        url = self._spotify_url_from_uri(raw)
-        if url == raw and not raw.startswith("http"):
-            # Bare Spotify track id (no scheme/URI prefix) — build the URL
-            # directly; anything else unrecognized is not a usable link.
-            if ":" not in raw and "/" not in raw:
-                return f"https://open.spotify.com/track/{raw}"
-            return ""
-        return url
+        return spotify_track_url((record or {}).get("spotify_id"))
 
     def _obscurity_mode(self) -> str:
         mode = (os.getenv("OBSCURITY_VALIDATION_MODE") or "strict").lower()
@@ -4569,7 +4738,7 @@ class PlaylistCLI:
         if tracks == 0:
             notice("Library is empty — /ingest, /pull, or /search to begin.")
         else:
-            _render_backfill_runway(backfill)
+            _render_backfill_runway(backfill, library_scopes(conn))
         if listen_events == 0:
             notice(
                 "Listen history is empty — /listen-sync polls recent plays; "
@@ -4904,7 +5073,15 @@ def _handle_find(cli: "PlaylistCLI", args: Any) -> int:
     section("Find", cli.last_search_query)
     info(f"Blend: {round(weight * 100)}% taste · {round((1 - weight) * 100)}% relevance — {signal}")
     table(
-        ["#", "Song", "Artist", "Year", "Rel", "Taste", "Blend"],
+        [
+            ColumnSpec("#", justify="right", style="dim"),
+            "Song",
+            "Artist",
+            "Year",
+            ColumnSpec("Rel", metric=True),
+            ColumnSpec("Taste", metric=True),
+            ColumnSpec("Blend", metric=True),
+        ],
         [
             [
                 i,
@@ -5048,7 +5225,14 @@ def _present_debug_last_search(payload: dict) -> None:
             track = candidate.get("track") or {}
             artist_label = track.get("artist_name") or track.get("artist_id") or ""
             label = f"{track.get('name', '')} — {artist_label}".strip(" —")
-            preview_rows.append([idx, label, candidate.get("track_id") or ""])
+            preview_rows.append(
+                [
+                    idx,
+                    # Visible label unchanged; a known Spotify id adds a hyperlink.
+                    link_text(label, spotify_track_url(track.get("spotify_id"))),
+                    candidate.get("track_id") or "",
+                ]
+            )
         subsection("Top Results (IDs)")
         table(["#", "Track", "Track ID"], preview_rows)
 
