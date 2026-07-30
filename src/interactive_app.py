@@ -146,6 +146,9 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "backup",
             "restore",
             "restore-previous-rotation",
+            "add",
+            "remove",
+            "move",
         ],
     ),
     ("Discover", ["find", "search", "results"]),
@@ -998,7 +1001,10 @@ class PlaylistInteractiveApp(App):
         * update (without --dry-run) — rewrites the real Spotify playlist;
         * rotate / rotate-played — modify the real playlist (no dry-run mode);
         * sync — adds AND removes real-playlist tracks to mirror the db;
-        * clean (without --dry-run) — permanently deletes rows from the db.
+        * clean (without --dry-run) — permanently deletes rows from the db;
+        * remove / move — take tracks out of a real playlist (via
+          playlist_remove_all_occurrences_of_items, so ALL duplicate
+          occurrences vanish; the /undo snapshot restores them).
 
         Deliberately NOT gated: undo and restore-previous-rotation (recovery
         commands whose whole purpose is reverting a bad write — friction
@@ -1037,6 +1043,18 @@ class PlaylistInteractiveApp(App):
             return (
                 "Permanently remove dead or over-popular songs from the local "
                 "database? (/clean --dry-run previews the removals.)"
+            )
+        if command == "remove":
+            return (
+                "Remove the matched track from Spotify playlist "
+                f"'{getattr(args, 'from_playlist', '')}'? ALL duplicate occurrences "
+                "vanish (the /undo snapshot restores them)."
+            )
+        if command == "move":
+            return (
+                f"Move the matched track from '{getattr(args, 'from_playlist', '')}' "
+                f"to '{getattr(args, 'to_playlist', '')}'? Both live playlists are "
+                "modified (/undo twice reverts both)."
             )
         return None
 
