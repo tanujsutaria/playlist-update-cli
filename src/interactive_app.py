@@ -996,7 +996,9 @@ class PlaylistInteractiveApp(App):
         * restore — replaces the entire live data/ directory with a backup;
         * auth-reset — deletes the cached Spotify token file;
         * update (without --dry-run) — rewrites the real Spotify playlist;
-        * rotate / rotate-played — modify the real playlist (no dry-run mode);
+        * rotate / rotate-played (without --dry-run) — modify the real
+          playlist (the legacy alias has no --dry-run flag, so it always
+          gates);
         * sync — adds AND removes real-playlist tracks to mirror the db;
         * clean (without --dry-run) — permanently deletes rows from the db.
 
@@ -1023,10 +1025,10 @@ class PlaylistInteractiveApp(App):
                 f"Apply a fresh selection to Spotify playlist '{playlist}'? "
                 "This rewrites the live playlist (use --dry-run to preview)."
             )
-        if command in ("rotate", "rotate-played"):
+        if command in ("rotate", "rotate-played") and not getattr(args, "dry_run", False):
             return (
                 f"Rotate played tracks out of Spotify playlist '{playlist}'? "
-                "This modifies the live playlist."
+                "This modifies the live playlist (use --dry-run to preview)."
             )
         if command == "sync":
             return (
