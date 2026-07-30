@@ -534,6 +534,11 @@ class TestEnrichCommand:
         assert args.limit == 25
         assert args.dry_run is False
         assert args.concurrency == 8
+        # No cohort flag = whole-library (today's behavior).
+        assert args.played is False
+        assert args.liked is False
+        assert args.rotation is False
+        assert args.playlist is None
 
     def test_parse_enrich_flags(self):
         parser = setup_parsers()
@@ -541,6 +546,30 @@ class TestEnrichCommand:
         assert args.limit == 100
         assert args.dry_run is True
         assert args.concurrency == 16
+
+    def test_parse_enrich_cohort_flags(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["enrich", "--played"]).played is True
+        assert parser.parse_args(["enrich", "--liked"]).liked is True
+        assert parser.parse_args(["enrich", "--rotation"]).rotation is True
+        assert parser.parse_args(["enrich", "--playlist", "My Mix"]).playlist == "My Mix"
+
+    def test_parse_enrich_cohorts_mutually_exclusive(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--played", "--liked"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--rotation", "--playlist", "My Mix"])
+
+    def test_parse_enrich_playlist_requires_name(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--playlist"])
+
+    def test_parse_enrich_cohort_keeps_limit_default(self):
+        # Cost discipline: a cohort flag must NOT loosen the --limit default.
+        parser = setup_parsers()
+        assert parser.parse_args(["enrich", "--liked"]).limit == 25
 
 
 class TestSonicCommand:
@@ -552,12 +581,36 @@ class TestSonicCommand:
         assert args.command == "sonic"
         assert args.limit == 50
         assert args.dry_run is False
+        # No cohort flag = whole-library (today's behavior).
+        assert args.played is False
+        assert args.liked is False
+        assert args.rotation is False
+        assert args.playlist is None
 
     def test_parse_sonic_flags(self):
         parser = setup_parsers()
         args = parser.parse_args(["sonic", "--limit", "200", "--dry-run"])
         assert args.limit == 200
         assert args.dry_run is True
+
+    def test_parse_sonic_cohort_flags(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["sonic", "--played"]).played is True
+        assert parser.parse_args(["sonic", "--liked"]).liked is True
+        assert parser.parse_args(["sonic", "--rotation"]).rotation is True
+        assert parser.parse_args(["sonic", "--playlist", "My Mix"]).playlist == "My Mix"
+
+    def test_parse_sonic_cohorts_mutually_exclusive(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--played", "--liked"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--liked", "--playlist", "My Mix"])
+
+    def test_parse_sonic_playlist_requires_name(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--playlist"])
 
 
 class TestIngestCommand:

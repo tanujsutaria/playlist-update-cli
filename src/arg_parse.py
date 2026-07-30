@@ -20,6 +20,37 @@ def _non_negative_int(value: str) -> int:
     return ivalue
 
 
+def _add_cohort_flags(parser: argparse.ArgumentParser) -> None:
+    """Attach the mutually-exclusive backfill cohort flags (/enrich, /sonic).
+
+    No flag targets the whole library in track-id order (today's behavior);
+    a cohort points the backfill at the tracks that actually feed /taste,
+    /find and rotation.
+    """
+    cohort = parser.add_mutually_exclusive_group()
+    cohort.add_argument(
+        "--played",
+        action="store_true",
+        help="Only tracks with listen history (the /listen-sync ledger)",
+    )
+    cohort.add_argument(
+        "--liked",
+        action="store_true",
+        help="Only Liked Songs (the /pull mirror)",
+    )
+    cohort.add_argument(
+        "--rotation",
+        action="store_true",
+        help="Only tracks that have appeared in rotation generations",
+    )
+    cohort.add_argument(
+        "--playlist",
+        metavar="NAME",
+        default=None,
+        help="Only tracks in the named playlist (the /pull mirror)",
+    )
+
+
 class HelpText(str):
     """Marker type: a parse_tokens "error" that is really help output.
 
@@ -337,6 +368,7 @@ def setup_parsers(
         metavar="N",
         help="Parallel deep-search workers (default 8); writes stay serialized",
     )
+    _add_cohort_flags(enrich_parser)
 
     # Sonic command (acoustic feature backfill from AcousticBrainz)
     sonic_parser = subparsers.add_parser(
@@ -354,6 +386,7 @@ def setup_parsers(
         action="store_true",
         help="List the tracks that would be looked up without calling out or writing",
     )
+    _add_cohort_flags(sonic_parser)
 
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")

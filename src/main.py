@@ -4466,31 +4466,119 @@ class PlaylistCLI:
             warning(f"Failed to undo the last change to '{playlist_name}'.")
         return success
 
-    def enrich_library(self, limit: int = 25, dry_run: bool = False, concurrency: int = 8) -> int:
+    def _cohort_source(
+        self, cohort: str, playlist: Optional[str]
+    ) -> Optional[Tuple[str, List[Any], str]]:
+        """Resolve a backfill cohort flag to (membership subquery, params, label).
+
+        Membership-only subqueries — the caller joins them against ``tracks``
+        and keeps its own missing-row filter, so --limit/--dry-run semantics
+        are untouched. Returns None on a --playlist miss, already rendered via
+        the central suggest-on-miss path (suggestions are never executed).
+        """
+        if cohort == "played":
+            return "SELECT DISTINCT track_id FROM listen_events", [], "played"
+        if cohort == "liked":
+            return "SELECT track_id FROM liked_tracks", [], "liked"
+        if cohort == "rotation":
+            return "SELECT DISTINCT track_id FROM generation_tracks", [], "rotation"
+        # --playlist NAME: membership lives in the /pull mirror. Exact
+        # (case-insensitive) match only — a near miss suggests, never executes.
+        row = self.repos.conn.execute(
+            """
+            SELECT spotify_playlist_id, name FROM spotify_playlists
+            WHERE name = ? COLLATE NOCASE
+            ORDER BY name LIMIT 1
+            """,
+            (playlist or "",),
+        ).fetchone()
+        if row is None:
+            report_playlist_miss(self, playlist or "")
+            return None
+        return (
+            "SELECT track_id FROM playlist_tracks WHERE spotify_playlist_id = ?",
+            [row["spotify_playlist_id"]],
+            f"playlist '{row['name']}'",
+        )
+
+    def _report_cohort_coverage(
+        self, source_sql: str, params: List[Any], label: str, target_table: str, what: str
+    ) -> None:
+        """Print the pre-run coverage readout: cohort size, missing count, %.
+
+        `source_sql`/`target_table` are trusted literals from the call sites
+        below, never user input.
+        """
+        conn = self.repos.conn
+        size = int(conn.execute(f"SELECT COUNT(*) FROM ({source_sql})", params).fetchone()[0])
+        missing = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM tracks t
+                JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id
+                LEFT JOIN {target_table} x ON x.track_id = t.track_id
+                WHERE x.track_id IS NULL
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        covered_pct = 100.0 if size == 0 else (size - missing) * 100.0 / size
+        info(
+            f"Cohort {label}: {size} track(s), {missing} missing {what} "
+            f"({covered_pct:.1f}% covered)."
+        )
+
+    def enrich_library(
+        self,
+        limit: int = 25,
+        dry_run: bool = False,
+        concurrency: int = 8,
+        cohort: Optional[str] = None,
+        playlist: Optional[str] = None,
+    ) -> int:
         """Backfill semantic context + re-embed library tracks that lack context.
 
         Each track is a real deep-search call, so this is bounded by `limit`
         (default 25) — a full-library backfill is an explicit, larger `--limit`.
         The slow network fetch is parallelized across `concurrency` workers while
         DB writes stay serialized. Tracks whose deep-search results don't surface
-        them are left untouched. Returns the number of tracks enriched.
+        them are left untouched. A cohort flag (--played/--liked/--rotation/
+        --playlist) narrows the candidates to tracks that actually feed /taste,
+        /find and rotation; no cohort keeps today's whole-library order.
+        Returns the number of tracks enriched.
         """
         section("Enrich Library")
         info("Semantic context only (genre/mood/era/style) — not acoustic audio features.")
+        cohort_join = ""
+        cohort_params: List[Any] = []
+        if cohort:
+            resolved = self._cohort_source(cohort, playlist)
+            if resolved is None:
+                return 0  # --playlist miss (already reported with suggestions)
+            source_sql, cohort_params, label = resolved
+            self._report_cohort_coverage(
+                source_sql, cohort_params, label, "track_context", "context"
+            )
+            cohort_join = f"JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id"
         rows = self.repos.conn.execute(
-            """
+            f"""
             SELECT t.track_id, t.name, t.artist_id, a.name AS artist_name
             FROM tracks t
+            {cohort_join}
             LEFT JOIN track_context c ON c.track_id = t.track_id
             LEFT JOIN artists a ON a.artist_id = t.artist_id
             WHERE c.track_id IS NULL
             ORDER BY t.track_id
             LIMIT ?
             """,
-            (max(0, limit),),
+            (*cohort_params, max(0, limit)),
         ).fetchall()
         if not rows:
-            info("Nothing to enrich — every track already has context.")
+            if cohort:
+                info("Nothing to enrich — the cohort is empty or fully covered.")
+            else:
+                info("Nothing to enrich — every track already has context.")
             return 0
 
         def _name_artist(row: Any) -> Tuple[str, str]:
@@ -4535,30 +4623,54 @@ class PlaylistCLI:
         )
         return counts["enriched"]
 
-    def sonic_backfill(self, limit: int = 50, dry_run: bool = False) -> int:
+    def sonic_backfill(
+        self,
+        limit: int = 50,
+        dry_run: bool = False,
+        cohort: Optional[str] = None,
+        playlist: Optional[str] = None,
+    ) -> int:
         """Backfill acoustic features from AcousticBrainz for tracks that lack them.
 
         Resolves each track to a MusicBrainz MBID and stores its precomputed
         AcousticBrainz sonic vector — no audio downloaded. SERIAL + rate-limited
         (MusicBrainz ~1 req/sec), so a full library is ~minutes, not parallelizable.
-        Returns the number of tracks for which sonic features were stored.
+        A cohort flag (--played/--liked/--rotation/--playlist) narrows the
+        candidates to tracks that actually feed /taste, /find and rotation;
+        no cohort keeps today's whole-library order. Returns the number of
+        tracks for which sonic features were stored.
         """
         section("Sonic Backfill")
         info("Acoustic features from AcousticBrainz (MBID-keyed; no audio downloaded).")
+        cohort_join = ""
+        cohort_params: List[Any] = []
+        if cohort:
+            resolved = self._cohort_source(cohort, playlist)
+            if resolved is None:
+                return 0  # --playlist miss (already reported with suggestions)
+            source_sql, cohort_params, label = resolved
+            self._report_cohort_coverage(
+                source_sql, cohort_params, label, "track_sonic", "sonic features"
+            )
+            cohort_join = f"JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id"
         rows = self.repos.conn.execute(
-            """
+            f"""
             SELECT t.track_id, t.name, a.name AS artist
             FROM tracks t
+            {cohort_join}
             LEFT JOIN track_sonic s ON s.track_id = t.track_id
             LEFT JOIN artists a ON a.artist_id = t.artist_id
             WHERE s.track_id IS NULL
             ORDER BY t.track_id
             LIMIT ?
             """,
-            (max(0, limit),),
+            (*cohort_params, max(0, limit)),
         ).fetchall()
         if not rows:
-            info("Nothing to backfill — every track already has sonic features.")
+            if cohort:
+                info("Nothing to backfill — the cohort is empty or fully covered.")
+            else:
+                info("Nothing to backfill — every track already has sonic features.")
             return 0
 
         def _name_artist(row: Any) -> Tuple[str, str]:
@@ -4596,6 +4708,9 @@ class PlaylistCLI:
                 ["Failed", counts["failed"]],
             ]
         )
+        if cohort:
+            # Hit-rate probe: how much of this cohort AcousticBrainz can serve.
+            info(f"resolved {counts['stored']}/{total} via AcousticBrainz")
         return counts["stored"]
 
     def debug_last_search(self) -> Optional[Dict[str, object]]:
@@ -5251,17 +5366,43 @@ def _handle_undo(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _cohort_from_args(args: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Map the mutually-exclusive cohort flags to (cohort, playlist_name).
+
+    argparse enforces the mutual exclusion; no flag means whole-library (None).
+    """
+    if getattr(args, "played", False):
+        return "played", None
+    if getattr(args, "liked", False):
+        return "liked", None
+    if getattr(args, "rotation", False):
+        return "rotation", None
+    playlist = getattr(args, "playlist", None)
+    if playlist:
+        return "playlist", playlist
+    return None, None
+
+
 def _handle_enrich(cli: "PlaylistCLI", args: Any) -> int:
+    cohort, playlist = _cohort_from_args(args)
     cli.enrich_library(
         limit=getattr(args, "limit", 25),
         dry_run=getattr(args, "dry_run", False),
         concurrency=getattr(args, "concurrency", 8),
+        cohort=cohort,
+        playlist=playlist,
     )
     return 0
 
 
 def _handle_sonic(cli: "PlaylistCLI", args: Any) -> int:
-    cli.sonic_backfill(limit=getattr(args, "limit", 50), dry_run=getattr(args, "dry_run", False))
+    cohort, playlist = _cohort_from_args(args)
+    cli.sonic_backfill(
+        limit=getattr(args, "limit", 50),
+        dry_run=getattr(args, "dry_run", False),
+        cohort=cohort,
+        playlist=playlist,
+    )
     return 0
 
 
