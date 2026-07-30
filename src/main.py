@@ -57,7 +57,7 @@ from storage.db import Database, get_db_path
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.sonic import SONIC_FEATURES, describe_sonic
-from storage.vectors import decode_vector, mean_vector, taste_centroid, vector_norm
+from storage.vectors import decode_vector, encode_vector, mean_vector, taste_centroid, vector_norm
 from taste_facets import (
     decade_histogram,
     decade_of,
@@ -4598,6 +4598,126 @@ class PlaylistCLI:
         )
         return counts["stored"]
 
+    def embed_backfill(self, limit: Optional[int] = None, dry_run: bool = False) -> int:
+        """Backfill lexical embeddings for tracks that have none.
+
+        Embeds the canonical ``"name by artist"`` text with the already-local
+        model and writes rows into ``track_embeddings`` — fully offline and
+        free, so the default is the whole library (bound it with ``--limit``).
+        Tracks that already have an embedding are never touched: /enrich's
+        context-based re-embeds stay the upgrade path on top of this floor.
+        Returns the number of tracks embedded.
+        """
+        section("Embed Backfill")
+        info("Lexical 'name by artist' embeddings via the local model (offline, free).")
+        rows = self.repos.conn.execute(
+            """
+            SELECT t.track_id, t.name, t.artist_id, a.name AS artist_name
+            FROM tracks t
+            LEFT JOIN track_embeddings e ON e.track_id = t.track_id
+            LEFT JOIN artists a ON a.artist_id = t.artist_id
+            WHERE e.track_id IS NULL
+            ORDER BY t.track_id
+            LIMIT ?
+            """,
+            (-1 if limit is None else max(0, limit),),
+        ).fetchall()
+        if not rows:
+            info("Nothing to embed — every track already has an embedding.")
+            return 0
+
+        def _name_artist(row: Any) -> Tuple[str, str]:
+            return (row["name"] or "", row["artist_name"] or row["artist_id"] or "")
+
+        total = len(rows)
+        bound = "all missing" if limit is None else f"limit {limit}"
+        info(f"Found {total} track(s) without an embedding ({bound}).")
+        if dry_run:
+            for row in rows[:10]:
+                name, artist = _name_artist(row)
+                info(f"  would embed: {name} — {artist}")
+            if total > 10:
+                info(f"  … and {total - 10} more")
+            info(f"Dry run: {total} track(s) would be embedded. Re-run without --dry-run.")
+            return 0
+
+        embedded = 0
+        batch_size = 256
+        for start in range(0, total, batch_size):
+            batch = rows[start : start + batch_size]
+            texts = [f"{name} by {artist}" for name, artist in map(_name_artist, batch)]
+            vectors = self.db.embed_texts(texts)
+            now = datetime.now().isoformat()
+            for row, vector in zip(batch, vectors):
+                values = [float(v) for v in vector]
+                self.repos.embeddings.upsert(
+                    {
+                        "track_id": row["track_id"],
+                        "model_name": self.db.model_name,
+                        "embedding_blob": encode_vector(values),
+                        "embedding_dim": len(values),
+                        "embedding_norm": vector_norm(values),
+                        "created_at": now,
+                    }
+                )
+                embedded += 1
+            # Commit per batch so an interrupted run keeps its progress.
+            self.repos.conn.commit()
+            info(f"  embedded {min(start + batch_size, total)}/{total}")
+        key_value_table([["Embedded", embedded]])
+        return embedded
+
+    def similar_tracks(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        """Local more-like-this: nearest stored embeddings for a track or text.
+
+        ``query`` is either a track id (``artist|||name``) — seeded by its
+        stored embedding when present, its lexical text otherwise — or free
+        text embedded on the fly. Pure local KNN over ``track_embeddings``
+        (no network); returns the payload dict, rendering is the handler's.
+        """
+        text = query.strip()
+        seed: Optional[Dict[str, Any]] = None
+        record = self.repos.tracks.get(text) or self.repos.tracks.get(text.lower())
+        if record is not None:
+            seed_id = record["track_id"]
+            artist_record = self.repos.artists.get(record.get("artist_id") or "")
+            artist_name = (artist_record or {}).get("name") or record.get("artist_id") or ""
+            seed = {
+                "track_id": seed_id,
+                "label": f"{record.get('name') or seed_id} — {artist_name}".strip(" —"),
+            }
+            stored = self.repos.embeddings.get(seed_id)
+            if stored is not None:
+                vector = decode_vector(stored["embedding_blob"])
+            else:
+                vector = self.db.embed_texts([f"{record.get('name') or ''} by {artist_name}"])[0]
+        else:
+            if "|||" in text:
+                notice(f"No track '{text}' in the library — matching it as free text.")
+            vector = self.db.embed_texts([text])[0]
+
+        exclude = {seed["track_id"]} if seed else None
+        scored = self.db.rank_similar(vector, limit=limit, exclude_ids=exclude)
+        results: List[Dict[str, Any]] = []
+        for track_id, similarity in scored:
+            track = self.repos.tracks.get(track_id) or {}
+            artist_record = self.repos.artists.get(track.get("artist_id") or "")
+            artist_name = (artist_record or {}).get("name") or track.get("artist_id") or ""
+            results.append(
+                {
+                    "track_id": track_id,
+                    "song": track.get("name") or track_id,
+                    "artist": artist_name,
+                    "similarity": round(float(similarity), 4),
+                    # Honest provenance: a track_context row means /enrich
+                    # re-embedded this track from semantic context; otherwise
+                    # the vector is the lexical "name by artist" text.
+                    "basis": "context" if self.repos.context.get(track_id) else "title",
+                    "spotify_url": spotify_track_url(track.get("spotify_id")),
+                }
+            )
+        return {"query": query, "seed": seed, "results": results}
+
     def debug_last_search(self) -> Optional[Dict[str, object]]:
         """Return debug payload for the last search run."""
         run_id = self.last_search_run_id
@@ -5265,6 +5385,59 @@ def _handle_sonic(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _handle_embed(cli: "PlaylistCLI", args: Any) -> int:
+    cli.embed_backfill(limit=getattr(args, "limit", None), dry_run=getattr(args, "dry_run", False))
+    return 0
+
+
+def _handle_similar(cli: "PlaylistCLI", args: Any) -> int:
+    """Local more-like-this over stored embeddings — offline and instant."""
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    try:
+        query = " ".join(args.query)
+        payload = cli.similar_tracks(query, limit=getattr(args, "limit", 10))
+        results = payload.get("results") or []
+        if not results:
+            notice("No neighbors found. Run /embed to give every track an embedding.")
+            return 1
+        seed = payload.get("seed") or {}
+        section("Similar", seed.get("label") or query)
+        table(
+            [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Song",
+                "Artist",
+                ColumnSpec("Sim", metric=True),
+                ColumnSpec("Basis", style="dim"),
+            ],
+            [
+                [
+                    idx,
+                    # Visible text unchanged; a known Spotify identity adds an
+                    # OSC 8 hyperlink (terminals without support show the name).
+                    link_text(r["song"], r["spotify_url"]),
+                    r["artist"],
+                    f"{r['similarity']:.2f}",
+                    r["basis"],
+                ]
+                for idx, r in enumerate(results, 1)
+            ],
+        )
+        caption("basis: context = /enrich'd semantic embedding · title = lexical 'name by artist'")
+        to_playlist = getattr(args, "to_playlist", None)
+        if to_playlist:
+            chosen = [r["track_id"] for r in results]
+            ok = cli.add_search_to_playlist(to_playlist, chosen)
+            payload["wrote"] = {"playlist": to_playlist, "requested": len(chosen), "ok": bool(ok)}
+        return 0
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
+
+
 def _present_debug_track(payload: dict) -> None:
     """Render the `debug track` payload as tables (output unchanged)."""
     track = payload.get("track") or {}
@@ -5608,6 +5781,8 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "auth-refresh": _handle_auth_refresh,
     "auth-reset": _handle_auth_reset,
     "interactive": _handle_interactive,
+    "embed": _handle_embed,
+    "similar": _handle_similar,
 }
 
 

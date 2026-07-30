@@ -110,6 +110,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # a half-configured setup may need to get unstuck).
     "auth-reset",
     "interactive",
+    # Offline embedding backfill + local KNN — local DB and model only.
+    "embed",
+    "similar",
 }
 
 # Task-based grouping for the /help listing. Commands not named here fall into
@@ -148,7 +151,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "restore-previous-rotation",
         ],
     ),
-    ("Discover", ["find", "search", "results"]),
+    ("Discover", ["find", "search", "results", "similar", "embed"]),
     ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups"]),
 ]
 HELP_LEGACY = {"import"}

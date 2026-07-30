@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from models import Song, track_id_for
 from nextgen.embeddings import EmbeddingModel
@@ -158,11 +158,66 @@ class SongStore:
                 results.append(match)
         return results
 
+    def rank_similar(
+        self,
+        query: Sequence[float],
+        limit: int = 10,
+        exclude_ids: Optional[Iterable[str]] = None,
+    ) -> List[Tuple[str, float]]:
+        """Scored top-N cosine KNN over every stored embedding.
+
+        Unlike ``find_similar_songs`` (thresholded, pure-Python per-row loop),
+        this loads all embeddings whose dimension matches ``query`` into one
+        numpy matrix and scores the whole library in a single dot-product
+        pass — instant even at ~15k x 768. Returns ``(track_id, cosine)``
+        pairs, best first; zero-norm rows and ids in ``exclude_ids`` never
+        appear.
+        """
+        import numpy as np
+
+        query_vec = np.asarray(list(query), dtype=np.float32)
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_vec.size == 0 or query_norm == 0.0 or limit <= 0:
+            return []
+
+        excluded = set(exclude_ids or ())
+        ids: List[str] = []
+        blobs: List[bytes] = []
+        for row in self.repos.conn.execute(
+            "SELECT track_id, embedding_blob FROM track_embeddings WHERE embedding_dim = ?;",
+            (int(query_vec.size),),
+        ).fetchall():
+            if row["track_id"] in excluded:
+                continue
+            ids.append(row["track_id"])
+            blobs.append(row["embedding_blob"])
+        if not ids:
+            return []
+
+        # encode_vector stores float32 (array("f")), so the blobs concatenate
+        # straight into an (n, dim) matrix without a per-row decode loop.
+        matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(ids), -1)
+        norms = np.linalg.norm(matrix, axis=1)
+        keep = norms > 0.0
+        if not bool(keep.any()):
+            return []
+        if not bool(keep.all()):
+            matrix = matrix[keep]
+            norms = norms[keep]
+            ids = [track_id for track_id, ok in zip(ids, keep) if ok]
+        scores = (matrix @ query_vec) / (norms * query_norm)
+        order = np.argsort(scores)[::-1][:limit]
+        return [(ids[int(i)], float(scores[int(i)])) for i in order]
+
     def generate_embedding(self, song: Song) -> "np.ndarray":
         import numpy as np
 
         vector = self._embedder().embed([_embed_text(song)])[0]
         return np.array(vector, dtype=float)
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        """Batch-encode arbitrary texts with the canonical embedding model."""
+        return self._embedder().embed(list(texts))
 
     def get_stats(self) -> Dict[str, Any]:
         total_songs = int(self.repos.conn.execute("SELECT COUNT(*) FROM tracks;").fetchone()[0])
