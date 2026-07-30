@@ -53,6 +53,7 @@ class TestSetupParsers:
             "pull",
             "rotate",
             "rotate-played",
+            "doctor",
         ]
 
         # The _subparsers action contains the choices
@@ -704,6 +705,20 @@ class TestInteractiveCommand:
         parser = setup_parsers()
         args = parser.parse_args(["interactive"])
         assert args.command == "interactive"
+
+
+class TestDoctorCommand:
+    """/doctor: offline integrity audit, no arguments beyond --json."""
+
+    def test_parse_doctor_default(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["doctor"])
+        assert args.command == "doctor"
+        assert args.json is False
+
+    def test_parse_doctor_json(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["doctor", "--json"]).json is True
 
 
 class TestParseArgsFunction:

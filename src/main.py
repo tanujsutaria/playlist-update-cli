@@ -21,6 +21,9 @@ from rich.logging import RichHandler
 from rich.text import Text
 
 from config import AppConfig, env_flag, env_int
+from doctor import DEFAULT_EMBEDDING_MODEL, default_backups_dir, has_failures
+from doctor import results_payload as doctor_results_payload
+from doctor import run_checks as run_doctor_checks
 from gdpr_import import GdprImportError, import_streaming_history, iter_streaming_records
 from models import Song, track_id_for
 from nextgen.acoustic import backfill_sonic
@@ -5573,6 +5576,57 @@ def _handle_interactive(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+# ui contract colors: green = succeeded, yellow = warning, red = failure only.
+_DOCTOR_STATUS_STYLES = {"ok": "green", "warn": "yellow", "fail": "bold red"}
+
+
+def _doctor_status_style(value: Any) -> Optional[str]:
+    return _DOCTOR_STATUS_STYLES.get(str(value))
+
+
+def _handle_doctor(cli: "PlaylistCLI", args: Any) -> int:
+    """Offline integrity audit (/doctor): render doctor.run_checks as a status
+    table (or the --json payload) and exit nonzero when any check failed."""
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    results: List[Any] = []
+    try:
+        conn = cli.repos.conn
+        db_path = cli.storage.path
+        expected_model = os.getenv("SEARCH_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+        results = run_doctor_checks(
+            conn, db_path, default_backups_dir(), expected_model=expected_model
+        )
+        payload = doctor_results_payload(results)
+        payload["db_path"] = str(db_path)
+        section("Doctor", str(db_path))
+        table(
+            [
+                ColumnSpec("Status", metric=_doctor_status_style),
+                "Check",
+                "Detail",
+                "Remedy",
+            ],
+            [[r.status, r.name, r.detail, r.remedy or "—"] for r in results],
+        )
+        counts = payload["counts"]
+        if counts["fail"]:
+            # error() is never silenced by json mode (it would land on stderr);
+            # in --json the payload itself carries the verdicts, so skip it.
+            if not json_mode:
+                error(f"{counts['fail']} check(s) failed — remedies above.", title="Doctor")
+        elif counts["warn"]:
+            warning(f"Healthy, with {counts['warn']} warning(s).")
+        else:
+            info("All checks passed.")
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
+    return 1 if has_failures(results) else 0
+
+
 # Built after the handler functions so each name is already defined.
 _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "import": _handle_import,
@@ -5608,6 +5662,7 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "auth-refresh": _handle_auth_refresh,
     "auth-reset": _handle_auth_reset,
     "interactive": _handle_interactive,
+    "doctor": _handle_doctor,
 }
 
 

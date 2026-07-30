@@ -515,6 +515,15 @@ def setup_parsers(
     # Interactive UI
     subparsers.add_parser("interactive", help="Launch the interactive UI")
 
+    # Doctor command (read-only, offline): integrity + consistency audit of
+    # the SQLite system of record, one ok/warn/fail row per check.
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Audit the local database: integrity, schema, orphans, backups (offline)"
+    )
+    doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
+
     return parser
 
 

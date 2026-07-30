@@ -110,6 +110,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # a half-configured setup may need to get unstuck).
     "auth-reset",
     "interactive",
+    # Fully offline read-only audit of the local database — must run in setup
+    # mode so "is my system of record healthy?" needs no credentials.
+    "doctor",
 }
 
 # Task-based grouping for the /help listing. Commands not named here fall into
@@ -149,7 +152,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
         ],
     ),
     ("Discover", ["find", "search", "results"]),
-    ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups"]),
+    ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups", "doctor"]),
 ]
 HELP_LEGACY = {"import"}
 
