@@ -3653,21 +3653,27 @@ class PlaylistCLI:
         caption("mirror is read-only; local edits are not pushed")
         return payload
 
-    def rotate_playlist_played(self, playlist_name: str, max_replace: Optional[int] = None) -> None:
-        """Rotate a playlist by removing tracks played since they were added."""
-        section("Rotate (Played)", playlist_name)
+    def _plan_rotation_played(
+        self, playlist_name: str, max_replace: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Plan phase for /rotate: compute removals + replacements, no writes.
+
+        Spotify is only read (playlist id + tracks); the single write lives in
+        rotate_playlist_played's apply phase. Returns None when there is
+        nothing to do (the reason is already emitted), else the plan dict.
+        """
         try:
             if self.spotify.get_playlist_id(playlist_name) is None:
                 report_playlist_miss(self, playlist_name)
-                return
+                return None
             tracks = self.spotify.get_playlist_tracks(playlist_name)
         except Exception as exc:
             warning(f"Failed to load playlist: {exc}")
-            return
+            return None
 
         if not tracks:
             warning("Playlist is empty.")
-            return
+            return None
 
         def parse_ts(value: Optional[str]) -> Optional[datetime]:
             if not value:
@@ -3699,7 +3705,7 @@ class PlaylistCLI:
 
         if not track_ids:
             warning("No recognizable tracks found in playlist.")
-            return
+            return None
 
         latest_map = self.repos.listen_events.list_by_track
         played_ids: List[Tuple[str, Optional[datetime], Optional[datetime]]] = []
@@ -3731,7 +3737,7 @@ class PlaylistCLI:
 
         if not played_ids:
             info("No played tracks detected since add time.")
-            return
+            return None
 
         if max_replace is not None:
             played_ids = played_ids[:max_replace]
@@ -3785,7 +3791,8 @@ class PlaylistCLI:
         candidate_rows.sort(key=candidate_key)
 
         needed = min(len(played_ids), len(candidate_rows))
-        replacements = candidate_rows[:needed]
+        # Plain dicts: sqlite3.Row has no .get(), and the table renderers use it.
+        replacements = [dict(row) for row in candidate_rows[:needed]]
 
         songs_to_keep: List[Song] = []
         for entry in tracks:
@@ -3819,57 +3826,108 @@ class PlaylistCLI:
             )
 
         new_songs = songs_to_keep + replacement_songs
-        success = self.spotify.replace_playlist_items(playlist_name, new_songs)
+        return {
+            "played_ids": played_ids,
+            "replacements": replacements,
+            "needed": needed,
+            "new_songs": new_songs,
+        }
+
+    def _rotation_removed_table(
+        self, played_ids: List[Tuple[str, Optional[datetime], Optional[datetime]]]
+    ) -> None:
+        """Render the played-tracks table shared by /rotate apply and dry-run."""
+        removed_rows = []
+        for idx, (track_id, added_at, played_at) in enumerate(played_ids, 1):
+            track = self.repos.tracks.get(track_id) or {}
+            artist_record = self.repos.artists.get(track.get("artist_id") or "")
+            artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
+            removed_rows.append(
+                [
+                    idx,
+                    # Visible text unchanged; a Spotify identity adds an
+                    # OSC 8 hyperlink (terminals without it show the name).
+                    link_text(
+                        track.get("name") or track_id,
+                        spotify_track_url(track.get("spotify_id")),
+                    ),
+                    artist_name or "",
+                    added_at.isoformat() if added_at else "",
+                    played_at.isoformat() if played_at else "",
+                ]
+            )
+        if removed_rows:
+            table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
+
+    def _rotation_added_table(self, replacements: List[Any]) -> None:
+        """Render the replacements table shared by /rotate apply and dry-run."""
+        added_rows = []
+        for idx, row in enumerate(replacements, 1):
+            artist_record = self.repos.artists.get(row["artist_id"] or "")
+            artist_name = artist_record.get("name") if artist_record else row["artist_id"]
+            added_rows.append(
+                [
+                    idx,
+                    row.get("name") or "",
+                    artist_name or "",
+                    row.get("spotify_id") or "",
+                ]
+            )
+        if added_rows:
+            table(
+                [
+                    ColumnSpec("#", justify="right", style="dim"),
+                    # The row carries its Spotify id in column 3 — the song
+                    # name links to it, visible text unchanged.
+                    ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
+                    "Artist",
+                    "Spotify ID",
+                ],
+                added_rows,
+            )
+
+    def rotate_playlist_played(
+        self,
+        playlist_name: str,
+        max_replace: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Rotate a playlist by removing tracks played since they were added.
+
+        With ``dry_run`` the plan (removals + replacements) is rendered in the
+        /diff table conventions and nothing is written to Spotify.
+        """
+        section("Rotate (Played)", f"{playlist_name}{' (dry run)' if dry_run else ''}")
+        plan = self._plan_rotation_played(playlist_name, max_replace)
+        if plan is None:
+            return
+
+        played_ids = plan["played_ids"]
+        replacements = plan["replacements"]
+        needed = plan["needed"]
+
+        if dry_run:
+            key_value_table(
+                [
+                    ["Would remove", f"{len(played_ids)} tracks"],
+                    ["Would add", f"{needed} tracks"],
+                ]
+            )
+            subsection("Would Remove (Played After Added)")
+            self._rotation_removed_table(played_ids)
+            subsection("Would Add (Replacements)")
+            self._rotation_added_table(replacements)
+            info("Dry run: no changes written. Re-run without --dry-run to apply.")
+            return
+
+        # Apply phase: the single Spotify write.
+        success = self.spotify.replace_playlist_items(playlist_name, plan["new_songs"])
         if success:
             info(f"Replaced {len(replacements)} played tracks.")
             subsection("Removed (Played After Added)")
-            removed_rows = []
-            for idx, (track_id, added_at, played_at) in enumerate(played_ids[:needed], 1):
-                track = self.repos.tracks.get(track_id) or {}
-                artist_record = self.repos.artists.get(track.get("artist_id") or "")
-                artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
-                removed_rows.append(
-                    [
-                        idx,
-                        # Visible text unchanged; a Spotify identity adds an
-                        # OSC 8 hyperlink (terminals without it show the name).
-                        link_text(
-                            track.get("name") or track_id,
-                            spotify_track_url(track.get("spotify_id")),
-                        ),
-                        artist_name or "",
-                        added_at.isoformat() if added_at else "",
-                        played_at.isoformat() if played_at else "",
-                    ]
-                )
-            if removed_rows:
-                table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
-
+            self._rotation_removed_table(played_ids[:needed])
             subsection("Added (Replacements)")
-            added_rows = []
-            for idx, row in enumerate(replacements, 1):
-                artist_record = self.repos.artists.get(row["artist_id"] or "")
-                artist_name = artist_record.get("name") if artist_record else row["artist_id"]
-                added_rows.append(
-                    [
-                        idx,
-                        row.get("name") or "",
-                        artist_name or "",
-                        row.get("spotify_id") or "",
-                    ]
-                )
-            if added_rows:
-                table(
-                    [
-                        ColumnSpec("#", justify="right", style="dim"),
-                        # The row carries its Spotify id in column 3 — the song
-                        # name links to it, visible text unchanged.
-                        ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
-                        "Artist",
-                        "Spotify ID",
-                    ],
-                    added_rows,
-                )
+            self._rotation_added_table(replacements)
         else:
             warning("Failed to update playlist.")
 
@@ -6166,7 +6224,7 @@ def _handle_rotate_played(cli: "PlaylistCLI", args: Any) -> int:
 
 
 def _handle_rotate(cli: "PlaylistCLI", args: Any) -> int:
-    cli.rotate_playlist_played(args.playlist, args.max_replace)
+    cli.rotate_playlist_played(args.playlist, args.max_replace, getattr(args, "dry_run", False))
     return 0
 
 

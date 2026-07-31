@@ -136,3 +136,29 @@ def test_polled_event_with_unknown_duration_counts_as_play():
     assert len(cli.spotify.replace_calls) == 1
     kept_ids = [song.id for song in cli.spotify.replace_calls[0]]
     assert track_id not in kept_ids
+
+
+def test_dry_run_previews_plan_without_writing(capsys):
+    """--dry-run renders the plan (removals + replacements) and never writes."""
+    cli = _make_cli(_PLAYLIST)
+    track_id = _seed_track(cli, "Artist A", "Song One")
+    _seed_track(cli, "Artist B", "Song Two")  # replacement candidate
+    _seed_event(cli, track_id, "2026-06-06T00:00:00Z", ms_played=215000)
+
+    cli.rotate_playlist_played("My Mix", dry_run=True)
+
+    assert cli.spotify.replace_calls == []  # zero Spotify writes
+    out = capsys.readouterr().out
+    assert "Would remove" in out
+    assert "Would add" in out
+    assert "Dry run: no changes written" in out
+
+
+def test_dry_run_with_nothing_played_writes_nothing(capsys):
+    cli = _make_cli(_PLAYLIST)
+    _seed_track(cli, "Artist A", "Song One")
+
+    cli.rotate_playlist_played("My Mix", dry_run=True)
+
+    assert cli.spotify.replace_calls == []
+    assert "No played tracks detected" in capsys.readouterr().out

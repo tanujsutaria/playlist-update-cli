@@ -2385,6 +2385,7 @@ class TestDestructiveQuestion:
 
         question = self._app(monkeypatch)._destructive_question
         assert question("update", SimpleNamespace(playlist="Chill", dry_run=True)) is None
+        assert question("rotate", SimpleNamespace(playlist="Chill", dry_run=True)) is None
         assert question("clean", SimpleNamespace(dry_run=True)) is None
 
     def test_non_destructive_and_recovery_commands_are_not_gated(self, monkeypatch):

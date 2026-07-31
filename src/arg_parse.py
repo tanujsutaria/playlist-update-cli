@@ -487,6 +487,11 @@ def setup_parsers(
         default=None,
         help="Maximum number of played tracks to replace (default: all)",
     )
+    rotate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview removals and replacements without writing to Spotify",
+    )
 
     # Backup command
     backup_parser = subparsers.add_parser("backup", help="Backup the data directory")

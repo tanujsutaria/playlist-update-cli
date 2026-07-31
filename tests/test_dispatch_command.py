@@ -299,10 +299,17 @@ class TestDispatchRotatePlayed:
 class TestDispatchRotate:
     def test_rotate_routes_correctly(self, cli):
         cli.rotate_playlist_played = MagicMock()
-        args = _make_args(playlist="PL", max_replace=None)
+        args = _make_args(playlist="PL", max_replace=None, dry_run=False)
         rc = dispatch_command(cli, "rotate", args)
         assert rc == 0
-        cli.rotate_playlist_played.assert_called_once_with("PL", None)
+        cli.rotate_playlist_played.assert_called_once_with("PL", None, False)
+
+    def test_rotate_dry_run_routes_correctly(self, cli):
+        cli.rotate_playlist_played = MagicMock()
+        args = _make_args(playlist="PL", max_replace=None, dry_run=True)
+        rc = dispatch_command(cli, "rotate", args)
+        assert rc == 0
+        cli.rotate_playlist_played.assert_called_once_with("PL", None, True)
 
 
 # ---- profile ----

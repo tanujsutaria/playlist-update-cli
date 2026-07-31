@@ -690,6 +690,16 @@ class TestRotateCommand:
         args = parser.parse_args(["rotate", "My Playlist", "--max-replace", "5"])
         assert args.max_replace == 5
 
+    def test_parse_rotate_dry_run_defaults_false(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["rotate", "My Playlist"])
+        assert args.dry_run is False
+
+    def test_parse_rotate_with_dry_run(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["rotate", "My Playlist", "--dry-run"])
+        assert args.dry_run is True
+
 
 class TestRotatePlayedCommand:
     """Tests for rotate-played (legacy) command parsing"""
