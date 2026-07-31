@@ -1,11 +1,19 @@
 """Tests for the sonic feature foundation: the AcousticBrainz->vector builder,
-the v5 track_sonic table, and the repo. Offline; no network.
+the v5 track_sonic table, the repo, and the cohort-targeted /sonic candidate
+selection. Offline; no network — the backfill itself is stubbed in the cohort
+tests, only the SQL and output shape are under test.
 """
 
 from __future__ import annotations
 
-import pytest
+from io import StringIO
 
+import pytest
+from rich.console import Console
+
+import main as main_mod
+import ui
+from main import PlaylistCLI
 from storage.db import Database
 from storage.migrations import LATEST_VERSION, ensure_schema
 from storage.repos import Repositories
@@ -129,3 +137,169 @@ class TestDescribeSonic:
         # ...and bpm_norm is denormalized to an approximate BPM (104 in the sample).
         assert "bpm_norm" not in prof
         assert prof["bpm"] == 104
+
+
+def _rendered(captured, width: int = 120) -> str:
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
+
+
+class TestSonicCohorts:
+    """Cohort-targeted /sonic: candidate selection joins the chosen source
+    (played/liked/rotation/--playlist NAME); no flag stays whole-library.
+    `backfill_sonic` is stubbed — no MusicBrainz/AcousticBrainz calls."""
+
+    TRACKS = [("a|||one", "One"), ("a|||three", "Three"), ("a|||two", "Two")]
+
+    @pytest.fixture(autouse=True)
+    def _sink(self):
+        self.captured = []
+        ui.set_output_sink(self.captured.append)
+        yield
+        ui.set_output_sink(None)
+
+    def _cli(self, tmp_path):
+        conn = Database(tmp_path / "tunr.db").connect()
+        ensure_schema(conn)
+        conn.execute("INSERT INTO artists (artist_id, name) VALUES ('a', 'A')")
+        conn.executemany(
+            "INSERT INTO tracks (track_id, name, artist_id, status) "
+            "VALUES (?, ?, 'a', 'candidate')",
+            self.TRACKS,
+        )
+        conn.commit()
+        cli = PlaylistCLI.__new__(PlaylistCLI)
+        cli._repos = Repositories(conn)
+        return cli
+
+    def _stub_backfill(self, monkeypatch, stored_n=None):
+        """Replace the real backfill; records the candidate list it was given."""
+        seen = []
+
+        def stub(repos, candidates, on_result=None, **kwargs):
+            seen.extend(candidates)
+            n = len(candidates) if stored_n is None else min(stored_n, len(candidates))
+            return {"stored": n, "no_mbid": len(candidates) - n, "no_data": 0, "failed": 0}
+
+        monkeypatch.setattr(main_mod, "backfill_sonic", stub)
+        return seen
+
+    def test_played_cohort_only(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        # Two events for the same track: DISTINCT keeps the cohort deduped.
+        cli._repos.conn.executemany(
+            "INSERT INTO listen_events (event_id, track_id) VALUES (?, ?)",
+            [("ev-1", "a|||two"), ("ev-2", "a|||two")],
+        )
+        cli._repos.conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="played") == 1
+        assert [tid for tid, *_ in seen] == ["a|||two"]
+
+    def test_liked_cohort_only(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        cli._repos.conn.execute("INSERT INTO liked_tracks (track_id) VALUES ('a|||one')")
+        cli._repos.conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="liked") == 1
+        assert [tid for tid, *_ in seen] == ["a|||one"]
+
+    def test_rotation_cohort_only(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        conn = cli._repos.conn
+        conn.execute(
+            "INSERT INTO playlists (playlist_id, name, current_generation) VALUES ('p1', 'R', 0)"
+        )
+        conn.executemany(
+            "INSERT INTO rotation_generations (generation_id, playlist_id, generation_index) "
+            "VALUES (?, 'p1', ?)",
+            [("g1", 0), ("g2", 1)],
+        )
+        # The same track in two generations must not duplicate the cohort.
+        conn.executemany(
+            "INSERT INTO generation_tracks (generation_id, track_id, position) VALUES (?, ?, 0)",
+            [("g1", "a|||three"), ("g2", "a|||three")],
+        )
+        conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="rotation") == 1
+        assert [tid for tid, *_ in seen] == ["a|||three"]
+
+    def test_playlist_cohort_matches_case_insensitively(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        repos = cli._repos
+        repos.spotify_playlists.upsert(spotify_playlist_id="sp1", name="Daily Mix")
+        repos.conn.executemany(
+            "INSERT INTO playlist_tracks (spotify_playlist_id, track_id, position) "
+            "VALUES ('sp1', ?, ?)",
+            [("a|||one", 0), ("a|||two", 1)],
+        )
+        repos.conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="playlist", playlist="daily mix") == 2
+        assert [tid for tid, *_ in seen] == ["a|||one", "a|||two"]
+
+    def test_empty_cohort_calls_nothing(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)  # no liked_tracks seeded
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="liked") == 0
+        assert seen == []
+        assert "Cohort liked: 0 track(s)" in _rendered(self.captured)
+
+    def test_playlist_miss_suggests_and_never_executes(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        cli._repos.spotify_playlists.upsert(spotify_playlist_id="sp1", name="Daily Mix")
+        cli._repos.conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, cohort="playlist", playlist="Daly Mix") == 0
+        assert seen == []  # suggest-only: a near miss never runs the backfill
+        rendered = _rendered(self.captured)
+        assert "no playlist 'Daly Mix'" in rendered
+        assert "Daily Mix" in rendered
+
+    def test_coverage_readout_and_hit_rate_shape(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        repos = cli._repos
+        repos.conn.executemany(
+            "INSERT INTO liked_tracks (track_id) VALUES (?)", [("a|||one",), ("a|||two",)]
+        )
+        # One cohort track already has sonic features -> 50% covered, 1 missing.
+        repos.sonic.upsert(
+            {
+                "track_id": "a|||one",
+                "mbid": "mb-1",
+                "sonic_blob": encode_vector(build_sonic_vector(HL, LL)),
+                "sonic_dim": SONIC_DIM,
+                "features_json": "{}",
+                "source": "acousticbrainz",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        repos.conn.commit()
+        self._stub_backfill(monkeypatch, stored_n=0)  # AcousticBrainz misses it
+        assert cli.sonic_backfill(limit=10, cohort="liked") == 0
+        rendered = _rendered(self.captured)
+        assert "Cohort liked: 2 track(s), 1 missing sonic features (50.0% covered)." in rendered
+        assert "resolved 0/1 via AcousticBrainz" in rendered
+
+    def test_cohort_dry_run_calls_nothing(self, tmp_path, monkeypatch):
+        cli = self._cli(tmp_path)
+        cli._repos.conn.execute("INSERT INTO liked_tracks (track_id) VALUES ('a|||one')")
+        cli._repos.conn.commit()
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10, dry_run=True, cohort="liked") == 0
+        assert seen == []
+        assert "would resolve: One" in _rendered(self.captured)
+
+    def test_no_cohort_stays_whole_library(self, tmp_path, monkeypatch):
+        # No flag = today's behavior: all tracks, no cohort/hit-rate lines.
+        cli = self._cli(tmp_path)
+        seen = self._stub_backfill(monkeypatch)
+        assert cli.sonic_backfill(limit=10) == 3
+        assert [tid for tid, *_ in seen] == ["a|||one", "a|||three", "a|||two"]
+        rendered = _rendered(self.captured)
+        assert "Cohort" not in rendered
+        assert "via AcousticBrainz" not in rendered

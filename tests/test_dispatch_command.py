@@ -342,13 +342,25 @@ class TestDispatchEnrich:
         args = _make_args(limit=25, dry_run=False, concurrency=8)
         rc = dispatch_command(cli, "enrich", args)
         assert rc == 0
-        cli.enrich_library.assert_called_once_with(limit=25, dry_run=False, concurrency=8)
+        cli.enrich_library.assert_called_once_with(
+            limit=25, dry_run=False, concurrency=8, cohort=None, playlist=None
+        )
 
     def test_enrich_passes_flags(self, cli):
         cli.enrich_library = MagicMock()
         args = _make_args(limit=100, dry_run=True, concurrency=16)
         dispatch_command(cli, "enrich", args)
-        cli.enrich_library.assert_called_once_with(limit=100, dry_run=True, concurrency=16)
+        cli.enrich_library.assert_called_once_with(
+            limit=100, dry_run=True, concurrency=16, cohort=None, playlist=None
+        )
+
+    def test_enrich_routes_cohort_flag(self, cli):
+        cli.enrich_library = MagicMock()
+        args = _make_args(limit=25, dry_run=False, concurrency=8, liked=True)
+        dispatch_command(cli, "enrich", args)
+        cli.enrich_library.assert_called_once_with(
+            limit=25, dry_run=False, concurrency=8, cohort="liked", playlist=None
+        )
 
 
 # ---- sonic ----
@@ -358,7 +370,17 @@ class TestDispatchSonic:
         args = _make_args(limit=50, dry_run=False)
         rc = dispatch_command(cli, "sonic", args)
         assert rc == 0
-        cli.sonic_backfill.assert_called_once_with(limit=50, dry_run=False)
+        cli.sonic_backfill.assert_called_once_with(
+            limit=50, dry_run=False, cohort=None, playlist=None
+        )
+
+    def test_sonic_routes_playlist_cohort(self, cli):
+        cli.sonic_backfill = MagicMock()
+        args = _make_args(limit=50, dry_run=False, playlist="Daily Mix")
+        dispatch_command(cli, "sonic", args)
+        cli.sonic_backfill.assert_called_once_with(
+            limit=50, dry_run=False, cohort="playlist", playlist="Daily Mix"
+        )
 
 
 # ---- backup ----
