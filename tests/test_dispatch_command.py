@@ -478,6 +478,19 @@ class TestDispatchInteractive:
         assert rc == 0
 
 
+# ---- doctor ----
+class TestDispatchDoctor:
+    def test_doctor_runs_offline_and_returns_zero(self, cli, tmp_path, monkeypatch):
+        """/doctor audits the (isolated, fresh) DB entirely offline: the lazy
+        storage property opens the TUNR_DB_PATH tmp database, no Spotify is
+        touched, and a healthy DB exits 0. The backups dir is sandboxed so the
+        check never reads the repo's real backups/ state dir."""
+        monkeypatch.setattr(main_module, "default_backups_dir", lambda: tmp_path / "backups")
+        args = _make_args(json=False)
+        rc = dispatch_command(cli, "doctor", args)
+        assert rc == 0
+
+
 # ---- unknown command ----
 class TestDispatchUnknown:
     def test_unknown_command_returns_error(self, cli):
