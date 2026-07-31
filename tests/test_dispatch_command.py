@@ -561,6 +561,8 @@ class TestDispatchDoctor:
         args = _make_args(json=False)
         rc = dispatch_command(cli, "doctor", args)
         assert rc == 0
+
+
 # ---- add / remove / move (quick track ops) ----
 class TestDispatchAdd:
     def test_add_routes_correctly(self, cli):

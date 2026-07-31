@@ -1044,6 +1044,8 @@ class TestSimilarCommand:
         parser = setup_parsers()
         with pytest.raises(SystemExit):
             parser.parse_args(["similar"])
+
+
 class TestAddCommand:
     """Tests for add command parsing (quick track ops)"""
 
