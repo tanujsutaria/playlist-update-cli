@@ -56,6 +56,9 @@ class TestSetupParsers:
             "doctor",
             "embed",
             "similar",
+            "add",
+            "remove",
+            "move",
         ]
 
         # The _subparsers action contains the choices
@@ -1031,3 +1034,98 @@ class TestSimilarCommand:
         parser = setup_parsers()
         with pytest.raises(SystemExit):
             parser.parse_args(["similar"])
+class TestAddCommand:
+    """Tests for add command parsing (quick track ops)"""
+
+    def test_parse_add_with_query_and_to(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["add", "wild", "nothing", "-", "shadow", "--to", "My Mix"])
+
+        assert args.command == "add"
+        assert args.query == ["wild", "nothing", "-", "shadow"]
+        assert args.to_playlist == "My Mix"
+        assert args.track_id is None
+
+    def test_parse_add_requires_to(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["add", "some", "song"])
+
+    def test_parse_add_with_id_bypass(self):
+        """--id needs no positional query (exact bypass)."""
+        parser = setup_parsers()
+        args = parser.parse_args(["add", "--id", "artist|||song", "--to", "Mix"])
+
+        assert args.query == []
+        assert args.track_id == "artist|||song"
+        assert args.to_playlist == "Mix"
+
+
+class TestRemoveCommand:
+    """Tests for remove command parsing (quick track ops)"""
+
+    def test_parse_remove_with_query_and_from(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["remove", "shadow", "--from", "My Mix"])
+
+        assert args.command == "remove"
+        assert args.query == ["shadow"]
+        assert args.from_playlist == "My Mix"
+        assert args.track_id is None
+
+    def test_parse_remove_requires_from(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["remove", "shadow"])
+
+    def test_parse_remove_with_id_bypass(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["remove", "--id", "artist|||song", "--from", "Mix"])
+
+        assert args.query == []
+        assert args.track_id == "artist|||song"
+        assert args.from_playlist == "Mix"
+
+    def test_remove_help_documents_all_occurrences(self):
+        """The help/description must warn that ALL duplicate occurrences vanish."""
+        parser = setup_parsers()
+        sub = None
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices and "remove" in action.choices:
+                sub = action.choices["remove"]
+                break
+        assert sub is not None
+        assert "playlist_remove_all_occurrences_of_items" in sub.format_help()
+
+
+class TestMoveCommand:
+    """Tests for move command parsing (quick track ops)"""
+
+    def test_parse_move_with_from_and_to(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["move", "shadow", "--from", "My Mix", "--to", "Chill"])
+
+        assert args.command == "move"
+        assert args.query == ["shadow"]
+        assert args.from_playlist == "My Mix"
+        assert args.to_playlist == "Chill"
+        assert args.track_id is None
+
+    def test_parse_move_requires_from(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["move", "shadow", "--to", "Chill"])
+
+    def test_parse_move_requires_to(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["move", "shadow", "--from", "My Mix"])
+
+    def test_parse_move_with_id_bypass(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["move", "--id", "a|||b", "--from", "Mix", "--to", "Chill"])
+
+        assert args.query == []
+        assert args.track_id == "a|||b"
+        assert args.from_playlist == "Mix"
+        assert args.to_playlist == "Chill"

@@ -599,6 +599,91 @@ def setup_parsers(
         "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
     )
 
+    # Quick track ops: one-line single-track playlist edits, fuzzy-resolved
+    # against the local tracks mirror. Every write is /undo-able.
+    add_parser = subparsers.add_parser(
+        "add", help="Add one track to a playlist (fuzzy-matched against the local mirror)"
+    )
+    add_parser.add_argument(
+        "query", nargs="*", help='Track to add, e.g. "artist - name" (freeform)'
+    )
+    add_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        required=True,
+        help="Playlist to add the track to",
+    )
+    add_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
+
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove one track from a playlist (ALL duplicate occurrences; /undo restores them)",
+        description=(
+            "Remove one track from a playlist. Uses Spotify's "
+            "playlist_remove_all_occurrences_of_items, so every duplicate occurrence "
+            "of the track vanishes — the /undo snapshot restores them."
+        ),
+    )
+    remove_parser.add_argument(
+        "query", nargs="*", help='Track to remove, e.g. "artist - name" (freeform)'
+    )
+    remove_parser.add_argument(
+        "--from",
+        dest="from_playlist",
+        metavar="NAME",
+        required=True,
+        help="Playlist to remove the track from",
+    )
+    remove_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
+
+    move_parser = subparsers.add_parser(
+        "move",
+        help="Move one track between playlists (remove + add; /undo twice reverts both)",
+        description=(
+            "Move one track between playlists: remove from the source (ALL duplicate "
+            "occurrences, via playlist_remove_all_occurrences_of_items), then add to "
+            "the destination. Both playlists are snapshotted first — /undo reverts the "
+            "destination add, a second /undo reverts the source removal."
+        ),
+    )
+    move_parser.add_argument(
+        "query", nargs="*", help='Track to move, e.g. "artist - name" (freeform)'
+    )
+    move_parser.add_argument(
+        "--from",
+        dest="from_playlist",
+        metavar="NAME",
+        required=True,
+        help="Source playlist",
+    )
+    move_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        required=True,
+        help="Destination playlist",
+    )
+    move_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
+
     return parser
 
 

@@ -554,6 +554,53 @@ class TestDispatchDoctor:
         args = _make_args(json=False)
         rc = dispatch_command(cli, "doctor", args)
         assert rc == 0
+# ---- add / remove / move (quick track ops) ----
+class TestDispatchAdd:
+    def test_add_routes_correctly(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["wild", "nothing"], to_playlist="Mix", track_id=None)
+        rc = dispatch_command(cli, "add", args)
+        assert rc == 0
+        cli.add_track_to_playlist.assert_called_once_with("wild nothing", "Mix", track_id=None)
+
+    def test_add_threads_id_bypass(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=[], to_playlist="Mix", track_id="a|||b")
+        dispatch_command(cli, "add", args)
+        cli.add_track_to_playlist.assert_called_once_with("", "Mix", track_id="a|||b")
+
+    def test_add_failure_returns_error(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=False)
+        args = _make_args(query=["x"], to_playlist="Mix", track_id=None)
+        assert dispatch_command(cli, "add", args) == 1
+
+
+class TestDispatchRemove:
+    def test_remove_routes_correctly(self, cli):
+        cli.remove_track_from_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["shadow"], from_playlist="Mix", track_id=None)
+        rc = dispatch_command(cli, "remove", args)
+        assert rc == 0
+        cli.remove_track_from_playlist.assert_called_once_with("shadow", "Mix", track_id=None)
+
+    def test_remove_failure_returns_error(self, cli):
+        cli.remove_track_from_playlist = MagicMock(return_value=False)
+        args = _make_args(query=["shadow"], from_playlist="Mix", track_id=None)
+        assert dispatch_command(cli, "remove", args) == 1
+
+
+class TestDispatchMove:
+    def test_move_routes_correctly(self, cli):
+        cli.move_track = MagicMock(return_value=True)
+        args = _make_args(query=["shadow"], from_playlist="Mix", to_playlist="Chill", track_id=None)
+        rc = dispatch_command(cli, "move", args)
+        assert rc == 0
+        cli.move_track.assert_called_once_with("shadow", "Mix", "Chill", track_id=None)
+
+    def test_move_failure_returns_error(self, cli):
+        cli.move_track = MagicMock(return_value=False)
+        args = _make_args(query=["shadow"], from_playlist="Mix", to_playlist="Chill", track_id=None)
+        assert dispatch_command(cli, "move", args) == 1
 
 
 # ---- unknown command ----
