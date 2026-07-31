@@ -545,6 +545,48 @@ def setup_parsers(
         help="Confirm the reset (without this flag nothing is deleted)",
     )
 
+    # Embed command (offline lexical embedding backfill)
+    embed_parser = subparsers.add_parser(
+        "embed", help="Backfill lexical embeddings for tracks that lack one (offline, local model)"
+    )
+    embed_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Max tracks to embed (default: all missing)",
+    )
+    embed_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the tracks that would be embedded without writing anything",
+    )
+
+    # Similar command (local more-like-this over stored embeddings)
+    similar_parser = subparsers.add_parser(
+        "similar", help="More-like-this from stored embeddings (offline; track id or free text)"
+    )
+    similar_parser.add_argument(
+        "query", nargs="+", help="A track id (artist|||name) or free text to match against"
+    )
+    similar_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=10,
+        metavar="N",
+        help="Number of neighbors to show (default: 10)",
+    )
+    similar_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        default=None,
+        help="Add the matches to playlist NAME (undoable via /undo)",
+    )
+    similar_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
+
     # Interactive UI
     subparsers.add_parser("interactive", help="Launch the interactive UI")
 

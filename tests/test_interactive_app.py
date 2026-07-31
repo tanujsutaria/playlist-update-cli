@@ -538,7 +538,7 @@ class TestSetupModeGating:
                 app._handle_command(f'/{cmd} "Test"')
             elif cmd in ("restore",):
                 app._handle_command(f"/{cmd} backup_name")
-            elif cmd in ("search", "find"):
+            elif cmd in ("search", "find", "similar"):
                 app._handle_command(f"/{cmd} jazz")
             elif cmd in ("plan",):
                 app._handle_command(f'/{cmd} "Test"')

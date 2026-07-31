@@ -383,6 +383,71 @@ class TestDispatchSonic:
         )
 
 
+# ---- embed ----
+class TestDispatchEmbed:
+    def test_embed_routes_correctly(self, cli):
+        cli.embed_backfill = MagicMock()
+        args = _make_args(limit=None, dry_run=False)
+        rc = dispatch_command(cli, "embed", args)
+        assert rc == 0
+        cli.embed_backfill.assert_called_once_with(limit=None, dry_run=False)
+
+    def test_embed_passes_flags(self, cli):
+        cli.embed_backfill = MagicMock()
+        args = _make_args(limit=500, dry_run=True)
+        dispatch_command(cli, "embed", args)
+        cli.embed_backfill.assert_called_once_with(limit=500, dry_run=True)
+
+
+# ---- similar ----
+class TestDispatchSimilar:
+    def _payload(self):
+        return {
+            "query": "a|||one",
+            "seed": {"track_id": "a|||one", "label": "one — A"},
+            "results": [
+                {
+                    "track_id": "b|||two",
+                    "song": "two",
+                    "artist": "B",
+                    "similarity": 0.91,
+                    "basis": "title",
+                    "spotify_url": "",
+                }
+            ],
+        }
+
+    def test_similar_routes_correctly(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        args = _make_args(query=["a|||one"], limit=10, to_playlist=None, json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.similar_tracks.assert_called_once_with("a|||one", limit=10)
+
+    def test_similar_joins_free_text_query(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        args = _make_args(query=["late", "night", "jazz"], limit=5, to_playlist=None, json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.similar_tracks.assert_called_once_with("late night jazz", limit=5)
+
+    def test_similar_to_writes_through_add_search_to_playlist(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        cli.add_search_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["a|||one"], limit=10, to_playlist="My Mix", json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.add_search_to_playlist.assert_called_once_with("My Mix", ["b|||two"])
+
+    def test_similar_no_results_returns_error(self, cli):
+        cli.similar_tracks = MagicMock(return_value={"query": "x", "seed": None, "results": []})
+        cli.add_search_to_playlist = MagicMock()
+        args = _make_args(query=["x"], limit=10, to_playlist="My Mix", json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 1
+        cli.add_search_to_playlist.assert_not_called()
+
+
 # ---- backup ----
 class TestDispatchBackup:
     def test_backup_routes_correctly(self, cli):

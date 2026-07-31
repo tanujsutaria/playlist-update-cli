@@ -113,6 +113,9 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # Fully offline read-only audit of the local database — must run in setup
     # mode so "is my system of record healthy?" needs no credentials.
     "doctor",
+    # Offline embedding backfill + local KNN — local DB and model only.
+    "embed",
+    "similar",
 }
 
 # Task-based grouping for the /help listing. Commands not named here fall into
@@ -151,7 +154,7 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "restore-previous-rotation",
         ],
     ),
-    ("Discover", ["find", "search", "results"]),
+    ("Discover", ["find", "search", "results", "similar", "embed"]),
     ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups", "doctor"]),
 ]
 HELP_LEGACY = {"import"}

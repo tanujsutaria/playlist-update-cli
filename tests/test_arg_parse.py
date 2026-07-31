@@ -54,6 +54,8 @@ class TestSetupParsers:
             "rotate",
             "rotate-played",
             "doctor",
+            "embed",
+            "similar",
         ]
 
         # The _subparsers action contains the choices
@@ -978,3 +980,54 @@ class TestFlagDidYouMean:
         assert error is None
         assert command == "update"
         assert args.count == 5
+
+
+class TestEmbedCommand:
+    """Tests for embed command parsing"""
+
+    def test_parse_embed_defaults(self):
+        """Bare embed parses with no limit (all missing) and no dry-run."""
+        parser = setup_parsers()
+        args = parser.parse_args(["embed"])
+        assert args.command == "embed"
+        assert args.limit is None
+        assert args.dry_run is False
+
+    def test_parse_embed_with_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["embed", "--limit", "500", "--dry-run"])
+        assert args.limit == 500
+        assert args.dry_run is True
+
+    def test_parse_embed_rejects_non_positive_limit(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["embed", "--limit", "0"])
+
+
+class TestSimilarCommand:
+    """Tests for similar command parsing"""
+
+    def test_parse_similar_defaults(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["similar", "artist|||song"])
+        assert args.command == "similar"
+        assert args.query == ["artist|||song"]
+        assert args.limit == 10
+        assert args.to_playlist is None
+        assert args.json is False
+
+    def test_parse_similar_free_text_and_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(
+            ["similar", "late", "night", "jazz", "--limit", "5", "--to", "My Mix", "--json"]
+        )
+        assert args.query == ["late", "night", "jazz"]
+        assert args.limit == 5
+        assert args.to_playlist == "My Mix"
+        assert args.json is True
+
+    def test_parse_similar_requires_query(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["similar"])
