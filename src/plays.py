@@ -68,6 +68,24 @@ def play_counts(conn: sqlite3.Connection, since: Optional[str] = None) -> Dict[s
     return {str(row[0]): int(row[1]) for row in rows}
 
 
+def last_played_map(conn: sqlite3.Connection) -> Dict[str, str]:
+    """track_id -> most recent ``played_at`` among counted plays (30s rule).
+
+    Values are the stored UTC ISO-8601 strings (lexicographic order ==
+    chronological order). Tracks whose counted plays all lack a ``played_at``
+    don't appear — absence means "no real listen data", never "never played".
+    """
+    rows = conn.execute(
+        f"""
+        SELECT track_id, MAX(played_at) AS last_played
+        FROM listen_events
+        WHERE {_PLAY_PREDICATE} AND played_at IS NOT NULL
+        GROUP BY track_id;
+        """
+    ).fetchall()
+    return {str(row[0]): str(row[1]) for row in rows}
+
+
 def top_played(
     conn: sqlite3.Connection,
     limit: int = 20,

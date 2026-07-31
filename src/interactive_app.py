@@ -110,6 +110,12 @@ COMMANDS_ALLOWED_WITHOUT_SPOTIFY = {
     # a half-configured setup may need to get unstuck).
     "auth-reset",
     "interactive",
+    # Fully offline read-only audit of the local database — must run in setup
+    # mode so "is my system of record healthy?" needs no credentials.
+    "doctor",
+    # Offline embedding backfill + local KNN — local DB and model only.
+    "embed",
+    "similar",
 }
 
 # Task-based grouping for the /help listing. Commands not named here fall into
@@ -146,10 +152,13 @@ HELP_GROUPS: "list[tuple[str, list[str]]]" = [
             "backup",
             "restore",
             "restore-previous-rotation",
+            "add",
+            "remove",
+            "move",
         ],
     ),
-    ("Discover", ["find", "search", "results"]),
-    ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups"]),
+    ("Discover", ["find", "search", "results", "similar", "embed"]),
+    ("Insight", ["dash", "stats", "profile", "taste", "list-rotations", "list-backups", "doctor"]),
 ]
 HELP_LEGACY = {"import"}
 
@@ -996,9 +1005,14 @@ class PlaylistInteractiveApp(App):
         * restore — replaces the entire live data/ directory with a backup;
         * auth-reset — deletes the cached Spotify token file;
         * update (without --dry-run) — rewrites the real Spotify playlist;
-        * rotate / rotate-played — modify the real playlist (no dry-run mode);
+        * rotate / rotate-played (without --dry-run) — modify the real
+          playlist (the legacy alias has no --dry-run flag, so it always
+          gates);
         * sync — adds AND removes real-playlist tracks to mirror the db;
-        * clean (without --dry-run) — permanently deletes rows from the db.
+        * clean (without --dry-run) — permanently deletes rows from the db;
+        * remove / move — take tracks out of a real playlist (via
+          playlist_remove_all_occurrences_of_items, so ALL duplicate
+          occurrences vanish; the /undo snapshot restores them).
 
         Deliberately NOT gated: undo and restore-previous-rotation (recovery
         commands whose whole purpose is reverting a bad write — friction
@@ -1023,10 +1037,10 @@ class PlaylistInteractiveApp(App):
                 f"Apply a fresh selection to Spotify playlist '{playlist}'? "
                 "This rewrites the live playlist (use --dry-run to preview)."
             )
-        if command in ("rotate", "rotate-played"):
+        if command in ("rotate", "rotate-played") and not getattr(args, "dry_run", False):
             return (
                 f"Rotate played tracks out of Spotify playlist '{playlist}'? "
-                "This modifies the live playlist."
+                "This modifies the live playlist (use --dry-run to preview)."
             )
         if command == "sync":
             return (
@@ -1037,6 +1051,18 @@ class PlaylistInteractiveApp(App):
             return (
                 "Permanently remove dead or over-popular songs from the local "
                 "database? (/clean --dry-run previews the removals.)"
+            )
+        if command == "remove":
+            return (
+                "Remove the matched track from Spotify playlist "
+                f"'{getattr(args, 'from_playlist', '')}'? ALL duplicate occurrences "
+                "vanish (the /undo snapshot restores them)."
+            )
+        if command == "move":
+            return (
+                f"Move the matched track from '{getattr(args, 'from_playlist', '')}' "
+                f"to '{getattr(args, 'to_playlist', '')}'? Both live playlists are "
+                "modified (/undo twice reverts both)."
             )
         return None
 

@@ -21,6 +21,9 @@ from rich.logging import RichHandler
 from rich.text import Text
 
 from config import AppConfig, env_flag, env_int
+from doctor import DEFAULT_EMBEDDING_MODEL, default_backups_dir, has_failures
+from doctor import results_payload as doctor_results_payload
+from doctor import run_checks as run_doctor_checks
 from gdpr_import import GdprImportError, import_streaming_history, iter_streaming_records
 from models import Song, track_id_for
 from nextgen.acoustic import backfill_sonic
@@ -57,7 +60,7 @@ from storage.db import Database, get_db_path
 from storage.migrations import ensure_schema
 from storage.repos import Repositories
 from storage.sonic import SONIC_FEATURES, describe_sonic
-from storage.vectors import decode_vector, mean_vector, taste_centroid, vector_norm
+from storage.vectors import decode_vector, encode_vector, mean_vector, taste_centroid, vector_norm
 from taste_facets import (
     decade_histogram,
     decade_of,
@@ -3650,21 +3653,27 @@ class PlaylistCLI:
         caption("mirror is read-only; local edits are not pushed")
         return payload
 
-    def rotate_playlist_played(self, playlist_name: str, max_replace: Optional[int] = None) -> None:
-        """Rotate a playlist by removing tracks played since they were added."""
-        section("Rotate (Played)", playlist_name)
+    def _plan_rotation_played(
+        self, playlist_name: str, max_replace: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Plan phase for /rotate: compute removals + replacements, no writes.
+
+        Spotify is only read (playlist id + tracks); the single write lives in
+        rotate_playlist_played's apply phase. Returns None when there is
+        nothing to do (the reason is already emitted), else the plan dict.
+        """
         try:
             if self.spotify.get_playlist_id(playlist_name) is None:
                 report_playlist_miss(self, playlist_name)
-                return
+                return None
             tracks = self.spotify.get_playlist_tracks(playlist_name)
         except Exception as exc:
             warning(f"Failed to load playlist: {exc}")
-            return
+            return None
 
         if not tracks:
             warning("Playlist is empty.")
-            return
+            return None
 
         def parse_ts(value: Optional[str]) -> Optional[datetime]:
             if not value:
@@ -3696,7 +3705,7 @@ class PlaylistCLI:
 
         if not track_ids:
             warning("No recognizable tracks found in playlist.")
-            return
+            return None
 
         latest_map = self.repos.listen_events.list_by_track
         played_ids: List[Tuple[str, Optional[datetime], Optional[datetime]]] = []
@@ -3728,7 +3737,7 @@ class PlaylistCLI:
 
         if not played_ids:
             info("No played tracks detected since add time.")
-            return
+            return None
 
         if max_replace is not None:
             played_ids = played_ids[:max_replace]
@@ -3782,7 +3791,8 @@ class PlaylistCLI:
         candidate_rows.sort(key=candidate_key)
 
         needed = min(len(played_ids), len(candidate_rows))
-        replacements = candidate_rows[:needed]
+        # Plain dicts: sqlite3.Row has no .get(), and the table renderers use it.
+        replacements = [dict(row) for row in candidate_rows[:needed]]
 
         songs_to_keep: List[Song] = []
         for entry in tracks:
@@ -3816,57 +3826,108 @@ class PlaylistCLI:
             )
 
         new_songs = songs_to_keep + replacement_songs
-        success = self.spotify.replace_playlist_items(playlist_name, new_songs)
+        return {
+            "played_ids": played_ids,
+            "replacements": replacements,
+            "needed": needed,
+            "new_songs": new_songs,
+        }
+
+    def _rotation_removed_table(
+        self, played_ids: List[Tuple[str, Optional[datetime], Optional[datetime]]]
+    ) -> None:
+        """Render the played-tracks table shared by /rotate apply and dry-run."""
+        removed_rows = []
+        for idx, (track_id, added_at, played_at) in enumerate(played_ids, 1):
+            track = self.repos.tracks.get(track_id) or {}
+            artist_record = self.repos.artists.get(track.get("artist_id") or "")
+            artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
+            removed_rows.append(
+                [
+                    idx,
+                    # Visible text unchanged; a Spotify identity adds an
+                    # OSC 8 hyperlink (terminals without it show the name).
+                    link_text(
+                        track.get("name") or track_id,
+                        spotify_track_url(track.get("spotify_id")),
+                    ),
+                    artist_name or "",
+                    added_at.isoformat() if added_at else "",
+                    played_at.isoformat() if played_at else "",
+                ]
+            )
+        if removed_rows:
+            table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
+
+    def _rotation_added_table(self, replacements: List[Any]) -> None:
+        """Render the replacements table shared by /rotate apply and dry-run."""
+        added_rows = []
+        for idx, row in enumerate(replacements, 1):
+            artist_record = self.repos.artists.get(row["artist_id"] or "")
+            artist_name = artist_record.get("name") if artist_record else row["artist_id"]
+            added_rows.append(
+                [
+                    idx,
+                    row.get("name") or "",
+                    artist_name or "",
+                    row.get("spotify_id") or "",
+                ]
+            )
+        if added_rows:
+            table(
+                [
+                    ColumnSpec("#", justify="right", style="dim"),
+                    # The row carries its Spotify id in column 3 — the song
+                    # name links to it, visible text unchanged.
+                    ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
+                    "Artist",
+                    "Spotify ID",
+                ],
+                added_rows,
+            )
+
+    def rotate_playlist_played(
+        self,
+        playlist_name: str,
+        max_replace: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Rotate a playlist by removing tracks played since they were added.
+
+        With ``dry_run`` the plan (removals + replacements) is rendered in the
+        /diff table conventions and nothing is written to Spotify.
+        """
+        section("Rotate (Played)", f"{playlist_name}{' (dry run)' if dry_run else ''}")
+        plan = self._plan_rotation_played(playlist_name, max_replace)
+        if plan is None:
+            return
+
+        played_ids = plan["played_ids"]
+        replacements = plan["replacements"]
+        needed = plan["needed"]
+
+        if dry_run:
+            key_value_table(
+                [
+                    ["Would remove", f"{len(played_ids)} tracks"],
+                    ["Would add", f"{needed} tracks"],
+                ]
+            )
+            subsection("Would Remove (Played After Added)")
+            self._rotation_removed_table(played_ids)
+            subsection("Would Add (Replacements)")
+            self._rotation_added_table(replacements)
+            info("Dry run: no changes written. Re-run without --dry-run to apply.")
+            return
+
+        # Apply phase: the single Spotify write.
+        success = self.spotify.replace_playlist_items(playlist_name, plan["new_songs"])
         if success:
             info(f"Replaced {len(replacements)} played tracks.")
             subsection("Removed (Played After Added)")
-            removed_rows = []
-            for idx, (track_id, added_at, played_at) in enumerate(played_ids[:needed], 1):
-                track = self.repos.tracks.get(track_id) or {}
-                artist_record = self.repos.artists.get(track.get("artist_id") or "")
-                artist_name = artist_record.get("name") if artist_record else track.get("artist_id")
-                removed_rows.append(
-                    [
-                        idx,
-                        # Visible text unchanged; a Spotify identity adds an
-                        # OSC 8 hyperlink (terminals without it show the name).
-                        link_text(
-                            track.get("name") or track_id,
-                            spotify_track_url(track.get("spotify_id")),
-                        ),
-                        artist_name or "",
-                        added_at.isoformat() if added_at else "",
-                        played_at.isoformat() if played_at else "",
-                    ]
-                )
-            if removed_rows:
-                table(["#", "Song", "Artist", "Added At", "Played At"], removed_rows)
-
+            self._rotation_removed_table(played_ids[:needed])
             subsection("Added (Replacements)")
-            added_rows = []
-            for idx, row in enumerate(replacements, 1):
-                artist_record = self.repos.artists.get(row["artist_id"] or "")
-                artist_name = artist_record.get("name") if artist_record else row["artist_id"]
-                added_rows.append(
-                    [
-                        idx,
-                        row.get("name") or "",
-                        artist_name or "",
-                        row.get("spotify_id") or "",
-                    ]
-                )
-            if added_rows:
-                table(
-                    [
-                        ColumnSpec("#", justify="right", style="dim"),
-                        # The row carries its Spotify id in column 3 — the song
-                        # name links to it, visible text unchanged.
-                        ColumnSpec("Song", link=lambda _cell, row: spotify_track_url(str(row[3]))),
-                        "Artist",
-                        "Spotify ID",
-                    ],
-                    added_rows,
-                )
+            self._rotation_added_table(replacements)
         else:
             warning("Failed to update playlist.")
 
@@ -4466,31 +4527,444 @@ class PlaylistCLI:
             warning(f"Failed to undo the last change to '{playlist_name}'.")
         return success
 
-    def enrich_library(self, limit: int = 25, dry_run: bool = False, concurrency: int = 8) -> int:
+    def _cohort_source(
+        self, cohort: str, playlist: Optional[str]
+    ) -> Optional[Tuple[str, List[Any], str]]:
+        """Resolve a backfill cohort flag to (membership subquery, params, label).
+
+        Membership-only subqueries — the caller joins them against ``tracks``
+        and keeps its own missing-row filter, so --limit/--dry-run semantics
+        are untouched. Returns None on a --playlist miss, already rendered via
+        the central suggest-on-miss path (suggestions are never executed).
+        """
+        if cohort == "played":
+            return "SELECT DISTINCT track_id FROM listen_events", [], "played"
+        if cohort == "liked":
+            return "SELECT track_id FROM liked_tracks", [], "liked"
+        if cohort == "rotation":
+            return "SELECT DISTINCT track_id FROM generation_tracks", [], "rotation"
+        # --playlist NAME: membership lives in the /pull mirror. Exact
+        # (case-insensitive) match only — a near miss suggests, never executes.
+        row = self.repos.conn.execute(
+            """
+            SELECT spotify_playlist_id, name FROM spotify_playlists
+            WHERE name = ? COLLATE NOCASE
+            ORDER BY name LIMIT 1
+            """,
+            (playlist or "",),
+        ).fetchone()
+        if row is None:
+            report_playlist_miss(self, playlist or "")
+            return None
+        return (
+            "SELECT track_id FROM playlist_tracks WHERE spotify_playlist_id = ?",
+            [row["spotify_playlist_id"]],
+            f"playlist '{row['name']}'",
+        )
+
+    def _report_cohort_coverage(
+        self, source_sql: str, params: List[Any], label: str, target_table: str, what: str
+    ) -> None:
+        """Print the pre-run coverage readout: cohort size, missing count, %.
+
+        `source_sql`/`target_table` are trusted literals from the call sites
+        below, never user input.
+        """
+        conn = self.repos.conn
+        size = int(conn.execute(f"SELECT COUNT(*) FROM ({source_sql})", params).fetchone()[0])
+        missing = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM tracks t
+                JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id
+                LEFT JOIN {target_table} x ON x.track_id = t.track_id
+                WHERE x.track_id IS NULL
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        covered_pct = 100.0 if size == 0 else (size - missing) * 100.0 / size
+        info(
+            f"Cohort {label}: {size} track(s), {missing} missing {what} "
+            f"({covered_pct:.1f}% covered)."
+        )
+
+    # ---- Quick track ops (/add, /remove, /move) ---------------------------
+
+    def _mirror_playlist_id(self, playlist_name: str) -> Optional[str]:
+        """spotify_playlist_id of a mirrored playlist by (case-insensitive) name.
+
+        Local-only: reads the /pull mirror (spotify_playlists), never the API.
+        Returns None when the playlist hasn't been mirrored yet.
+        """
+        lowered = playlist_name.lower()
+        for row in self.repos.spotify_playlists.list_all():
+            if (row.get("name") or "").lower() == lowered:
+                return row.get("spotify_playlist_id")
+        return None
+
+    def _track_candidate(self, track_id: str) -> Optional[Dict[str, Any]]:
+        """Hydrate one tracks-mirror row into a resolution candidate dict."""
+        record = self.repos.tracks.get(track_id)
+        if not record:
+            return None
+        artist_name = record.get("artist_id") or ""
+        artist_record = self.repos.artists.get(record.get("artist_id") or "")
+        if artist_record and artist_record.get("name"):
+            artist_name = artist_record.get("name")
+        return {
+            "track_id": track_id,
+            "name": record.get("name") or "",
+            "artist": artist_name,
+            "spotify_id": record.get("spotify_id"),
+        }
+
+    def _track_candidates(self, source_playlist: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fuzzy-match candidates from the tracks mirror.
+
+        With ``source_playlist`` (the /remove and /move case) candidates are
+        restricted to that playlist's mirrored membership; a playlist the
+        mirror doesn't know yet falls back to the whole mirror with a note
+        (its membership may simply predate the last /pull).
+        """
+        if source_playlist:
+            mirror_id = self._mirror_playlist_id(source_playlist)
+            if mirror_id:
+                rows = self.repos.playlist_tracks.list_for_playlist(mirror_id)
+                hydrated = (self._track_candidate(row["track_id"]) for row in rows)
+                return [candidate for candidate in hydrated if candidate]
+            info(
+                f"'{source_playlist}' isn't in the local mirror (run /pull) — "
+                "matching against the whole library."
+            )
+        rows = self.repos.conn.execute(
+            """
+            SELECT t.track_id, t.name, t.spotify_id,
+                   COALESCE(a.name, t.artist_id, '') AS artist
+            FROM tracks t
+            LEFT JOIN artists a ON a.artist_id = t.artist_id
+            ORDER BY t.track_id
+            """
+        ).fetchall()
+        return [
+            {
+                "track_id": row["track_id"],
+                "name": row["name"] or "",
+                "artist": row["artist"] or "",
+                "spotify_id": row["spotify_id"],
+            }
+            for row in rows
+        ]
+
+    def _resolve_track(
+        self,
+        query: str,
+        track_id: Optional[str] = None,
+        source_playlist: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a freeform query (or exact --id) to one mirrored track.
+
+        Exact first: an explicit ``track_id``, a raw ``artist|||name`` query,
+        or an "artist - name" query whose ``models.track_id_for`` id is in the
+        mirror. Otherwise difflib scoring over 'artist - name' rows (restricted
+        to the source playlist's membership for /remove and /move). A miss or
+        an ambiguous match fails loudly with a top-3 near-miss listing — no
+        wizard.
+        """
+        query = (query or "").strip()
+        if track_id:
+            candidate = self._track_candidate(track_id)
+            if candidate is None:
+                warning(f"No track with id '{track_id}' in the local mirror.")
+            return candidate
+        if not query:
+            warning("Provide a track query or --id TRACK_ID.")
+            return None
+        if "|||" in query:
+            candidate = self._track_candidate(query.lower())
+            if candidate is None:
+                warning(f"No track with id '{query.lower()}' in the local mirror.")
+            return candidate
+        if " - " in query:
+            artist, name = query.split(" - ", 1)
+            candidate = self._track_candidate(track_id_for(artist.strip(), name.strip()))
+            if candidate is not None:
+                return candidate
+
+        candidates = self._track_candidates(source_playlist)
+        if not candidates:
+            warning("No local tracks to match against. Run /pull to mirror your library first.")
+            return None
+        lowered = query.lower()
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for candidate in candidates:
+            label = f"{candidate['artist']} - {candidate['name']}".lower()
+            score = max(
+                difflib.SequenceMatcher(None, lowered, label).ratio(),
+                difflib.SequenceMatcher(None, lowered, candidate["name"].lower()).ratio(),
+            )
+            scored.append((score, candidate))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        best_score, best = scored[0]
+        runner_score = scored[1][0] if len(scored) > 1 else 0.0
+        cutoff, ambiguity_gap = 0.6, 0.05
+        if best_score >= cutoff and (best_score - runner_score) >= ambiguity_gap:
+            return best
+        if best_score < cutoff:
+            warning(f"No confident match for '{query}'. Closest near-misses:")
+        else:
+            warning(f"'{query}' is ambiguous. Top matches:")
+        for score, candidate in scored[:3]:
+            info(
+                f"  {candidate['artist']} — {candidate['name']}  "
+                f"(id: {candidate['track_id']}, score {score:.2f})"
+            )
+        info("Re-run with a more specific query or --id TRACK_ID.")
+        return None
+
+    def _lives_in_line(self, track_id: str) -> str:
+        """'lives in: A, B' from the mirror — first app caller of playlists_for_track."""
+        names = [
+            playlist.get("name") or ""
+            for playlist in self.repos.playlist_tracks.playlists_for_track(track_id)
+        ]
+        names = [name for name in names if name]
+        return f"lives in: {', '.join(names)}" if names else "lives in: no mirrored playlist"
+
+    @staticmethod
+    def _stored_spotify_uri(raw: Optional[str]) -> Optional[str]:
+        """A stored ``tracks.spotify_id`` (URI / bare id / URL) -> track URI, or None."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("spotify:track:"):
+            return raw
+        if raw.startswith("http"):
+            tail = raw.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+            return f"spotify:track:{tail}" if tail else None
+        if ":" not in raw and "/" not in raw:
+            return f"spotify:track:{raw}"
+        return None
+
+    def _song_from_candidate(self, candidate: Dict[str, Any]) -> Song:
+        return Song(
+            id=candidate["track_id"],
+            name=candidate["name"],
+            artist=candidate["artist"],
+            spotify_uri=self._stored_spotify_uri(candidate.get("spotify_id")),
+            first_added=datetime.now(),
+        )
+
+    def _remove_uri_for(self, candidate: Dict[str, Any]) -> Optional[str]:
+        """URI for a playlist remove: tracks.spotify_id, else a live search_song
+        fallback (pre-capture rows carry no Spotify identity yet)."""
+        uri = self._stored_spotify_uri(candidate.get("spotify_id"))
+        if uri:
+            return uri
+        uri = self.spotify.search_song(self._song_from_candidate(candidate))
+        if not uri:
+            warning(
+                f"No Spotify URI for '{candidate['name']}' — not stored locally and "
+                "the live search found no confident match."
+            )
+        return uri
+
+    def _patch_mirror_membership(self, playlist_name: str, track_id: str, present: bool) -> None:
+        """Patch one playlist_tracks mirror row after a successful Spotify write.
+
+        Keeps /status and follow-up /remove or /move resolutions fresh until the
+        next /pull re-mirrors the playlist. No-op when the playlist isn't
+        mirrored yet (the next /pull captures it, membership row included).
+        """
+        mirror_id = self._mirror_playlist_id(playlist_name)
+        if not mirror_id:
+            return
+        now = datetime.utcnow().isoformat() + "Z"
+        if present:
+            self.repos.conn.execute(
+                """
+                INSERT OR IGNORE INTO playlist_tracks (
+                  spotify_playlist_id, track_id, added_at, position, synced_at
+                )
+                VALUES (
+                  ?, ?, ?,
+                  (SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_tracks
+                   WHERE spotify_playlist_id = ?),
+                  ?
+                );
+                """,
+                (mirror_id, track_id, now, mirror_id, now),
+            )
+        else:
+            self.repos.conn.execute(
+                "DELETE FROM playlist_tracks WHERE spotify_playlist_id = ? AND track_id = ?;",
+                (mirror_id, track_id),
+            )
+        self.repos.conn.commit()
+
+    def add_track_to_playlist(
+        self, query: str, playlist_name: str, track_id: Optional[str] = None
+    ) -> bool:
+        """Add one mirrored track to a Spotify playlist (undoable).
+
+        Fuzzy-resolves ``query`` against the whole tracks mirror (or takes the
+        exact ``track_id``), then reuses the proven write choreography:
+        snapshot -> append (URI-less rows fall back to append_to_playlist's
+        live search) -> record undo -> patch the mirror row.
+        """
+        candidate = self._resolve_track(query, track_id=track_id)
+        if candidate is None:
+            return False
+        section("Add Track", playlist_name)
+        info(
+            f"{candidate['artist']} — {candidate['name']} "
+            f"({self._lives_in_line(candidate['track_id'])})"
+        )
+        prior = self._snapshot_playlist(playlist_name)
+        song = self._song_from_candidate(candidate)
+        success = self.spotify.append_to_playlist(playlist_name, [song])
+        if success:
+            self._record_undo(playlist_name, prior)
+            self._patch_mirror_membership(playlist_name, candidate["track_id"], present=True)
+            info(f"Added '{candidate['name']}' to playlist '{playlist_name}'.")
+            info("Run /undo to revert this change.")
+        else:
+            warning(f"Failed to add '{candidate['name']}' to playlist '{playlist_name}'.")
+        return success
+
+    def remove_track_from_playlist(
+        self, query: str, playlist_name: str, track_id: Optional[str] = None
+    ) -> bool:
+        """Remove one track from a Spotify playlist (undoable).
+
+        Resolution is restricted to the source playlist's mirrored membership.
+        The underlying call is playlist_remove_all_occurrences_of_items, so ALL
+        duplicate occurrences vanish — the undo snapshot restores them.
+        """
+        candidate = self._resolve_track(query, track_id=track_id, source_playlist=playlist_name)
+        if candidate is None:
+            return False
+        section("Remove Track", playlist_name)
+        info(
+            f"{candidate['artist']} — {candidate['name']} "
+            f"({self._lives_in_line(candidate['track_id'])})"
+        )
+        uri = self._remove_uri_for(candidate)
+        if not uri:
+            return False
+        prior = self._snapshot_playlist(playlist_name)
+        success = self.spotify.remove_from_playlist(playlist_name, [uri])
+        if success:
+            self._record_undo(playlist_name, prior)
+            self._patch_mirror_membership(playlist_name, candidate["track_id"], present=False)
+            info(
+                f"Removed '{candidate['name']}' from playlist '{playlist_name}' (all occurrences)."
+            )
+            info("Run /undo to revert this change.")
+        else:
+            warning(f"Failed to remove '{candidate['name']}' from playlist '{playlist_name}'.")
+        return success
+
+    def move_track(
+        self,
+        query: str,
+        from_playlist: str,
+        to_playlist: str,
+        track_id: Optional[str] = None,
+    ) -> bool:
+        """Move one track between playlists: remove from source, append to dest.
+
+        BOTH playlists are snapshotted before either write, and each successful
+        write pushes its own undo entry — LIFO, so the first /undo reverts the
+        destination append and a second /undo reverts the source removal.
+        """
+        candidate = self._resolve_track(query, track_id=track_id, source_playlist=from_playlist)
+        if candidate is None:
+            return False
+        section("Move Track", f"{from_playlist} → {to_playlist}")
+        info(
+            f"{candidate['artist']} — {candidate['name']} "
+            f"({self._lives_in_line(candidate['track_id'])})"
+        )
+        uri = self._remove_uri_for(candidate)
+        if not uri:
+            return False
+        # Snapshot BOTH playlists before either write, so a mid-move failure
+        # still leaves an accurate restore point for each side.
+        prior_from = self._snapshot_playlist(from_playlist)
+        prior_to = self._snapshot_playlist(to_playlist)
+        if not self.spotify.remove_from_playlist(from_playlist, [uri]):
+            warning(
+                f"Failed to remove '{candidate['name']}' from '{from_playlist}' — "
+                "nothing was moved."
+            )
+            return False
+        self._record_undo(from_playlist, prior_from)
+        self._patch_mirror_membership(from_playlist, candidate["track_id"], present=False)
+        song = self._song_from_candidate(candidate)
+        if not self.spotify.append_to_playlist(to_playlist, [song]):
+            warning(
+                f"Removed '{candidate['name']}' from '{from_playlist}' but failed to add "
+                f"it to '{to_playlist}'. Run /undo to restore '{from_playlist}'."
+            )
+            return False
+        self._record_undo(to_playlist, prior_to)
+        self._patch_mirror_membership(to_playlist, candidate["track_id"], present=True)
+        info(f"Moved '{candidate['name']}' from '{from_playlist}' to '{to_playlist}'.")
+        info("Run /undo to revert (twice to revert both playlists).")
+        return True
+
+    def enrich_library(
+        self,
+        limit: int = 25,
+        dry_run: bool = False,
+        concurrency: int = 8,
+        cohort: Optional[str] = None,
+        playlist: Optional[str] = None,
+    ) -> int:
         """Backfill semantic context + re-embed library tracks that lack context.
 
         Each track is a real deep-search call, so this is bounded by `limit`
         (default 25) — a full-library backfill is an explicit, larger `--limit`.
         The slow network fetch is parallelized across `concurrency` workers while
         DB writes stay serialized. Tracks whose deep-search results don't surface
-        them are left untouched. Returns the number of tracks enriched.
+        them are left untouched. A cohort flag (--played/--liked/--rotation/
+        --playlist) narrows the candidates to tracks that actually feed /taste,
+        /find and rotation; no cohort keeps today's whole-library order.
+        Returns the number of tracks enriched.
         """
         section("Enrich Library")
         info("Semantic context only (genre/mood/era/style) — not acoustic audio features.")
+        cohort_join = ""
+        cohort_params: List[Any] = []
+        if cohort:
+            resolved = self._cohort_source(cohort, playlist)
+            if resolved is None:
+                return 0  # --playlist miss (already reported with suggestions)
+            source_sql, cohort_params, label = resolved
+            self._report_cohort_coverage(
+                source_sql, cohort_params, label, "track_context", "context"
+            )
+            cohort_join = f"JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id"
         rows = self.repos.conn.execute(
-            """
+            f"""
             SELECT t.track_id, t.name, t.artist_id, a.name AS artist_name
             FROM tracks t
+            {cohort_join}
             LEFT JOIN track_context c ON c.track_id = t.track_id
             LEFT JOIN artists a ON a.artist_id = t.artist_id
             WHERE c.track_id IS NULL
             ORDER BY t.track_id
             LIMIT ?
             """,
-            (max(0, limit),),
+            (*cohort_params, max(0, limit)),
         ).fetchall()
         if not rows:
-            info("Nothing to enrich — every track already has context.")
+            if cohort:
+                info("Nothing to enrich — the cohort is empty or fully covered.")
+            else:
+                info("Nothing to enrich — every track already has context.")
             return 0
 
         def _name_artist(row: Any) -> Tuple[str, str]:
@@ -4535,30 +5009,54 @@ class PlaylistCLI:
         )
         return counts["enriched"]
 
-    def sonic_backfill(self, limit: int = 50, dry_run: bool = False) -> int:
+    def sonic_backfill(
+        self,
+        limit: int = 50,
+        dry_run: bool = False,
+        cohort: Optional[str] = None,
+        playlist: Optional[str] = None,
+    ) -> int:
         """Backfill acoustic features from AcousticBrainz for tracks that lack them.
 
         Resolves each track to a MusicBrainz MBID and stores its precomputed
         AcousticBrainz sonic vector — no audio downloaded. SERIAL + rate-limited
         (MusicBrainz ~1 req/sec), so a full library is ~minutes, not parallelizable.
-        Returns the number of tracks for which sonic features were stored.
+        A cohort flag (--played/--liked/--rotation/--playlist) narrows the
+        candidates to tracks that actually feed /taste, /find and rotation;
+        no cohort keeps today's whole-library order. Returns the number of
+        tracks for which sonic features were stored.
         """
         section("Sonic Backfill")
         info("Acoustic features from AcousticBrainz (MBID-keyed; no audio downloaded).")
+        cohort_join = ""
+        cohort_params: List[Any] = []
+        if cohort:
+            resolved = self._cohort_source(cohort, playlist)
+            if resolved is None:
+                return 0  # --playlist miss (already reported with suggestions)
+            source_sql, cohort_params, label = resolved
+            self._report_cohort_coverage(
+                source_sql, cohort_params, label, "track_sonic", "sonic features"
+            )
+            cohort_join = f"JOIN ({source_sql}) cohort ON cohort.track_id = t.track_id"
         rows = self.repos.conn.execute(
-            """
+            f"""
             SELECT t.track_id, t.name, a.name AS artist
             FROM tracks t
+            {cohort_join}
             LEFT JOIN track_sonic s ON s.track_id = t.track_id
             LEFT JOIN artists a ON a.artist_id = t.artist_id
             WHERE s.track_id IS NULL
             ORDER BY t.track_id
             LIMIT ?
             """,
-            (max(0, limit),),
+            (*cohort_params, max(0, limit)),
         ).fetchall()
         if not rows:
-            info("Nothing to backfill — every track already has sonic features.")
+            if cohort:
+                info("Nothing to backfill — the cohort is empty or fully covered.")
+            else:
+                info("Nothing to backfill — every track already has sonic features.")
             return 0
 
         def _name_artist(row: Any) -> Tuple[str, str]:
@@ -4596,7 +5094,130 @@ class PlaylistCLI:
                 ["Failed", counts["failed"]],
             ]
         )
+        if cohort:
+            # Hit-rate probe: how much of this cohort AcousticBrainz can serve.
+            info(f"resolved {counts['stored']}/{total} via AcousticBrainz")
         return counts["stored"]
+
+    def embed_backfill(self, limit: Optional[int] = None, dry_run: bool = False) -> int:
+        """Backfill lexical embeddings for tracks that have none.
+
+        Embeds the canonical ``"name by artist"`` text with the already-local
+        model and writes rows into ``track_embeddings`` — fully offline and
+        free, so the default is the whole library (bound it with ``--limit``).
+        Tracks that already have an embedding are never touched: /enrich's
+        context-based re-embeds stay the upgrade path on top of this floor.
+        Returns the number of tracks embedded.
+        """
+        section("Embed Backfill")
+        info("Lexical 'name by artist' embeddings via the local model (offline, free).")
+        rows = self.repos.conn.execute(
+            """
+            SELECT t.track_id, t.name, t.artist_id, a.name AS artist_name
+            FROM tracks t
+            LEFT JOIN track_embeddings e ON e.track_id = t.track_id
+            LEFT JOIN artists a ON a.artist_id = t.artist_id
+            WHERE e.track_id IS NULL
+            ORDER BY t.track_id
+            LIMIT ?
+            """,
+            (-1 if limit is None else max(0, limit),),
+        ).fetchall()
+        if not rows:
+            info("Nothing to embed — every track already has an embedding.")
+            return 0
+
+        def _name_artist(row: Any) -> Tuple[str, str]:
+            return (row["name"] or "", row["artist_name"] or row["artist_id"] or "")
+
+        total = len(rows)
+        bound = "all missing" if limit is None else f"limit {limit}"
+        info(f"Found {total} track(s) without an embedding ({bound}).")
+        if dry_run:
+            for row in rows[:10]:
+                name, artist = _name_artist(row)
+                info(f"  would embed: {name} — {artist}")
+            if total > 10:
+                info(f"  … and {total - 10} more")
+            info(f"Dry run: {total} track(s) would be embedded. Re-run without --dry-run.")
+            return 0
+
+        embedded = 0
+        batch_size = 256
+        for start in range(0, total, batch_size):
+            batch = rows[start : start + batch_size]
+            texts = [f"{name} by {artist}" for name, artist in map(_name_artist, batch)]
+            vectors = self.db.embed_texts(texts)
+            now = datetime.now().isoformat()
+            for row, vector in zip(batch, vectors):
+                values = [float(v) for v in vector]
+                self.repos.embeddings.upsert(
+                    {
+                        "track_id": row["track_id"],
+                        "model_name": self.db.model_name,
+                        "embedding_blob": encode_vector(values),
+                        "embedding_dim": len(values),
+                        "embedding_norm": vector_norm(values),
+                        "created_at": now,
+                    }
+                )
+                embedded += 1
+            # Commit per batch so an interrupted run keeps its progress.
+            self.repos.conn.commit()
+            info(f"  embedded {min(start + batch_size, total)}/{total}")
+        key_value_table([["Embedded", embedded]])
+        return embedded
+
+    def similar_tracks(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        """Local more-like-this: nearest stored embeddings for a track or text.
+
+        ``query`` is either a track id (``artist|||name``) — seeded by its
+        stored embedding when present, its lexical text otherwise — or free
+        text embedded on the fly. Pure local KNN over ``track_embeddings``
+        (no network); returns the payload dict, rendering is the handler's.
+        """
+        text = query.strip()
+        seed: Optional[Dict[str, Any]] = None
+        record = self.repos.tracks.get(text) or self.repos.tracks.get(text.lower())
+        if record is not None:
+            seed_id = record["track_id"]
+            artist_record = self.repos.artists.get(record.get("artist_id") or "")
+            artist_name = (artist_record or {}).get("name") or record.get("artist_id") or ""
+            seed = {
+                "track_id": seed_id,
+                "label": f"{record.get('name') or seed_id} — {artist_name}".strip(" —"),
+            }
+            stored = self.repos.embeddings.get(seed_id)
+            if stored is not None:
+                vector = decode_vector(stored["embedding_blob"])
+            else:
+                vector = self.db.embed_texts([f"{record.get('name') or ''} by {artist_name}"])[0]
+        else:
+            if "|||" in text:
+                notice(f"No track '{text}' in the library — matching it as free text.")
+            vector = self.db.embed_texts([text])[0]
+
+        exclude = {seed["track_id"]} if seed else None
+        scored = self.db.rank_similar(vector, limit=limit, exclude_ids=exclude)
+        results: List[Dict[str, Any]] = []
+        for track_id, similarity in scored:
+            track = self.repos.tracks.get(track_id) or {}
+            artist_record = self.repos.artists.get(track.get("artist_id") or "")
+            artist_name = (artist_record or {}).get("name") or track.get("artist_id") or ""
+            results.append(
+                {
+                    "track_id": track_id,
+                    "song": track.get("name") or track_id,
+                    "artist": artist_name,
+                    "similarity": round(float(similarity), 4),
+                    # Honest provenance: a track_context row means /enrich
+                    # re-embedded this track from semantic context; otherwise
+                    # the vector is the lexical "name by artist" text.
+                    "basis": "context" if self.repos.context.get(track_id) else "title",
+                    "spotify_url": spotify_track_url(track.get("spotify_id")),
+                }
+            )
+        return {"query": query, "seed": seed, "results": results}
 
     def debug_last_search(self) -> Optional[Dict[str, object]]:
         """Return debug payload for the last search run."""
@@ -5251,18 +5872,97 @@ def _handle_undo(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+def _cohort_from_args(args: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Map the mutually-exclusive cohort flags to (cohort, playlist_name).
+
+    argparse enforces the mutual exclusion; no flag means whole-library (None).
+    """
+    if getattr(args, "played", False):
+        return "played", None
+    if getattr(args, "liked", False):
+        return "liked", None
+    if getattr(args, "rotation", False):
+        return "rotation", None
+    playlist = getattr(args, "playlist", None)
+    if playlist:
+        return "playlist", playlist
+    return None, None
+
+
 def _handle_enrich(cli: "PlaylistCLI", args: Any) -> int:
+    cohort, playlist = _cohort_from_args(args)
     cli.enrich_library(
         limit=getattr(args, "limit", 25),
         dry_run=getattr(args, "dry_run", False),
         concurrency=getattr(args, "concurrency", 8),
+        cohort=cohort,
+        playlist=playlist,
     )
     return 0
 
 
 def _handle_sonic(cli: "PlaylistCLI", args: Any) -> int:
-    cli.sonic_backfill(limit=getattr(args, "limit", 50), dry_run=getattr(args, "dry_run", False))
+    cohort, playlist = _cohort_from_args(args)
+    cli.sonic_backfill(
+        limit=getattr(args, "limit", 50),
+        dry_run=getattr(args, "dry_run", False),
+        cohort=cohort,
+        playlist=playlist,
+    )
     return 0
+
+
+def _handle_embed(cli: "PlaylistCLI", args: Any) -> int:
+    cli.embed_backfill(limit=getattr(args, "limit", None), dry_run=getattr(args, "dry_run", False))
+    return 0
+
+
+def _handle_similar(cli: "PlaylistCLI", args: Any) -> int:
+    """Local more-like-this over stored embeddings — offline and instant."""
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    try:
+        query = " ".join(args.query)
+        payload = cli.similar_tracks(query, limit=getattr(args, "limit", 10))
+        results = payload.get("results") or []
+        if not results:
+            notice("No neighbors found. Run /embed to give every track an embedding.")
+            return 1
+        seed = payload.get("seed") or {}
+        section("Similar", seed.get("label") or query)
+        table(
+            [
+                ColumnSpec("#", justify="right", style="dim"),
+                "Song",
+                "Artist",
+                ColumnSpec("Sim", metric=True),
+                ColumnSpec("Basis", style="dim"),
+            ],
+            [
+                [
+                    idx,
+                    # Visible text unchanged; a known Spotify identity adds an
+                    # OSC 8 hyperlink (terminals without support show the name).
+                    link_text(r["song"], r["spotify_url"]),
+                    r["artist"],
+                    f"{r['similarity']:.2f}",
+                    r["basis"],
+                ]
+                for idx, r in enumerate(results, 1)
+            ],
+        )
+        caption("basis: context = /enrich'd semantic embedding · title = lexical 'name by artist'")
+        to_playlist = getattr(args, "to_playlist", None)
+        if to_playlist:
+            chosen = [r["track_id"] for r in results]
+            ok = cli.add_search_to_playlist(to_playlist, chosen)
+            payload["wrote"] = {"playlist": to_playlist, "requested": len(chosen), "ok": bool(ok)}
+        return 0
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
 
 
 def _present_debug_track(payload: dict) -> None:
@@ -5524,7 +6224,7 @@ def _handle_rotate_played(cli: "PlaylistCLI", args: Any) -> int:
 
 
 def _handle_rotate(cli: "PlaylistCLI", args: Any) -> int:
-    cli.rotate_playlist_played(args.playlist, args.max_replace)
+    cli.rotate_playlist_played(args.playlist, args.max_replace, getattr(args, "dry_run", False))
     return 0
 
 
@@ -5573,6 +6273,84 @@ def _handle_interactive(cli: "PlaylistCLI", args: Any) -> int:
     return 0
 
 
+# ui contract colors: green = succeeded, yellow = warning, red = failure only.
+_DOCTOR_STATUS_STYLES = {"ok": "green", "warn": "yellow", "fail": "bold red"}
+
+
+def _doctor_status_style(value: Any) -> Optional[str]:
+    return _DOCTOR_STATUS_STYLES.get(str(value))
+
+
+def _handle_doctor(cli: "PlaylistCLI", args: Any) -> int:
+    """Offline integrity audit (/doctor): render doctor.run_checks as a status
+    table (or the --json payload) and exit nonzero when any check failed."""
+    json_mode = getattr(args, "json", False)
+    set_json_mode(json_mode)
+    payload: Dict[str, Any] = {}
+    results: List[Any] = []
+    try:
+        conn = cli.repos.conn
+        db_path = cli.storage.path
+        expected_model = os.getenv("SEARCH_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+        results = run_doctor_checks(
+            conn, db_path, default_backups_dir(), expected_model=expected_model
+        )
+        payload = doctor_results_payload(results)
+        payload["db_path"] = str(db_path)
+        section("Doctor", str(db_path))
+        table(
+            [
+                ColumnSpec("Status", metric=_doctor_status_style),
+                "Check",
+                "Detail",
+                "Remedy",
+            ],
+            [[r.status, r.name, r.detail, r.remedy or "—"] for r in results],
+        )
+        counts = payload["counts"]
+        if counts["fail"]:
+            # error() is never silenced by json mode (it would land on stderr);
+            # in --json the payload itself carries the verdicts, so skip it.
+            if not json_mode:
+                error(f"{counts['fail']} check(s) failed — remedies above.", title="Doctor")
+        elif counts["warn"]:
+            warning(f"Healthy, with {counts['warn']} warning(s).")
+        else:
+            info("All checks passed.")
+    finally:
+        if json_mode:
+            emit_json(payload)
+        set_json_mode(False)
+    return 1 if has_failures(results) else 0
+
+
+def _handle_add(cli: "PlaylistCLI", args: Any) -> int:
+    query = " ".join(getattr(args, "query", None) or [])
+    ok = cli.add_track_to_playlist(
+        query, args.to_playlist, track_id=getattr(args, "track_id", None)
+    )
+    return 0 if ok else 1
+
+
+def _handle_remove(cli: "PlaylistCLI", args: Any) -> int:
+    query = " ".join(getattr(args, "query", None) or [])
+    ok = cli.remove_track_from_playlist(
+        query, args.from_playlist, track_id=getattr(args, "track_id", None)
+    )
+    return 0 if ok else 1
+
+
+def _handle_move(cli: "PlaylistCLI", args: Any) -> int:
+    query = " ".join(getattr(args, "query", None) or [])
+    ok = cli.move_track(
+        query,
+        args.from_playlist,
+        args.to_playlist,
+        track_id=getattr(args, "track_id", None),
+    )
+    return 0 if ok else 1
+
+
 # Built after the handler functions so each name is already defined.
 _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "import": _handle_import,
@@ -5608,6 +6386,12 @@ _COMMAND_HANDLERS: Dict[str, Callable[["PlaylistCLI", Any], int]] = {
     "auth-refresh": _handle_auth_refresh,
     "auth-reset": _handle_auth_reset,
     "interactive": _handle_interactive,
+    "doctor": _handle_doctor,
+    "embed": _handle_embed,
+    "similar": _handle_similar,
+    "add": _handle_add,
+    "remove": _handle_remove,
+    "move": _handle_move,
 }
 
 

@@ -53,6 +53,12 @@ class TestSetupParsers:
             "pull",
             "rotate",
             "rotate-played",
+            "doctor",
+            "embed",
+            "similar",
+            "add",
+            "remove",
+            "move",
         ]
 
         # The _subparsers action contains the choices
@@ -534,6 +540,11 @@ class TestEnrichCommand:
         assert args.limit == 25
         assert args.dry_run is False
         assert args.concurrency == 8
+        # No cohort flag = whole-library (today's behavior).
+        assert args.played is False
+        assert args.liked is False
+        assert args.rotation is False
+        assert args.playlist is None
 
     def test_parse_enrich_flags(self):
         parser = setup_parsers()
@@ -541,6 +552,30 @@ class TestEnrichCommand:
         assert args.limit == 100
         assert args.dry_run is True
         assert args.concurrency == 16
+
+    def test_parse_enrich_cohort_flags(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["enrich", "--played"]).played is True
+        assert parser.parse_args(["enrich", "--liked"]).liked is True
+        assert parser.parse_args(["enrich", "--rotation"]).rotation is True
+        assert parser.parse_args(["enrich", "--playlist", "My Mix"]).playlist == "My Mix"
+
+    def test_parse_enrich_cohorts_mutually_exclusive(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--played", "--liked"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--rotation", "--playlist", "My Mix"])
+
+    def test_parse_enrich_playlist_requires_name(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["enrich", "--playlist"])
+
+    def test_parse_enrich_cohort_keeps_limit_default(self):
+        # Cost discipline: a cohort flag must NOT loosen the --limit default.
+        parser = setup_parsers()
+        assert parser.parse_args(["enrich", "--liked"]).limit == 25
 
 
 class TestSonicCommand:
@@ -552,12 +587,36 @@ class TestSonicCommand:
         assert args.command == "sonic"
         assert args.limit == 50
         assert args.dry_run is False
+        # No cohort flag = whole-library (today's behavior).
+        assert args.played is False
+        assert args.liked is False
+        assert args.rotation is False
+        assert args.playlist is None
 
     def test_parse_sonic_flags(self):
         parser = setup_parsers()
         args = parser.parse_args(["sonic", "--limit", "200", "--dry-run"])
         assert args.limit == 200
         assert args.dry_run is True
+
+    def test_parse_sonic_cohort_flags(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["sonic", "--played"]).played is True
+        assert parser.parse_args(["sonic", "--liked"]).liked is True
+        assert parser.parse_args(["sonic", "--rotation"]).rotation is True
+        assert parser.parse_args(["sonic", "--playlist", "My Mix"]).playlist == "My Mix"
+
+    def test_parse_sonic_cohorts_mutually_exclusive(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--played", "--liked"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--liked", "--playlist", "My Mix"])
+
+    def test_parse_sonic_playlist_requires_name(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sonic", "--playlist"])
 
 
 class TestIngestCommand:
@@ -630,6 +689,16 @@ class TestRotateCommand:
         parser = setup_parsers()
         args = parser.parse_args(["rotate", "My Playlist", "--max-replace", "5"])
         assert args.max_replace == 5
+
+    def test_parse_rotate_dry_run_defaults_false(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["rotate", "My Playlist"])
+        assert args.dry_run is False
+
+    def test_parse_rotate_with_dry_run(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["rotate", "My Playlist", "--dry-run"])
+        assert args.dry_run is True
 
 
 class TestRotatePlayedCommand:
@@ -704,6 +773,20 @@ class TestInteractiveCommand:
         parser = setup_parsers()
         args = parser.parse_args(["interactive"])
         assert args.command == "interactive"
+
+
+class TestDoctorCommand:
+    """/doctor: offline integrity audit, no arguments beyond --json."""
+
+    def test_parse_doctor_default(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["doctor"])
+        assert args.command == "doctor"
+        assert args.json is False
+
+    def test_parse_doctor_json(self):
+        parser = setup_parsers()
+        assert parser.parse_args(["doctor", "--json"]).json is True
 
 
 class TestParseArgsFunction:
@@ -910,3 +993,151 @@ class TestFlagDidYouMean:
         assert error is None
         assert command == "update"
         assert args.count == 5
+
+
+class TestEmbedCommand:
+    """Tests for embed command parsing"""
+
+    def test_parse_embed_defaults(self):
+        """Bare embed parses with no limit (all missing) and no dry-run."""
+        parser = setup_parsers()
+        args = parser.parse_args(["embed"])
+        assert args.command == "embed"
+        assert args.limit is None
+        assert args.dry_run is False
+
+    def test_parse_embed_with_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["embed", "--limit", "500", "--dry-run"])
+        assert args.limit == 500
+        assert args.dry_run is True
+
+    def test_parse_embed_rejects_non_positive_limit(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["embed", "--limit", "0"])
+
+
+class TestSimilarCommand:
+    """Tests for similar command parsing"""
+
+    def test_parse_similar_defaults(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["similar", "artist|||song"])
+        assert args.command == "similar"
+        assert args.query == ["artist|||song"]
+        assert args.limit == 10
+        assert args.to_playlist is None
+        assert args.json is False
+
+    def test_parse_similar_free_text_and_flags(self):
+        parser = setup_parsers()
+        args = parser.parse_args(
+            ["similar", "late", "night", "jazz", "--limit", "5", "--to", "My Mix", "--json"]
+        )
+        assert args.query == ["late", "night", "jazz"]
+        assert args.limit == 5
+        assert args.to_playlist == "My Mix"
+        assert args.json is True
+
+    def test_parse_similar_requires_query(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["similar"])
+
+
+class TestAddCommand:
+    """Tests for add command parsing (quick track ops)"""
+
+    def test_parse_add_with_query_and_to(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["add", "wild", "nothing", "-", "shadow", "--to", "My Mix"])
+
+        assert args.command == "add"
+        assert args.query == ["wild", "nothing", "-", "shadow"]
+        assert args.to_playlist == "My Mix"
+        assert args.track_id is None
+
+    def test_parse_add_requires_to(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["add", "some", "song"])
+
+    def test_parse_add_with_id_bypass(self):
+        """--id needs no positional query (exact bypass)."""
+        parser = setup_parsers()
+        args = parser.parse_args(["add", "--id", "artist|||song", "--to", "Mix"])
+
+        assert args.query == []
+        assert args.track_id == "artist|||song"
+        assert args.to_playlist == "Mix"
+
+
+class TestRemoveCommand:
+    """Tests for remove command parsing (quick track ops)"""
+
+    def test_parse_remove_with_query_and_from(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["remove", "shadow", "--from", "My Mix"])
+
+        assert args.command == "remove"
+        assert args.query == ["shadow"]
+        assert args.from_playlist == "My Mix"
+        assert args.track_id is None
+
+    def test_parse_remove_requires_from(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["remove", "shadow"])
+
+    def test_parse_remove_with_id_bypass(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["remove", "--id", "artist|||song", "--from", "Mix"])
+
+        assert args.query == []
+        assert args.track_id == "artist|||song"
+        assert args.from_playlist == "Mix"
+
+    def test_remove_help_documents_all_occurrences(self):
+        """The help/description must warn that ALL duplicate occurrences vanish."""
+        parser = setup_parsers()
+        sub = None
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices and "remove" in action.choices:
+                sub = action.choices["remove"]
+                break
+        assert sub is not None
+        assert "playlist_remove_all_occurrences_of_items" in sub.format_help()
+
+
+class TestMoveCommand:
+    """Tests for move command parsing (quick track ops)"""
+
+    def test_parse_move_with_from_and_to(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["move", "shadow", "--from", "My Mix", "--to", "Chill"])
+
+        assert args.command == "move"
+        assert args.query == ["shadow"]
+        assert args.from_playlist == "My Mix"
+        assert args.to_playlist == "Chill"
+        assert args.track_id is None
+
+    def test_parse_move_requires_from(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["move", "shadow", "--to", "Chill"])
+
+    def test_parse_move_requires_to(self):
+        parser = setup_parsers()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["move", "shadow", "--from", "My Mix"])
+
+    def test_parse_move_with_id_bypass(self):
+        parser = setup_parsers()
+        args = parser.parse_args(["move", "--id", "a|||b", "--from", "Mix", "--to", "Chill"])
+
+        assert args.query == []
+        assert args.track_id == "a|||b"
+        assert args.from_playlist == "Mix"
+        assert args.to_playlist == "Chill"

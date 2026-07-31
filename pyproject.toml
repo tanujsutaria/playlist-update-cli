@@ -50,6 +50,7 @@ py-modules = [
     "song_store",
     "gdpr_import",
     "plays",
+    "doctor",
     "dashboard",
     "scoring",
     "taste_facets",

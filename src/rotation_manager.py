@@ -4,13 +4,21 @@ import re as _re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from models import PlaylistHistory, RotationStats, Song
+from plays import last_played_map, parse_played_at, recency_weights
 from scoring import MatchScorer, PlaylistScoreConfig
 from spotify_manager import SpotifyManager
+from ui import caption
 
 logger = logging.getLogger(__name__)
+
+# Within-tier demotion strength: how much one unit of recency-weighted play
+# mass (plays.recency_weights — a play right now weighs 1.0) subtracts from a
+# candidate's ranking score. Match scores are cosine-similarity scale (~[0,1]),
+# so a couple of recent real plays demote a track without ejecting it.
+LISTEN_DEMOTION_WEIGHT = 0.05
 
 
 def _playlist_slug(playlist_name: str) -> str:
@@ -118,6 +126,34 @@ class RotationManager:
             current_strategy="similarity-based",
         )
 
+    def _listen_signals(self) -> Tuple[Dict[str, datetime], Dict[str, float]]:
+        """Real listen-ledger signals for selection (both empty when absent).
+
+        Returns ``(track_id -> last real play as a naive local datetime,
+        track_id -> recency-weighted play mass)`` from ``plays``. When the
+        repos (and thus the listen ledger) are unavailable, both maps are
+        empty and selection behaves exactly as before listen-awareness —
+        the same holds per-track for tracks absent from the maps.
+        """
+        if self.repos is None:
+            return {}, {}
+        try:
+            conn = self.repos.conn
+            raw_last = last_played_map(conn)
+            weights = recency_weights(conn)
+        except Exception as e:
+            logger.warning(f"Listen ledger unavailable, ignoring listen data: {e}")
+            return {}, {}
+        last: Dict[str, datetime] = {}
+        for track_id, value in raw_last.items():
+            parsed = parse_played_at(value)
+            if parsed is None:
+                continue
+            # Selection compares against naive local datetime.now() dates;
+            # convert the aware UTC timestamp to match.
+            last[track_id] = parsed.astimezone().replace(tzinfo=None)
+        return last, weights
+
     def _select_songs_with_history(
         self,
         history: PlaylistHistory,
@@ -133,6 +169,12 @@ class RotationManager:
             return []
         used_songs = history.all_used_songs
 
+        # Real listen-ledger signals; tracks absent from these maps are
+        # selected exactly as before (generation-index freshness only).
+        last_played, listen_weights = self._listen_signals()
+        with_data = sum(1 for s in all_songs if s.id in last_played)
+        caption(f"{with_data} of {len(all_songs)} candidates had real listen data.")
+
         scores_by_id: Dict[str, float] = {}
         if score_config is not None:
             try:
@@ -145,11 +187,26 @@ class RotationManager:
                 scores_by_id = {}
 
         def rank_candidates(candidates: List[Song]) -> List[Song]:
-            if not scores_by_id:
-                return candidates
-            return sorted(
-                candidates, key=lambda s: (-scores_by_id.get(s.id, 0.0), s.name, s.artist)
-            )
+            if scores_by_id:
+                # Real listen mass folds into the match score as a demotion
+                # penalty; tracks absent from the ledger keep their exact
+                # pre-listen-aware ranking key.
+                return sorted(
+                    candidates,
+                    key=lambda s: (
+                        -(
+                            scores_by_id.get(s.id, 0.0)
+                            - LISTEN_DEMOTION_WEIGHT * listen_weights.get(s.id, 0.0)
+                        ),
+                        s.name,
+                        s.artist,
+                    ),
+                )
+            if listen_weights:
+                # No match scores: stable sort by listen mass alone, so tracks
+                # absent from the map (mass 0.0) keep their original order.
+                return sorted(candidates, key=lambda s: listen_weights.get(s.id, 0.0))
+            return candidates
 
         # First priority: songs that have never been used
         unused_songs = [s for s in all_songs if s.id not in used_songs]
@@ -171,6 +228,15 @@ class RotationManager:
             for song_id in gen_songs:
                 # Keep the most recent usage date
                 recent_usage[song_id] = gen_date
+
+        # A real last-played timestamp trumps the one-generation-per-day
+        # estimate whenever it is more recent: freshness uses the max of the
+        # two, so a track actually heard yesterday never counts as fresh just
+        # because its generation is old.
+        for song_id, played_dt in last_played.items():
+            estimate = recent_usage.get(song_id)
+            if estimate is None or played_dt > estimate:
+                recent_usage[song_id] = played_dt
 
         # Find songs not used in the fresh period
         fresh_songs = []

@@ -538,7 +538,7 @@ class TestSetupModeGating:
                 app._handle_command(f'/{cmd} "Test"')
             elif cmd in ("restore",):
                 app._handle_command(f"/{cmd} backup_name")
-            elif cmd in ("search", "find"):
+            elif cmd in ("search", "find", "similar"):
                 app._handle_command(f"/{cmd} jazz")
             elif cmd in ("plan",):
                 app._handle_command(f'/{cmd} "Test"')
@@ -2385,6 +2385,7 @@ class TestDestructiveQuestion:
 
         question = self._app(monkeypatch)._destructive_question
         assert question("update", SimpleNamespace(playlist="Chill", dry_run=True)) is None
+        assert question("rotate", SimpleNamespace(playlist="Chill", dry_run=True)) is None
         assert question("clean", SimpleNamespace(dry_run=True)) is None
 
     def test_non_destructive_and_recovery_commands_are_not_gated(self, monkeypatch):

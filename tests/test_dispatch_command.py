@@ -299,10 +299,17 @@ class TestDispatchRotatePlayed:
 class TestDispatchRotate:
     def test_rotate_routes_correctly(self, cli):
         cli.rotate_playlist_played = MagicMock()
-        args = _make_args(playlist="PL", max_replace=None)
+        args = _make_args(playlist="PL", max_replace=None, dry_run=False)
         rc = dispatch_command(cli, "rotate", args)
         assert rc == 0
-        cli.rotate_playlist_played.assert_called_once_with("PL", None)
+        cli.rotate_playlist_played.assert_called_once_with("PL", None, False)
+
+    def test_rotate_dry_run_routes_correctly(self, cli):
+        cli.rotate_playlist_played = MagicMock()
+        args = _make_args(playlist="PL", max_replace=None, dry_run=True)
+        rc = dispatch_command(cli, "rotate", args)
+        assert rc == 0
+        cli.rotate_playlist_played.assert_called_once_with("PL", None, True)
 
 
 # ---- profile ----
@@ -342,13 +349,25 @@ class TestDispatchEnrich:
         args = _make_args(limit=25, dry_run=False, concurrency=8)
         rc = dispatch_command(cli, "enrich", args)
         assert rc == 0
-        cli.enrich_library.assert_called_once_with(limit=25, dry_run=False, concurrency=8)
+        cli.enrich_library.assert_called_once_with(
+            limit=25, dry_run=False, concurrency=8, cohort=None, playlist=None
+        )
 
     def test_enrich_passes_flags(self, cli):
         cli.enrich_library = MagicMock()
         args = _make_args(limit=100, dry_run=True, concurrency=16)
         dispatch_command(cli, "enrich", args)
-        cli.enrich_library.assert_called_once_with(limit=100, dry_run=True, concurrency=16)
+        cli.enrich_library.assert_called_once_with(
+            limit=100, dry_run=True, concurrency=16, cohort=None, playlist=None
+        )
+
+    def test_enrich_routes_cohort_flag(self, cli):
+        cli.enrich_library = MagicMock()
+        args = _make_args(limit=25, dry_run=False, concurrency=8, liked=True)
+        dispatch_command(cli, "enrich", args)
+        cli.enrich_library.assert_called_once_with(
+            limit=25, dry_run=False, concurrency=8, cohort="liked", playlist=None
+        )
 
 
 # ---- sonic ----
@@ -358,7 +377,82 @@ class TestDispatchSonic:
         args = _make_args(limit=50, dry_run=False)
         rc = dispatch_command(cli, "sonic", args)
         assert rc == 0
-        cli.sonic_backfill.assert_called_once_with(limit=50, dry_run=False)
+        cli.sonic_backfill.assert_called_once_with(
+            limit=50, dry_run=False, cohort=None, playlist=None
+        )
+
+    def test_sonic_routes_playlist_cohort(self, cli):
+        cli.sonic_backfill = MagicMock()
+        args = _make_args(limit=50, dry_run=False, playlist="Daily Mix")
+        dispatch_command(cli, "sonic", args)
+        cli.sonic_backfill.assert_called_once_with(
+            limit=50, dry_run=False, cohort="playlist", playlist="Daily Mix"
+        )
+
+
+# ---- embed ----
+class TestDispatchEmbed:
+    def test_embed_routes_correctly(self, cli):
+        cli.embed_backfill = MagicMock()
+        args = _make_args(limit=None, dry_run=False)
+        rc = dispatch_command(cli, "embed", args)
+        assert rc == 0
+        cli.embed_backfill.assert_called_once_with(limit=None, dry_run=False)
+
+    def test_embed_passes_flags(self, cli):
+        cli.embed_backfill = MagicMock()
+        args = _make_args(limit=500, dry_run=True)
+        dispatch_command(cli, "embed", args)
+        cli.embed_backfill.assert_called_once_with(limit=500, dry_run=True)
+
+
+# ---- similar ----
+class TestDispatchSimilar:
+    def _payload(self):
+        return {
+            "query": "a|||one",
+            "seed": {"track_id": "a|||one", "label": "one — A"},
+            "results": [
+                {
+                    "track_id": "b|||two",
+                    "song": "two",
+                    "artist": "B",
+                    "similarity": 0.91,
+                    "basis": "title",
+                    "spotify_url": "",
+                }
+            ],
+        }
+
+    def test_similar_routes_correctly(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        args = _make_args(query=["a|||one"], limit=10, to_playlist=None, json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.similar_tracks.assert_called_once_with("a|||one", limit=10)
+
+    def test_similar_joins_free_text_query(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        args = _make_args(query=["late", "night", "jazz"], limit=5, to_playlist=None, json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.similar_tracks.assert_called_once_with("late night jazz", limit=5)
+
+    def test_similar_to_writes_through_add_search_to_playlist(self, cli):
+        cli.similar_tracks = MagicMock(return_value=self._payload())
+        cli.add_search_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["a|||one"], limit=10, to_playlist="My Mix", json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 0
+        cli.add_search_to_playlist.assert_called_once_with("My Mix", ["b|||two"])
+
+    def test_similar_no_results_returns_error(self, cli):
+        cli.similar_tracks = MagicMock(return_value={"query": "x", "seed": None, "results": []})
+        cli.add_search_to_playlist = MagicMock()
+        args = _make_args(query=["x"], limit=10, to_playlist="My Mix", json=False)
+        rc = dispatch_command(cli, "similar", args)
+        assert rc == 1
+        cli.add_search_to_playlist.assert_not_called()
 
 
 # ---- backup ----
@@ -454,6 +548,68 @@ class TestDispatchInteractive:
         args = _make_args()
         rc = dispatch_command(cli, "interactive", args)
         assert rc == 0
+
+
+# ---- doctor ----
+class TestDispatchDoctor:
+    def test_doctor_runs_offline_and_returns_zero(self, cli, tmp_path, monkeypatch):
+        """/doctor audits the (isolated, fresh) DB entirely offline: the lazy
+        storage property opens the TUNR_DB_PATH tmp database, no Spotify is
+        touched, and a healthy DB exits 0. The backups dir is sandboxed so the
+        check never reads the repo's real backups/ state dir."""
+        monkeypatch.setattr(main_module, "default_backups_dir", lambda: tmp_path / "backups")
+        args = _make_args(json=False)
+        rc = dispatch_command(cli, "doctor", args)
+        assert rc == 0
+
+
+# ---- add / remove / move (quick track ops) ----
+class TestDispatchAdd:
+    def test_add_routes_correctly(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["wild", "nothing"], to_playlist="Mix", track_id=None)
+        rc = dispatch_command(cli, "add", args)
+        assert rc == 0
+        cli.add_track_to_playlist.assert_called_once_with("wild nothing", "Mix", track_id=None)
+
+    def test_add_threads_id_bypass(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=True)
+        args = _make_args(query=[], to_playlist="Mix", track_id="a|||b")
+        dispatch_command(cli, "add", args)
+        cli.add_track_to_playlist.assert_called_once_with("", "Mix", track_id="a|||b")
+
+    def test_add_failure_returns_error(self, cli):
+        cli.add_track_to_playlist = MagicMock(return_value=False)
+        args = _make_args(query=["x"], to_playlist="Mix", track_id=None)
+        assert dispatch_command(cli, "add", args) == 1
+
+
+class TestDispatchRemove:
+    def test_remove_routes_correctly(self, cli):
+        cli.remove_track_from_playlist = MagicMock(return_value=True)
+        args = _make_args(query=["shadow"], from_playlist="Mix", track_id=None)
+        rc = dispatch_command(cli, "remove", args)
+        assert rc == 0
+        cli.remove_track_from_playlist.assert_called_once_with("shadow", "Mix", track_id=None)
+
+    def test_remove_failure_returns_error(self, cli):
+        cli.remove_track_from_playlist = MagicMock(return_value=False)
+        args = _make_args(query=["shadow"], from_playlist="Mix", track_id=None)
+        assert dispatch_command(cli, "remove", args) == 1
+
+
+class TestDispatchMove:
+    def test_move_routes_correctly(self, cli):
+        cli.move_track = MagicMock(return_value=True)
+        args = _make_args(query=["shadow"], from_playlist="Mix", to_playlist="Chill", track_id=None)
+        rc = dispatch_command(cli, "move", args)
+        assert rc == 0
+        cli.move_track.assert_called_once_with("shadow", "Mix", "Chill", track_id=None)
+
+    def test_move_failure_returns_error(self, cli):
+        cli.move_track = MagicMock(return_value=False)
+        args = _make_args(query=["shadow"], from_playlist="Mix", to_playlist="Chill", track_id=None)
+        assert dispatch_command(cli, "move", args) == 1
 
 
 # ---- unknown command ----

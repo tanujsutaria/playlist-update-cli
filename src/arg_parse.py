@@ -20,6 +20,37 @@ def _non_negative_int(value: str) -> int:
     return ivalue
 
 
+def _add_cohort_flags(parser: argparse.ArgumentParser) -> None:
+    """Attach the mutually-exclusive backfill cohort flags (/enrich, /sonic).
+
+    No flag targets the whole library in track-id order (today's behavior);
+    a cohort points the backfill at the tracks that actually feed /taste,
+    /find and rotation.
+    """
+    cohort = parser.add_mutually_exclusive_group()
+    cohort.add_argument(
+        "--played",
+        action="store_true",
+        help="Only tracks with listen history (the /listen-sync ledger)",
+    )
+    cohort.add_argument(
+        "--liked",
+        action="store_true",
+        help="Only Liked Songs (the /pull mirror)",
+    )
+    cohort.add_argument(
+        "--rotation",
+        action="store_true",
+        help="Only tracks that have appeared in rotation generations",
+    )
+    cohort.add_argument(
+        "--playlist",
+        metavar="NAME",
+        default=None,
+        help="Only tracks in the named playlist (the /pull mirror)",
+    )
+
+
 class HelpText(str):
     """Marker type: a parse_tokens "error" that is really help output.
 
@@ -337,6 +368,7 @@ def setup_parsers(
         metavar="N",
         help="Parallel deep-search workers (default 8); writes stay serialized",
     )
+    _add_cohort_flags(enrich_parser)
 
     # Sonic command (acoustic feature backfill from AcousticBrainz)
     sonic_parser = subparsers.add_parser(
@@ -354,6 +386,7 @@ def setup_parsers(
         action="store_true",
         help="List the tracks that would be looked up without calling out or writing",
     )
+    _add_cohort_flags(sonic_parser)
 
     # Debug command (non-interactive)
     debug_parser = subparsers.add_parser("debug", help="Show debug info (last search or track)")
@@ -454,6 +487,11 @@ def setup_parsers(
         default=None,
         help="Maximum number of played tracks to replace (default: all)",
     )
+    rotate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview removals and replacements without writing to Spotify",
+    )
 
     # Backup command
     backup_parser = subparsers.add_parser("backup", help="Backup the data directory")
@@ -512,8 +550,144 @@ def setup_parsers(
         help="Confirm the reset (without this flag nothing is deleted)",
     )
 
+    # Embed command (offline lexical embedding backfill)
+    embed_parser = subparsers.add_parser(
+        "embed", help="Backfill lexical embeddings for tracks that lack one (offline, local model)"
+    )
+    embed_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Max tracks to embed (default: all missing)",
+    )
+    embed_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the tracks that would be embedded without writing anything",
+    )
+
+    # Similar command (local more-like-this over stored embeddings)
+    similar_parser = subparsers.add_parser(
+        "similar", help="More-like-this from stored embeddings (offline; track id or free text)"
+    )
+    similar_parser.add_argument(
+        "query", nargs="+", help="A track id (artist|||name) or free text to match against"
+    )
+    similar_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=10,
+        metavar="N",
+        help="Number of neighbors to show (default: 10)",
+    )
+    similar_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        default=None,
+        help="Add the matches to playlist NAME (undoable via /undo)",
+    )
+    similar_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
+
     # Interactive UI
     subparsers.add_parser("interactive", help="Launch the interactive UI")
+
+    # Doctor command (read-only, offline): integrity + consistency audit of
+    # the SQLite system of record, one ok/warn/fail row per check.
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Audit the local database: integrity, schema, orphans, backups (offline)"
+    )
+    doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON instead of tables"
+    )
+
+    # Quick track ops: one-line single-track playlist edits, fuzzy-resolved
+    # against the local tracks mirror. Every write is /undo-able.
+    add_parser = subparsers.add_parser(
+        "add", help="Add one track to a playlist (fuzzy-matched against the local mirror)"
+    )
+    add_parser.add_argument(
+        "query", nargs="*", help='Track to add, e.g. "artist - name" (freeform)'
+    )
+    add_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        required=True,
+        help="Playlist to add the track to",
+    )
+    add_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
+
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove one track from a playlist (ALL duplicate occurrences; /undo restores them)",
+        description=(
+            "Remove one track from a playlist. Uses Spotify's "
+            "playlist_remove_all_occurrences_of_items, so every duplicate occurrence "
+            "of the track vanishes — the /undo snapshot restores them."
+        ),
+    )
+    remove_parser.add_argument(
+        "query", nargs="*", help='Track to remove, e.g. "artist - name" (freeform)'
+    )
+    remove_parser.add_argument(
+        "--from",
+        dest="from_playlist",
+        metavar="NAME",
+        required=True,
+        help="Playlist to remove the track from",
+    )
+    remove_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
+
+    move_parser = subparsers.add_parser(
+        "move",
+        help="Move one track between playlists (remove + add; /undo twice reverts both)",
+        description=(
+            "Move one track between playlists: remove from the source (ALL duplicate "
+            "occurrences, via playlist_remove_all_occurrences_of_items), then add to "
+            "the destination. Both playlists are snapshotted first — /undo reverts the "
+            "destination add, a second /undo reverts the source removal."
+        ),
+    )
+    move_parser.add_argument(
+        "query", nargs="*", help='Track to move, e.g. "artist - name" (freeform)'
+    )
+    move_parser.add_argument(
+        "--from",
+        dest="from_playlist",
+        metavar="NAME",
+        required=True,
+        help="Source playlist",
+    )
+    move_parser.add_argument(
+        "--to",
+        dest="to_playlist",
+        metavar="NAME",
+        required=True,
+        help="Destination playlist",
+    )
+    move_parser.add_argument(
+        "--id",
+        dest="track_id",
+        metavar="TRACK_ID",
+        default=None,
+        help="Exact track id (artist|||name) — bypasses fuzzy matching",
+    )
 
     return parser
 

@@ -16,6 +16,7 @@ import pytest
 from plays import (
     PLAY_MS_THRESHOLD,
     daily_counts,
+    last_played_map,
     listening_clock,
     parse_played_at,
     play_counts,
@@ -96,6 +97,40 @@ class TestPlayCounts:
 
     def test_empty_ledger(self, conn):
         assert play_counts(conn) == {}
+
+
+# ---------------------------------------------------------------------------
+# last_played_map
+# ---------------------------------------------------------------------------
+
+
+class TestLastPlayedMap:
+    def test_max_played_at_per_track_with_play_rule(self, conn):
+        a = _seed_track(conn, "Artist A", "One")
+        b = _seed_track(conn, "Artist B", "Two")
+        _add_event(conn, "a1", a, "2026-06-01T10:00:00Z")
+        _add_event(conn, "a2", a, "2026-06-03T10:00:00Z")
+        # A later sub-30s skip must NOT become the track's last played.
+        _add_event(conn, "a3", a, "2026-06-05T10:00:00Z", ms_played=5000)
+        _add_event(conn, "b1", b, "2026-06-02T10:00:00Z", ms_played=PLAY_MS_THRESHOLD)
+
+        assert last_played_map(conn) == {
+            a: "2026-06-03T10:00:00Z",
+            b: "2026-06-02T10:00:00Z",
+        }
+
+    def test_track_with_only_sub30s_events_absent(self, conn):
+        a = _seed_track(conn, "Artist A", "One")
+        _add_event(conn, "a1", a, "2026-06-01T10:00:00Z", ms_played=1000)
+        assert last_played_map(conn) == {}
+
+    def test_null_played_at_rows_ignored(self, conn):
+        a = _seed_track(conn, "Artist A", "One")
+        _add_event(conn, "a1", a, None)
+        assert last_played_map(conn) == {}
+
+    def test_empty_ledger(self, conn):
+        assert last_played_map(conn) == {}
 
 
 # ---------------------------------------------------------------------------

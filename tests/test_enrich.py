@@ -8,9 +8,11 @@ or network runs, and `EmbeddingModel` uses the conftest sentence-transformers st
 
 from __future__ import annotations
 
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import ui
 from main import PlaylistCLI
@@ -211,6 +213,188 @@ class TestEnrichLibrary:
         cli = self._cli(repos)
         # One raises (counted as failed), Two still enriches — the loop survives.
         assert cli.enrich_library(limit=10) == 1
+
+
+def _rendered(captured, width: int = 120) -> str:
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
+
+
+def _seed_played(repos, track_ids):
+    repos.conn.executemany(
+        "INSERT INTO listen_events (event_id, track_id) VALUES (?, ?)",
+        [(f"ev-{i}", tid) for i, tid in enumerate(track_ids)],
+    )
+    repos.conn.commit()
+
+
+def _seed_liked(repos, track_ids):
+    repos.conn.executemany(
+        "INSERT INTO liked_tracks (track_id) VALUES (?)", [(tid,) for tid in track_ids]
+    )
+    repos.conn.commit()
+
+
+def _seed_rotation(repos, track_ids):
+    conn = repos.conn
+    conn.execute(
+        "INSERT INTO playlists (playlist_id, name, current_generation) VALUES ('p1', 'Rot', 0)"
+    )
+    conn.executemany(
+        "INSERT INTO rotation_generations (generation_id, playlist_id, generation_index) "
+        "VALUES (?, 'p1', ?)",
+        [("g1", 0), ("g2", 1)],
+    )
+    conn.executemany(
+        "INSERT INTO generation_tracks (generation_id, track_id, position) VALUES ('g1', ?, 0)",
+        [(tid,) for tid in track_ids],
+    )
+    # The same track in a second generation must not duplicate the cohort.
+    conn.execute(
+        "INSERT INTO generation_tracks (generation_id, track_id, position) VALUES ('g2', ?, 0)",
+        (track_ids[0],),
+    )
+    conn.commit()
+
+
+def _seed_mirror_playlist(repos, name, track_ids, spotify_playlist_id="sp1"):
+    repos.spotify_playlists.upsert(spotify_playlist_id=spotify_playlist_id, name=name)
+    repos.conn.executemany(
+        "INSERT INTO playlist_tracks (spotify_playlist_id, track_id, position) VALUES (?, ?, ?)",
+        [(spotify_playlist_id, tid, i) for i, tid in enumerate(track_ids)],
+    )
+    repos.conn.commit()
+
+
+class TestEnrichCohorts:
+    """Cohort-targeted /enrich: candidate selection joins the chosen source
+    (played/liked/rotation/--playlist NAME); no flag stays whole-library."""
+
+    TRACKS = [
+        ("a|||one", "One", "a", "A"),
+        ("a|||three", "Three", "a", "A"),
+        ("a|||two", "Two", "a", "A"),
+    ]
+
+    def _cli(self, repos):
+        cli = PlaylistCLI.__new__(PlaylistCLI)
+        cli._repos = repos
+        cli._search_pipeline = SimpleNamespace(
+            model_name="all-mpnet-base-v2",
+            strict_threshold=0.6,
+            lenient_threshold=0.75,
+        )
+        return cli
+
+    def _enriched_ids(self, repos):
+        rows = repos.conn.execute("SELECT track_id FROM track_context ORDER BY track_id")
+        return [r[0] for r in rows.fetchall()]
+
+    def test_played_cohort_only(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        # Two events for the same track: DISTINCT keeps the cohort deduped.
+        _seed_played(repos, ["a|||two", "a|||two"])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        assert self._cli(repos).enrich_library(limit=10, cohort="played") == 1
+        assert self._enriched_ids(repos) == ["a|||two"]
+
+    def test_liked_cohort_only(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_liked(repos, ["a|||one"])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        assert self._cli(repos).enrich_library(limit=10, cohort="liked") == 1
+        assert self._enriched_ids(repos) == ["a|||one"]
+
+    def test_rotation_cohort_only(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_rotation(repos, ["a|||three"])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        assert self._cli(repos).enrich_library(limit=10, cohort="rotation") == 1
+        assert self._enriched_ids(repos) == ["a|||three"]
+
+    def test_playlist_cohort_matches_case_insensitively(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_mirror_playlist(repos, "Daily Mix", ["a|||one", "a|||two"])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        cli = self._cli(repos)
+        assert cli.enrich_library(limit=10, cohort="playlist", playlist="daily mix") == 2
+        assert self._enriched_ids(repos) == ["a|||one", "a|||two"]
+
+    def test_cohort_respects_limit(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_liked(repos, [tid for tid, *_ in self.TRACKS])
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        assert self._cli(repos).enrich_library(limit=2, cohort="liked") == 2
+
+    def test_empty_cohort_calls_nothing(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)  # no listen_events seeded
+        calls = {"n": 0}
+
+        def _spy(query, **kw):
+            calls["n"] += 1
+            return _echo_provider(query)
+
+        monkeypatch.setattr(enrich_mod, "run_providers", _spy)
+        captured = []
+        ui.set_output_sink(captured.append)
+        assert self._cli(repos).enrich_library(limit=10, cohort="played") == 0
+        assert calls["n"] == 0
+        assert "Cohort played: 0 track(s)" in _rendered(captured)
+
+    def test_playlist_miss_suggests_and_never_executes(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_mirror_playlist(repos, "Daily Mix", ["a|||one"])
+        calls = {"n": 0}
+
+        def _spy(query, **kw):
+            calls["n"] += 1
+            return _echo_provider(query)
+
+        monkeypatch.setattr(enrich_mod, "run_providers", _spy)
+        captured = []
+        ui.set_output_sink(captured.append)
+        assert (
+            self._cli(repos).enrich_library(limit=10, cohort="playlist", playlist="Daly Mix") == 0
+        )
+        assert calls["n"] == 0  # suggest-only: a near miss never runs the backfill
+        rendered = _rendered(captured)
+        assert "no playlist 'Daly Mix'" in rendered
+        assert "Daily Mix" in rendered
+
+    def test_coverage_readout_shape(self, tmp_path, monkeypatch):
+        repos = _repos(tmp_path, self.TRACKS)
+        _seed_liked(repos, ["a|||one", "a|||two"])
+        repos.context.upsert(
+            {
+                "track_id": "a|||one",
+                "context_text": "already enriched",
+                "strict_text": "",
+                "lenient_text": "",
+                "fields_json": "[]",
+                "sources_json": "[]",
+                "strict_ratio": 1.0,
+                "context_version": "v1",
+                "generated_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        repos.conn.commit()
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        captured = []
+        ui.set_output_sink(captured.append)
+        self._cli(repos).enrich_library(limit=10, dry_run=True, cohort="liked")
+        assert "Cohort liked: 2 track(s), 1 missing context (50.0% covered)." in _rendered(captured)
+
+    def test_no_cohort_prints_no_cohort_line(self, tmp_path, monkeypatch):
+        # No flag = today's whole-library behavior; no coverage readout appears.
+        repos = _repos(tmp_path, self.TRACKS)
+        monkeypatch.setattr(enrich_mod, "run_providers", _echo_provider)
+        captured = []
+        ui.set_output_sink(captured.append)
+        assert self._cli(repos).enrich_library(limit=10) == 3
+        assert "Cohort" not in _rendered(captured)
 
 
 def _it(song, artist):
