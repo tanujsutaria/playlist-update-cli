@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-import main as main_module
+import doctor as doctor_module
 import ui
 from doctor import (
     CheckResult,
@@ -444,9 +444,10 @@ class TestDoctorHandler:
     @pytest.fixture(autouse=True)
     def _sandbox_backups(self, tmp_path, monkeypatch):
         # main._handle_doctor resolves <repo_root>/backups; tests must never
-        # read the real state dir. The from-import means patching main's name.
+        # read the real state dir. The handler calls doctor.default_backups_dir
+        # qualified, so patching the owning module intercepts it durably.
         self.backups_dir = tmp_path / "backups"
-        monkeypatch.setattr(main_module, "default_backups_dir", lambda: self.backups_dir)
+        monkeypatch.setattr(doctor_module, "default_backups_dir", lambda: self.backups_dir)
         monkeypatch.delenv("SEARCH_EMBEDDING_MODEL", raising=False)
 
     def test_healthy_db_exits_zero_and_renders_table(self, tmp_path, capsys):

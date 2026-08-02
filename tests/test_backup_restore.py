@@ -1,238 +1,187 @@
 """
 Unit tests for backup and restore commands.
-Tests the data directory backup and restore functionality.
+
+Drives the REAL ``PlaylistCLI.backup_data`` / ``restore_data`` / ``list_backups``
+against a hermetic tmp_path project root via the ``config.project_root`` seam —
+no ``Path`` mocking, no re-implementing the copy logic in the test body.
 """
 
-from datetime import datetime
-from pathlib import Path
-from unittest.mock import patch
+import re
+from io import StringIO
 
 import pytest
+from rich.console import Console
+
+import config
+import ui
+from main import PlaylistCLI
+
+
+@pytest.fixture
+def root(tmp_path, monkeypatch):
+    """Hermetic project root with a populated data/ directory."""
+    monkeypatch.setattr(config, "project_root", lambda: tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "tunr.db").write_bytes(b"sqlite-bytes")
+    embeddings_dir = data_dir / "embeddings"
+    embeddings_dir.mkdir()
+    (embeddings_dir / "songs.pkl").write_bytes(b"pickle data")
+    return tmp_path
+
+
+@pytest.fixture
+def cli(root):
+    cli = PlaylistCLI.__new__(PlaylistCLI)
+    cli._db = None
+    cli._spotify = None
+    cli._rotation_managers = {}
+    return cli
+
+
+@pytest.fixture
+def sink():
+    """Capture everything the ui helpers emit."""
+    captured = []
+    ui.set_output_sink(captured.append)
+    yield captured
+    ui.set_output_sink(None)
+
+
+def _rendered(captured, width: int = 120) -> str:
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
 
 
 class TestBackupCommand:
     """Tests for the backup command"""
 
-    def test_backup_creates_folder(self, cli_no_init, tmp_path):
-        """Test that backup creates a folder in backups directory"""
-        with patch("main.Path") as mock_path:
-            # Set up the path mocking
-            mock_path.return_value.parent.parent = tmp_path
+    def test_backup_creates_folder_and_copies_contents(self, cli, root):
+        cli.backup_data("my_backup")
+        backup = root / "backups" / "my_backup"
+        assert backup.is_dir()
+        assert (backup / "tunr.db").read_bytes() == b"sqlite-bytes"
+        assert (backup / "embeddings" / "songs.pkl").read_bytes() == b"pickle data"
 
-            # Create data directory
-            data_dir = tmp_path / "data"
-            data_dir.mkdir()
-            (data_dir / "test.txt").write_text("test data")
+    def test_backup_uses_timestamp_name(self, cli, root):
+        cli.backup_data()
+        (created,) = list((root / "backups").iterdir())
+        assert re.fullmatch(r"\d{8}_\d{6}", created.name)
 
-            backups_dir = tmp_path / "backups"
+    def test_backup_aborts_if_name_exists(self, cli, root):
+        existing = root / "backups" / "taken"
+        existing.mkdir(parents=True)
+        cli.backup_data("taken")
+        # The pre-existing folder is untouched — nothing was copied into it.
+        assert list(existing.iterdir()) == []
 
-            # Manually call the backup logic
-            from main import PlaylistCLI
 
-            cli = PlaylistCLI.__new__(PlaylistCLI)
-            cli._db = None
-            cli._spotify = None
-            cli._rotation_managers = {}
+def _snap(cli, root):
+    """Back up into the sandbox and TRIPWIRE before any restore runs.
 
-            # Patch __file__ to return our tmp_path
-            with patch.object(Path, "__new__", return_value=tmp_path / "src" / "main.py"):
-                # The backup should create the backups directory
-                backups_dir.mkdir(exist_ok=True)
-                assert backups_dir.exists()
-
-    def test_backup_uses_timestamp_name(self, tmp_path):
-        """Test that backup uses timestamp when name not provided"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        # Generate expected name format
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # Timestamp should match YYYYMMDD_HHMMSS format
-        assert len(timestamp) == 15
-        assert timestamp[8] == "_"
-
-    def test_backup_uses_custom_name(self, tmp_path):
-        """Test that backup uses provided name"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        custom_backup = backups_dir / "my_custom_backup"
-        custom_backup.mkdir()
-
-        assert custom_backup.exists()
-        assert custom_backup.name == "my_custom_backup"
-
-    def test_backup_copies_data_contents(self, tmp_path):
-        """Test that backup copies all data directory contents"""
-        # Create data directory with files
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        embeddings_dir = data_dir / "embeddings"
-        embeddings_dir.mkdir()
-        (embeddings_dir / "songs.pkl").write_bytes(b"pickle data")
-        (embeddings_dir / "embeddings.npy").write_bytes(b"numpy data")
-
-        # Create backup
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-        backup_dir = backups_dir / "test_backup"
-
-        import shutil
-
-        shutil.copytree(str(data_dir), str(backup_dir))
-
-        # Verify contents copied
-        assert (backup_dir / "embeddings" / "songs.pkl").exists()
-        assert (backup_dir / "embeddings" / "embeddings.npy").exists()
-
-    def test_backup_aborts_if_name_exists(self, tmp_path):
-        """Test that backup aborts if backup name already exists"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        # Create existing backup
-        existing = backups_dir / "existing_backup"
-        existing.mkdir()
-
-        # Trying to create same backup should fail
-        assert existing.exists()
+    restore_data's success path deletes the moved-aside live data directory;
+    if the config.project_root seam were ever stranded, a restore here would
+    swap the repo's REAL data/. Asserting the backup landed under tmp fails
+    fast before that can happen (mirrors the bdd suite's guard).
+    """
+    cli.backup_data("snap")
+    assert (root / "backups" / "snap").is_dir(), "backup did not land in the tmp sandbox"
 
 
 class TestRestoreCommand:
     """Tests for the restore command"""
 
-    def test_restore_copies_backup_to_data(self, tmp_path):
-        """Test that restore copies backup contents to data directory"""
-        # Create backup
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-        backup_dir = backups_dir / "my_backup"
-        backup_dir.mkdir()
-        (backup_dir / "test.txt").write_text("backup data")
+    def test_restore_copies_backup_to_data(self, cli, root):
+        _snap(cli, root)
+        (root / "data" / "tunr.db").write_bytes(b"mutated")
+        assert cli.restore_data("snap") is True
+        assert (root / "data" / "tunr.db").read_bytes() == b"sqlite-bytes"
 
-        # Create (empty) data directory
-        data_dir = tmp_path / "data"
+    def test_restore_removes_moved_aside_data(self, cli, root):
+        """On success the data_old_<ts> copy must not leak."""
+        _snap(cli, root)
+        assert cli.restore_data("snap") is True
+        leftovers = [p.name for p in root.iterdir() if p.name.startswith("data_old_")]
+        assert leftovers == []
 
-        # Restore
-        import shutil
+    def test_restore_not_found(self, cli, root):
+        assert cli.restore_data("nonexistent_backup") is False
+        # Live data untouched by a failed restore.
+        assert (root / "data" / "tunr.db").read_bytes() == b"sqlite-bytes"
 
-        if data_dir.exists():
-            shutil.rmtree(str(data_dir))
-        shutil.copytree(str(backup_dir), str(data_dir))
+    def test_restore_preserves_backup(self, cli, root):
+        _snap(cli, root)
+        assert cli.restore_data("snap") is True
+        (root / "data" / "tunr.db").write_bytes(b"modified after restore")
+        assert (root / "backups" / "snap" / "tunr.db").read_bytes() == b"sqlite-bytes"
 
-        # Verify
-        assert data_dir.exists()
-        assert (data_dir / "test.txt").read_text() == "backup data"
+    def test_restore_swap_failure_rolls_back_live_data(self, cli, root, monkeypatch):
+        """If the staging→data swap raises, the moved-aside live data must be
+        rolled back into place and the staging copy cleaned up."""
+        from pathlib import Path
 
-    def test_restore_renames_existing_data(self, tmp_path):
-        """Test that existing data directory is renamed before restore"""
-        # Create existing data
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        (data_dir / "old_data.txt").write_text("old data")
+        _snap(cli, root)
+        (root / "data" / "tunr.db").write_bytes(b"live-current")
 
-        # Rename pattern: data_old_YYYYMMDD_HHMMSS
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        old_data_dir = tmp_path / f"data_old_{timestamp}"
-        data_dir.rename(old_data_dir)
+        data_dir = root / "data"
+        real_rename = Path.rename
 
-        assert old_data_dir.exists()
-        assert not data_dir.exists()
+        def failing_rename(self, target):
+            # Fail ONLY the final staging→data swap; the move-aside of the
+            # live dir (data → data_old_<ts>) must still succeed first.
+            if Path(target) == data_dir and self.name.startswith(".data_restore_"):
+                raise OSError("simulated swap failure")
+            return real_rename(self, target)
 
-    def test_restore_not_found(self, tmp_path):
-        """Test error when backup doesn't exist"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
+        monkeypatch.setattr(Path, "rename", failing_rename)
 
-        nonexistent = backups_dir / "nonexistent_backup"
-        assert not nonexistent.exists()
-
-    def test_restore_preserves_backup(self, tmp_path):
-        """Test that restore doesn't modify the backup"""
-        # Create backup
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-        backup_dir = backups_dir / "my_backup"
-        backup_dir.mkdir()
-        backup_file = backup_dir / "data.txt"
-        backup_file.write_text("original backup data")
-
-        # Restore (copy)
-        data_dir = tmp_path / "data"
-        import shutil
-
-        shutil.copytree(str(backup_dir), str(data_dir))
-
-        # Modify restored data
-        (data_dir / "data.txt").write_text("modified data")
-
-        # Backup should be unchanged
-        assert backup_file.read_text() == "original backup data"
+        assert cli.restore_data("snap") is False
+        # Live data rolled back intact, nothing leaked.
+        assert (data_dir / "tunr.db").read_bytes() == b"live-current"
+        leftovers = [
+            p.name
+            for p in root.iterdir()
+            if p.name.startswith("data_old_") or p.name.startswith(".data_restore_")
+        ]
+        assert leftovers == []
 
 
 class TestListBackupsCommand:
     """Tests for the list-backups command"""
 
-    def test_list_backups_shows_all(self, tmp_path):
-        """Test that all backups are listed"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
+    def test_list_backups_shows_all(self, cli, root, sink):
+        for name in ("backup1", "backup2", "backup3"):
+            cli.backup_data(name)
+        cli.list_backups()
+        out = _rendered(sink)
+        for name in ("backup1", "backup2", "backup3"):
+            assert name in out
+        assert "Total backups: 3" in out
 
-        # Create multiple backups
-        (backups_dir / "backup1").mkdir()
-        (backups_dir / "backup2").mkdir()
-        (backups_dir / "backup3").mkdir()
+    def test_list_backups_empty_directory(self, cli, root, sink):
+        (root / "backups").mkdir()
+        cli.list_backups()
+        assert "No backups found." in _rendered(sink)
 
-        backups = list(backups_dir.iterdir())
-        assert len(backups) == 3
+    def test_list_backups_no_directory(self, cli, root, sink):
+        cli.list_backups()
+        assert "No backups directory found." in _rendered(sink)
 
-    def test_list_backups_shows_sizes(self, tmp_path):
-        """Test that backup sizes are calculated"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        backup = backups_dir / "my_backup"
-        backup.mkdir()
-        (backup / "file1.txt").write_bytes(b"x" * 1024)  # 1KB
-        (backup / "file2.txt").write_bytes(b"x" * 2048)  # 2KB
-
-        # Calculate size
-        total_size = sum(f.stat().st_size for f in backup.rglob("*") if f.is_file())
-        assert total_size == 3072  # 3KB
-
-    def test_list_backups_empty_directory(self, tmp_path):
-        """Test handling of empty backups directory"""
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        backups = list(backups_dir.iterdir())
-        assert len(backups) == 0
-
-    def test_list_backups_no_directory(self, tmp_path):
-        """Test handling when backups directory doesn't exist"""
-        backups_dir = tmp_path / "backups"
-        assert not backups_dir.exists()
-
-    def test_list_backups_sorted_by_date(self, tmp_path):
-        """Test that backups are sorted by modification time"""
+    def test_list_backups_sorted_by_date(self, cli, root, sink):
+        import os
         import time
 
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        # Create backups with different times
-        (backups_dir / "old_backup").mkdir()
-        time.sleep(0.1)
-        (backups_dir / "new_backup").mkdir()
-
-        # Sort by mtime descending
-        sorted_backups = sorted(
-            backups_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
-        )
-
-        assert sorted_backups[0].name == "new_backup"
-        assert sorted_backups[1].name == "old_backup"
+        cli.backup_data("old_backup")
+        cli.backup_data("new_backup")
+        now = time.time()
+        os.utime(root / "backups" / "old_backup", (now - 60, now - 60))
+        os.utime(root / "backups" / "new_backup", (now, now))
+        cli.list_backups()
+        out = _rendered(sink)
+        assert out.index("new_backup") < out.index("old_backup")
 
 
 if __name__ == "__main__":

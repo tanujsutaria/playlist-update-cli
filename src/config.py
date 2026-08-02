@@ -12,11 +12,23 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+
+def project_root() -> Path:
+    """Repository root — the directory containing ``src/``, ``data/``, ``backups/``.
+
+    The single seam for anchoring state directories: callers use
+    ``config.project_root()`` (module-qualified) so tests can monkeypatch this
+    one function instead of intercepting ``Path`` in whichever module the
+    caller currently lives.
+    """
+    return Path(__file__).resolve().parent.parent
 
 
 def env_float(name: str, default: float, env: Optional[Mapping[str, str]] = None) -> float:

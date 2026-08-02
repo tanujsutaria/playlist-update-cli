@@ -20,13 +20,20 @@ from rich.console import Group
 from rich.logging import RichHandler
 from rich.text import Text
 
+# Module imports (not from-imports) for the names tests monkeypatch at the
+# owning module: a patch on e.g. ``doctor.default_backups_dir`` intercepts the
+# qualified call below no matter which module this code lives in, so the test
+# seam survives future extraction of these command bodies out of main.py.
+import config
+import doctor
+import spotify_manager
 from config import AppConfig, env_flag, env_int
-from doctor import DEFAULT_EMBEDDING_MODEL, default_backups_dir, has_failures
+from doctor import DEFAULT_EMBEDDING_MODEL, has_failures
 from doctor import results_payload as doctor_results_payload
 from doctor import run_checks as run_doctor_checks
 from gdpr_import import GdprImportError, import_streaming_history, iter_streaming_records
 from models import Song, track_id_for
-from nextgen.acoustic import backfill_sonic
+from nextgen import acoustic
 from nextgen.embeddings import EmbeddingModel
 from nextgen.enrich import enrich_tracks
 from nextgen.pipeline import SearchPipeline, SearchResult
@@ -49,10 +56,7 @@ from spotify_manager import (
     SPOTIFY_ENV_KEYS,
     SpotifyManager,
     cached_token_summary,
-    get_cached_token_info,
     missing_scopes,
-    refresh_cached_token,
-    reset_cached_token,
     scope_error_hint,
     set_retry_status_callback,
 )
@@ -464,7 +468,7 @@ def configure_logging(handler: Optional[logging.Handler] = None) -> None:
 class PlaylistCLI:
     def __init__(self):
         # Get the project root directory
-        project_root = Path(__file__).parent.parent
+        project_root = config.project_root()
         load_dotenv(project_root / "config" / ".env")
 
         # Initialize managers as needed
@@ -2632,7 +2636,7 @@ class PlaylistCLI:
         Create a backup of the entire data/ folder in a new backups/ directory
         at the same level as src/.
         """
-        project_root = Path(__file__).parent.parent
+        project_root = config.project_root()
         data_dir = project_root / "data"
         backups_dir = project_root / "backups"
         backups_dir.mkdir(exist_ok=True)
@@ -2667,7 +2671,7 @@ class PlaylistCLI:
         live data is left intact (or rolled back), and on success the
         moved-aside old data dir is removed so it does not leak.
         """
-        project_root = Path(__file__).parent.parent
+        project_root = config.project_root()
         data_dir = project_root / "data"
         backups_dir = project_root / "backups"
         backup_folder = backups_dir / backup_name
@@ -2713,7 +2717,7 @@ class PlaylistCLI:
 
     def list_backups(self):
         """List all available backups with their sizes and dates"""
-        project_root = Path(__file__).parent.parent
+        project_root = config.project_root()
         backups_dir = project_root / "backups"
 
         if not backups_dir.exists():
@@ -5041,7 +5045,7 @@ class PlaylistCLI:
             else:  # no_mbid / no_data
                 info(f"  {status.replace('_', ' ')}: {name} — {artist}")
 
-        counts = backfill_sonic(
+        counts = acoustic.backfill_sonic(
             self.repos,
             [(row["track_id"], *_name_artist(row)) for row in rows],
             on_result=_on_result,
@@ -5516,7 +5520,7 @@ class PlaylistCLI:
 
     def auth_status(self):
         """Show Spotify auth token status without triggering auth flow."""
-        token_info = get_cached_token_info()
+        token_info = spotify_manager.get_cached_token_info()
         if not token_info:
             info("No cached Spotify token found.")
             return
@@ -5539,7 +5543,7 @@ class PlaylistCLI:
                 "to confirm."
             )
             return
-        removed = reset_cached_token()
+        removed = spotify_manager.reset_cached_token()
         self._spotify = None
         if removed:
             info(
@@ -5554,7 +5558,7 @@ class PlaylistCLI:
 
     def auth_refresh(self):
         """Refresh Spotify auth token if possible."""
-        refreshed = refresh_cached_token()
+        refreshed = spotify_manager.refresh_cached_token()
         if not refreshed:
             warning(
                 "No token refreshed. You may need to re-authenticate using any Spotify command."
@@ -6253,7 +6257,7 @@ def _handle_doctor(cli: "PlaylistCLI", args: Any) -> int:
         db_path = cli.storage.path
         expected_model = os.getenv("SEARCH_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
         results = run_doctor_checks(
-            conn, db_path, default_backups_dir(), expected_model=expected_model
+            conn, db_path, doctor.default_backups_dir(), expected_model=expected_model
         )
         payload = doctor_results_payload(results)
         payload["db_path"] = str(db_path)

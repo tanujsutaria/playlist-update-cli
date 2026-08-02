@@ -11,9 +11,9 @@ from io import StringIO
 import pytest
 from rich.console import Console
 
-import main as main_mod
 import ui
 from main import PlaylistCLI
+from nextgen import acoustic
 from storage.db import Database
 from storage.migrations import LATEST_VERSION, ensure_schema
 from storage.repos import Repositories
@@ -184,7 +184,7 @@ class TestSonicCohorts:
             n = len(candidates) if stored_n is None else min(stored_n, len(candidates))
             return {"stored": n, "no_mbid": len(candidates) - n, "no_data": 0, "failed": 0}
 
-        monkeypatch.setattr(main_mod, "backfill_sonic", stub)
+        monkeypatch.setattr(acoustic, "backfill_sonic", stub)
         return seen
 
     def test_played_cohort_only(self, tmp_path, monkeypatch):
