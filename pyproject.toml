@@ -61,11 +61,15 @@ py-modules = [
     "anthropic_web_search_wrapper",
     "openai_web_search_wrapper",
     "openai_web_score_wrapper",
+    "completions",
+    "llm_json",
+    "results_screen",
+    "scopes",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["storage*", "nextgen*"]
+include = ["storage*", "nextgen*", "commands*"]
 
 [tool.pytest.ini_options]
 # Put src/ at the front of sys.path so bare imports (`from models import ...`)
