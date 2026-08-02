@@ -79,18 +79,30 @@ class TestBackupCommand:
         assert list(existing.iterdir()) == []
 
 
+def _snap(cli, root):
+    """Back up into the sandbox and TRIPWIRE before any restore runs.
+
+    restore_data's success path deletes the moved-aside live data directory;
+    if the config.project_root seam were ever stranded, a restore here would
+    swap the repo's REAL data/. Asserting the backup landed under tmp fails
+    fast before that can happen (mirrors the bdd suite's guard).
+    """
+    cli.backup_data("snap")
+    assert (root / "backups" / "snap").is_dir(), "backup did not land in the tmp sandbox"
+
+
 class TestRestoreCommand:
     """Tests for the restore command"""
 
     def test_restore_copies_backup_to_data(self, cli, root):
-        cli.backup_data("snap")
+        _snap(cli, root)
         (root / "data" / "tunr.db").write_bytes(b"mutated")
         assert cli.restore_data("snap") is True
         assert (root / "data" / "tunr.db").read_bytes() == b"sqlite-bytes"
 
     def test_restore_removes_moved_aside_data(self, cli, root):
         """On success the data_old_<ts> copy must not leak."""
-        cli.backup_data("snap")
+        _snap(cli, root)
         assert cli.restore_data("snap") is True
         leftovers = [p.name for p in root.iterdir() if p.name.startswith("data_old_")]
         assert leftovers == []
@@ -101,10 +113,40 @@ class TestRestoreCommand:
         assert (root / "data" / "tunr.db").read_bytes() == b"sqlite-bytes"
 
     def test_restore_preserves_backup(self, cli, root):
-        cli.backup_data("snap")
+        _snap(cli, root)
         assert cli.restore_data("snap") is True
         (root / "data" / "tunr.db").write_bytes(b"modified after restore")
         assert (root / "backups" / "snap" / "tunr.db").read_bytes() == b"sqlite-bytes"
+
+    def test_restore_swap_failure_rolls_back_live_data(self, cli, root, monkeypatch):
+        """If the staging→data swap raises, the moved-aside live data must be
+        rolled back into place and the staging copy cleaned up."""
+        from pathlib import Path
+
+        _snap(cli, root)
+        (root / "data" / "tunr.db").write_bytes(b"live-current")
+
+        data_dir = root / "data"
+        real_rename = Path.rename
+
+        def failing_rename(self, target):
+            # Fail ONLY the final staging→data swap; the move-aside of the
+            # live dir (data → data_old_<ts>) must still succeed first.
+            if Path(target) == data_dir and self.name.startswith(".data_restore_"):
+                raise OSError("simulated swap failure")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(Path, "rename", failing_rename)
+
+        assert cli.restore_data("snap") is False
+        # Live data rolled back intact, nothing leaked.
+        assert (data_dir / "tunr.db").read_bytes() == b"live-current"
+        leftovers = [
+            p.name
+            for p in root.iterdir()
+            if p.name.startswith("data_old_") or p.name.startswith(".data_restore_")
+        ]
+        assert leftovers == []
 
 
 class TestListBackupsCommand:
