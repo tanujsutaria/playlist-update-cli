@@ -535,16 +535,6 @@ def _is_codex_cli(args: List[str]) -> bool:
     return Path(args[0]).name == "codex"
 
 
-def _is_openai_wrapper_command(command: str) -> bool:
-    lowered = command.lower()
-    return "openai_web_search_wrapper" in lowered
-
-
-def _is_anthropic_wrapper_command(command: str) -> bool:
-    lowered = command.lower()
-    return "anthropic_web_search_wrapper" in lowered
-
-
 def _is_openai_wrapper_argv(argv: List[str]) -> bool:
     return any("openai_web_search_wrapper" in arg.lower() for arg in argv)
 
@@ -553,26 +543,12 @@ def _is_anthropic_wrapper_argv(argv: List[str]) -> bool:
     return any("anthropic_web_search_wrapper" in arg.lower() for arg in argv)
 
 
-def _should_retry_claude_with_wrapper(command: str) -> bool:
-    lowered = command.lower()
-    if "anthropic_web_search_wrapper" in lowered:
-        return False
-    if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
-        return False
-    return _module_available("anthropic")
-
-
 def _should_retry_claude_with_wrapper_argv(argv: List[str]) -> bool:
     if _is_anthropic_wrapper_argv(argv):
         return False
     if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")):
         return False
     return _module_available("anthropic")
-
-
-def _default_codex_command() -> str:
-    schema = _codex_schema()
-    return f"codex exec --search --output-schema {schema} -"
 
 
 def _default_openai_web_search_command() -> str:

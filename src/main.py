@@ -791,46 +791,6 @@ class PlaylistCLI:
             logger.error(f"Error updating playlist: {str(e)}")
             logger.debug("Full error:", exc_info=True)
 
-    def _show_detailed_stats(self, rm: RotationManager):
-        """Show detailed statistics about the playlist"""
-        stats = rm.get_rotation_stats()
-        recent_songs = rm.get_recent_songs(days=7)
-
-        # Basic stats
-        section("Playlist Statistics")
-        stats_table = [
-            ["Total Songs", stats.total_songs],
-            ["Songs Used", stats.unique_songs_used],
-            ["Songs Never Used", stats.songs_never_used],
-            ["Total generations", stats.generations_count],
-            ["Complete Rotation", "Yes" if stats.complete_rotation_achieved else "No"],
-            [
-                "Rotation Progress",
-                f"{(stats.unique_songs_used / stats.total_songs) * 100:.1f}%"
-                if stats.total_songs
-                else "0.0%",
-            ],
-            ["Current Strategy", stats.current_strategy],
-        ]
-        key_value_table(stats_table)
-
-        # Recent activity
-        section("Recent Activity", "Last 7 Days")
-        recent_table = []
-        for date, songs in recent_songs.items():
-            recent_table.append(
-                [
-                    date,
-                    len(songs),
-                    ", ".join(f"{s.name} by {s.artist}"[:40] for s in songs[:3])
-                    + ("..." if len(songs) > 3 else ""),
-                ]
-            )
-        table(
-            ["Date", "Songs Added", "Sample Songs"],
-            recent_table,
-        )
-
     def restore_previous_rotation(self, playlist_name: str, offset: int = -1):
         """
         Restore a playlist to a previous rotation by going 'offset' generations back.

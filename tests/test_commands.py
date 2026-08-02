@@ -325,45 +325,6 @@ class TestRestorePreviousRotationCommand:
             mock_cli.restore_previous_rotation("Test Playlist", -1)
 
 
-class TestDetailedStatsCommand:
-    """Tests for _show_detailed_stats division by zero fix."""
-
-    def test_detailed_stats_zero_total_songs(self, mock_cli):
-        """Division by zero when total_songs is 0 should not crash."""
-        with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
-            mock_rm = MagicMock()
-            mock_rm.get_rotation_stats.return_value = RotationStats(
-                total_songs=0,
-                unique_songs_used=0,
-                generations_count=0,
-                songs_never_used=0,
-                complete_rotation_achieved=False,
-                current_strategy="similarity-based",
-            )
-            mock_rm.get_recent_songs.return_value = {}
-            mock_get_rm.return_value = mock_rm
-
-            # Should not raise ZeroDivisionError
-            mock_cli._show_detailed_stats(mock_rm)
-
-    def test_detailed_stats_normal(self, mock_cli):
-        """Normal case where total_songs > 0 should display percentage."""
-        with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
-            mock_rm = MagicMock()
-            mock_rm.get_rotation_stats.return_value = RotationStats(
-                total_songs=100,
-                unique_songs_used=50,
-                generations_count=5,
-                songs_never_used=50,
-                complete_rotation_achieved=False,
-                current_strategy="similarity-based",
-            )
-            mock_rm.get_recent_songs.return_value = {}
-            mock_get_rm.return_value = mock_rm
-
-            mock_cli._show_detailed_stats(mock_rm)
-
-
 class TestResetSearchState:
     """Tests for _reset_search_state helper method."""
 

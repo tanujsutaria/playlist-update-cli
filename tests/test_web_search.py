@@ -187,7 +187,6 @@ def test_claude_wrapper_fallbacks_to_cli(monkeypatch):
 
     monkeypatch.setattr("web_search.subprocess.run", fake_run)
     monkeypatch.setenv("WEB_SEARCH_CLAUDE_FALLBACK_CLI", "1")
-    monkeypatch.setattr("web_search._is_anthropic_wrapper_command", lambda command: True)
 
     results, summary = _run_command(
         "claude",
@@ -222,7 +221,6 @@ def test_claude_wrapper_no_cli_fallback_by_default(monkeypatch):
 
     monkeypatch.setattr("web_search.subprocess.run", fake_run)
     monkeypatch.delenv("WEB_SEARCH_CLAUDE_FALLBACK_CLI", raising=False)
-    monkeypatch.setattr("web_search._is_anthropic_wrapper_command", lambda command: True)
 
     results, summary = _run_command(
         "claude",
