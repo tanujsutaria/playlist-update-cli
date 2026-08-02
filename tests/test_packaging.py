@@ -49,22 +49,36 @@ def test_every_top_level_module_is_declared():
     assert not stale, f"py-modules declares modules that do not exist in src/: {stale}"
 
 
+def _contains_python(directory: Path) -> bool:
+    return any(directory.rglob("*.py"))
+
+
 def test_every_package_dir_is_packaged():
-    """Every directory under src/ must be a real, declared package.
+    """Every directory under src/ that holds Python code must be a real,
+    declared package.
 
     Two failure modes are caught: a directory matching no packages.find
     pattern, and a directory with no __init__.py at all — setuptools'
     packages.find skips namespace dirs silently, so such a directory would
     pass CI (pythonpath imports it fine) yet be absent from the wheel.
+
+    Directories WITHOUT any .py files are exempt: local checkouts accumulate
+    non-code state next to the sources (a stray src/data/ from an old run,
+    *.egg-info from an editable install) that no wheel should ship anyway.
     """
     patterns = _declared_package_patterns()
-    dirs = sorted(p for p in SRC.iterdir() if p.is_dir() and p.name not in IGNORED_DIRS)
+    dirs = sorted(
+        p
+        for p in SRC.iterdir()
+        if p.is_dir() and p.name not in IGNORED_DIRS and _contains_python(p)
+    )
     assert dirs, "expected at least storage/, nextgen/, commands/ under src/"
 
     missing_init = [d.name for d in dirs if not (d / "__init__.py").exists()]
     assert not missing_init, (
-        f"src/ directories without __init__.py: {missing_init} — packages.find "
-        "skips namespace dirs, so these would ship in no wheel. Add __init__.py."
+        f"src/ directories with .py files but no __init__.py: {missing_init} — "
+        "packages.find skips namespace dirs, so these would ship in no wheel. "
+        "Add __init__.py."
     )
 
     undeclared = [d.name for d in dirs if not any(fnmatch.fnmatch(d.name, pat) for pat in patterns)]
