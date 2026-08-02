@@ -2,12 +2,10 @@
 
 Drives the REAL ``PlaylistCLI.backup_data`` / ``restore_data`` / ``list_backups``
 methods end to end via ``dispatch_command`` (the shared ``run`` helper), against a
-fully hermetic, tmp_path-based project root. Those methods resolve their data and
-backups folders from ``Path(__file__).parent.parent`` inside ``src/main.py``; we
-monkeypatch ``main.Path`` with a thin factory that redirects ONLY the module's own
-``__file__`` to ``<tmp_root>/src/main.py`` (so ``parent.parent`` == ``tmp_root``)
-while every other ``Path(...)`` call passes straight through. This keeps the real
-``data/`` and ``backups/`` folders untouched.
+fully hermetic, tmp_path-based project root. Those methods anchor their data and
+backups folders via ``config.project_root()`` — the durable seam — so redirecting
+that one function to ``tmp_path`` keeps the real ``data/`` and ``backups/``
+folders untouched, no matter which module the backup code lives in.
 
 The data payload is a real SQLite database so the assertions check actual row
 counts before and after a restore -- not filesystem mechanics in the abstract.
@@ -21,7 +19,7 @@ from pathlib import Path as RealPath
 import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
-import main
+import config
 
 # Feature file resolved relative to bdd_features_base_dir (tests/bdd/features).
 scenarios("backup_restore.feature")
@@ -68,21 +66,12 @@ class _BackupWorld:
 
 @pytest.fixture
 def patched_root(tmp_path, monkeypatch) -> _BackupWorld:
-    """A hermetic project root; ``main.Path`` redirected so the CLI's backup/
-    restore/list code resolves its data + backups folders inside ``tmp_path``."""
+    """A hermetic project root; ``config.project_root`` redirected so the CLI's
+    backup/restore/list code resolves its data + backups folders inside
+    ``tmp_path``."""
     root = tmp_path / "proj"
     root.mkdir()
-
-    main_file = main.__file__  # absolute path to src/main.py
-
-    def path_factory(arg=None, *rest, **kwargs):
-        p = RealPath() if arg is None else RealPath(arg, *rest, **kwargs)
-        # Redirect ONLY the module's own __file__ so parent.parent == root.
-        if str(p) == main_file:
-            return root / "src" / "main.py"
-        return p
-
-    monkeypatch.setattr(main, "Path", path_factory)
+    monkeypatch.setattr(config, "project_root", lambda: root)
     return _BackupWorld(root)
 
 

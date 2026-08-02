@@ -2,11 +2,32 @@
 Unit tests for CLI commands: stats, view, sync, extract, clean, list-rotations, restore-previous-rotation.
 """
 
+from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 
+import config
+import ui
 from models import RotationStats
+
+
+@pytest.fixture
+def sink():
+    """Capture everything the ui helpers emit (durable output seam)."""
+    captured = []
+    ui.set_output_sink(captured.append)
+    yield captured
+    ui.set_output_sink(None)
+
+
+def _rendered(captured, width: int = 120) -> str:
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
 
 
 class TestStatsCommand:
@@ -392,13 +413,8 @@ class TestMarkSearchTracks:
 class TestListRotationsEdgeCases:
     """Edge case tests for list_rotations command."""
 
-    def test_list_rotations_invalid_generations_string(self, mock_cli, monkeypatch):
+    def test_list_rotations_invalid_generations_string(self, mock_cli, sink):
         """Invalid --generations string should display warning via UI."""
-        calls = []
-        import main
-
-        monkeypatch.setattr(main, "warning", lambda msg: calls.append(msg))
-
         with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
             mock_rm = MagicMock()
             mock_rm.history.generations = [["song1"]]
@@ -406,15 +422,10 @@ class TestListRotationsEdgeCases:
 
             mock_cli.list_rotations("Test Playlist", "invalid")
 
-        assert any("Invalid" in c for c in calls)
+        assert "Invalid" in _rendered(sink)
 
-    def test_list_rotations_zero_generations(self, mock_cli, monkeypatch):
+    def test_list_rotations_zero_generations(self, mock_cli, sink):
         """Zero generations should display warning via UI."""
-        calls = []
-        import main
-
-        monkeypatch.setattr(main, "warning", lambda msg: calls.append(msg))
-
         with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
             mock_rm = MagicMock()
             mock_rm.history.generations = [["song1"]]
@@ -422,15 +433,10 @@ class TestListRotationsEdgeCases:
 
             mock_cli.list_rotations("Test Playlist", "0")
 
-        assert any("positive" in c for c in calls)
+        assert "positive" in _rendered(sink)
 
-    def test_list_rotations_negative_generations(self, mock_cli, monkeypatch):
+    def test_list_rotations_negative_generations(self, mock_cli, sink):
         """Negative generations should display warning via UI."""
-        calls = []
-        import main
-
-        monkeypatch.setattr(main, "warning", lambda msg: calls.append(msg))
-
         with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
             mock_rm = MagicMock()
             mock_rm.history.generations = [["song1"]]
@@ -438,15 +444,10 @@ class TestListRotationsEdgeCases:
 
             mock_cli.list_rotations("Test Playlist", "-5")
 
-        assert any("positive" in c for c in calls)
+        assert "positive" in _rendered(sink)
 
-    def test_list_rotations_empty_shows_info(self, mock_cli, monkeypatch):
+    def test_list_rotations_empty_shows_info(self, mock_cli, sink):
         """Empty history should display info message via UI."""
-        calls = []
-        import main
-
-        monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
-
         with patch.object(mock_cli, "_get_rotation_manager") as mock_get_rm:
             mock_rm = MagicMock()
             mock_rm.history.generations = []
@@ -454,26 +455,20 @@ class TestListRotationsEdgeCases:
 
             mock_cli.list_rotations("Test Playlist", "3")
 
-        assert any("No rotations found" in c for c in calls)
+        assert "No rotations found" in _rendered(sink)
 
 
 class TestListBackupsDisplay:
     """Tests for list_backups UI output fix."""
 
-    def test_list_backups_no_directory(self, mock_cli, monkeypatch, tmp_path):
+    def test_list_backups_no_directory(self, mock_cli, monkeypatch, tmp_path, sink):
         """Missing backups dir should display info message via UI."""
-        calls = []
-        import main
+        # Anchor the project root at an empty tmp dir so the computed
+        # backups/ directory does not exist.
+        monkeypatch.setattr(config, "project_root", lambda: tmp_path)
+        mock_cli.list_backups()
 
-        monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
-
-        # Point Path(__file__).parent.parent at an empty tmp dir so the
-        # computed backups/ directory does not exist.
-        with patch("main.Path") as MockPath:
-            MockPath.return_value.parent.parent = tmp_path
-            mock_cli.list_backups()
-
-        assert any("No backups directory found" in c for c in calls)
+        assert "No backups directory found" in _rendered(sink)
 
 
 if __name__ == "__main__":

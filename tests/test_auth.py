@@ -1,14 +1,22 @@
 """
 Unit tests for auth-status, auth-refresh, and auth-reset commands, plus the
 spotify_manager token-reset/scope-diff helpers behind them.
+
+Token functions are patched on ``spotify_manager`` (the owning module — main
+calls them qualified, so the seam survives the command bodies moving out of
+main.py); rendered output is captured via the ``ui.set_output_sink`` choke
+point instead of patching main's from-imported ui names.
 """
 
 from datetime import datetime
+from io import StringIO
 
 import pytest
+from rich.console import Console
 
 import main
 import spotify_manager
+import ui
 from spotify_manager import SPOTIFY_SCOPES
 
 
@@ -21,100 +29,96 @@ def cli_no_init():
     return cli
 
 
-def test_auth_status_no_token(monkeypatch, cli_no_init):
+@pytest.fixture
+def sink():
+    captured = []
+    ui.set_output_sink(captured.append)
+    yield captured
+    ui.set_output_sink(None)
+
+
+def _rendered(captured, width: int = 400) -> str:
+    """Render captured output wide enough that no table cell ever wraps —
+    scope names are hyphenated, and a wrap mid-name would break substring
+    assertions."""
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
+
+
+def test_auth_status_no_token(monkeypatch, cli_no_init, sink):
     """auth_status with no cached token should display a message via UI info()."""
-    monkeypatch.setattr(main, "get_cached_token_info", lambda: None)
-    calls = []
-    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+    monkeypatch.setattr(spotify_manager, "get_cached_token_info", lambda: None)
 
     cli_no_init.auth_status()
 
-    assert any("No cached Spotify token found" in c for c in calls)
+    assert "No cached Spotify token found" in _rendered(sink)
 
 
-def test_auth_status_with_token(monkeypatch, cli_no_init):
+def test_auth_status_with_token(monkeypatch, cli_no_init, sink):
     ts = 1_700_000_000
     token_info = {"expires_at": ts, "expires_in": 3600, "scope": "playlist-read-private"}
-    monkeypatch.setattr(main, "get_cached_token_info", lambda: token_info)
-
-    rows_holder = {}
-
-    def fake_section(*args, **kwargs):
-        return None
-
-    def fake_key_value_table(rows):
-        rows_holder["rows"] = rows
-
-    monkeypatch.setattr(main, "section", fake_section)
-    monkeypatch.setattr(main, "key_value_table", fake_key_value_table)
+    monkeypatch.setattr(spotify_manager, "get_cached_token_info", lambda: token_info)
 
     cli_no_init.auth_status()
 
-    rows = rows_holder.get("rows", [])
+    out = _rendered(sink)
     expected_expires = datetime.fromtimestamp(ts).isoformat()
-    assert ["Expires at", expected_expires] in rows
-    assert ["Expires in (seconds)", 3600] in rows
-    assert ["Scopes", "playlist-read-private"] in rows
+    assert "Expires at" in out
+    assert expected_expires in out
+    assert "Expires in (seconds)" in out
+    assert "3600" in out
+    assert "Scopes" in out
+    assert "playlist-read-private" in out
 
 
-def _auth_status_rows(monkeypatch, cli, token_info):
-    """Run auth_status against a fake cached token, capturing the table rows."""
-    monkeypatch.setattr(main, "get_cached_token_info", lambda: token_info)
-    rows_holder = {}
-    monkeypatch.setattr(main, "section", lambda *a, **k: None)
-    monkeypatch.setattr(main, "key_value_table", lambda rows: rows_holder.update(rows=rows))
+def _auth_status_output(monkeypatch, cli, sink, token_info):
+    """Run auth_status against a fake cached token, returning rendered output."""
+    monkeypatch.setattr(spotify_manager, "get_cached_token_info", lambda: token_info)
     cli.auth_status()
-    return rows_holder.get("rows", [])
+    return _rendered(sink)
 
 
-def _verdict(rows):
-    verdicts = [value for label, value in rows if label == "Verdict"]
-    assert len(verdicts) == 1
-    return verdicts[0]
-
-
-def test_auth_status_verdict_full_scopes(monkeypatch, cli_no_init):
+def test_auth_status_verdict_full_scopes(monkeypatch, cli_no_init, sink):
     """A token granting every required scope gets a clean verdict."""
     token_info = {"expires_in": 3600, "scope": " ".join(SPOTIFY_SCOPES)}
-    rows = _auth_status_rows(monkeypatch, cli_no_init, token_info)
-    verdict = _verdict(rows)
-    assert "missing scopes" not in verdict
-    assert "all required scopes" in verdict
+    out = _auth_status_output(monkeypatch, cli_no_init, sink, token_info)
+    assert "Verdict" in out
+    assert "missing scopes" not in out
+    assert "all required scopes" in out
 
 
-def test_auth_status_verdict_missing_scopes(monkeypatch, cli_no_init):
+def test_auth_status_verdict_missing_scopes(monkeypatch, cli_no_init, sink):
     """A stale token missing the listening scopes names them + /auth-reset."""
     granted = [s for s in SPOTIFY_SCOPES if not s.startswith("user-")]
     token_info = {"expires_in": 3600, "scope": " ".join(granted)}
-    rows = _auth_status_rows(monkeypatch, cli_no_init, token_info)
-    verdict = _verdict(rows)
-    assert verdict.startswith("missing scopes: ")
-    assert "user-read-recently-played" in verdict
-    assert "user-top-read" in verdict
-    assert "run /auth-reset" in verdict
+    out = _auth_status_output(monkeypatch, cli_no_init, sink, token_info)
+    assert "missing scopes: " in out
+    assert "user-read-recently-played" in out
+    assert "user-top-read" in out
+    assert "run /auth-reset" in out
 
 
-def test_auth_status_verdict_token_without_scope_field(monkeypatch, cli_no_init):
+def test_auth_status_verdict_token_without_scope_field(monkeypatch, cli_no_init, sink):
     """A token whose scope field is absent counts as missing everything."""
-    rows = _auth_status_rows(monkeypatch, cli_no_init, {"expires_in": 3600})
-    verdict = _verdict(rows)
-    assert "missing scopes" in verdict
+    out = _auth_status_output(monkeypatch, cli_no_init, sink, {"expires_in": 3600})
+    assert "missing scopes" in out
     for scope in SPOTIFY_SCOPES:
-        assert scope in verdict
+        assert scope in out
 
 
-def test_auth_status_no_token_still_short_circuits(monkeypatch, cli_no_init):
-    """No cached token: no verdict row is fabricated, just the info line."""
-    monkeypatch.setattr(main, "get_cached_token_info", lambda: None)
-    calls = []
-    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
-    tables = []
-    monkeypatch.setattr(main, "key_value_table", lambda rows: tables.append(rows))
+def test_auth_status_no_token_still_short_circuits(monkeypatch, cli_no_init, sink):
+    """No cached token: no verdict table is fabricated, just the info line."""
+    monkeypatch.setattr(spotify_manager, "get_cached_token_info", lambda: None)
 
     cli_no_init.auth_status()
 
-    assert any("No cached Spotify token found" in c for c in calls)
-    assert tables == []
+    out = _rendered(sink)
+    assert "No cached Spotify token found" in out
+    assert "Verdict" not in out
+    assert "Expires" not in out
 
 
 class TestMissingScopes:
@@ -155,11 +159,11 @@ class TestResetCachedToken:
 
 
 class TestAuthReset:
-    def test_bare_reset_warns_and_deletes_nothing(self, monkeypatch, cli_no_init):
+    def test_bare_reset_warns_and_deletes_nothing(self, monkeypatch, cli_no_init, sink):
         deleted = []
-        monkeypatch.setattr(main, "reset_cached_token", lambda: deleted.append(True) or True)
-        warnings = []
-        monkeypatch.setattr(main, "warning", lambda msg: warnings.append(msg))
+        monkeypatch.setattr(
+            spotify_manager, "reset_cached_token", lambda: deleted.append(True) or True
+        )
         sentinel = object()
         cli_no_init._spotify = sentinel
 
@@ -167,13 +171,13 @@ class TestAuthReset:
 
         assert deleted == []
         assert cli_no_init._spotify is sentinel  # client untouched without --yes
-        assert any("--yes" in w for w in warnings)
+        assert "--yes" in _rendered(sink)
 
-    def test_yes_deletes_token_and_drops_client(self, monkeypatch, cli_no_init):
+    def test_yes_deletes_token_and_drops_client(self, monkeypatch, cli_no_init, sink):
         deleted = []
-        monkeypatch.setattr(main, "reset_cached_token", lambda: deleted.append(True) or True)
-        infos = []
-        monkeypatch.setattr(main, "info", lambda msg: infos.append(msg))
+        monkeypatch.setattr(
+            spotify_manager, "reset_cached_token", lambda: deleted.append(True) or True
+        )
         cli_no_init._spotify = object()  # live client with the old token
 
         cli_no_init.auth_reset(yes=True)
@@ -183,51 +187,43 @@ class TestAuthReset:
         # its old token until expiry, so "next command re-opens consent" would
         # otherwise be false.
         assert cli_no_init._spotify is None
-        assert any("consent" in msg for msg in infos)
+        assert "consent" in _rendered(sink)
 
-    def test_yes_with_no_token_is_graceful(self, monkeypatch, cli_no_init):
-        monkeypatch.setattr(main, "reset_cached_token", lambda: False)
-        infos = []
-        monkeypatch.setattr(main, "info", lambda msg: infos.append(msg))
+    def test_yes_with_no_token_is_graceful(self, monkeypatch, cli_no_init, sink):
+        monkeypatch.setattr(spotify_manager, "reset_cached_token", lambda: False)
 
         cli_no_init.auth_reset(yes=True)
 
         assert cli_no_init._spotify is None
-        assert any("No cached Spotify token" in msg for msg in infos)
+        assert "No cached Spotify token" in _rendered(sink)
 
 
-def test_auth_refresh_no_token(monkeypatch, cli_no_init):
+def test_auth_refresh_no_token(monkeypatch, cli_no_init, sink):
     """auth_refresh with no token should display a warning via UI warning()."""
-    monkeypatch.setattr(main, "refresh_cached_token", lambda: None)
-    calls = []
-    monkeypatch.setattr(main, "warning", lambda msg: calls.append(msg))
+    monkeypatch.setattr(spotify_manager, "refresh_cached_token", lambda: None)
 
     cli_no_init.auth_refresh()
 
-    assert any("No token refreshed" in c for c in calls)
+    assert "No token refreshed" in _rendered(sink)
 
 
-def test_auth_refresh_with_expiry(monkeypatch, cli_no_init):
+def test_auth_refresh_with_expiry(monkeypatch, cli_no_init, sink):
     """auth_refresh with new expiry should display a message via UI info()."""
     ts = 1_700_000_000
-    monkeypatch.setattr(main, "refresh_cached_token", lambda: {"expires_at": ts})
-    calls = []
-    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+    monkeypatch.setattr(spotify_manager, "refresh_cached_token", lambda: {"expires_at": ts})
 
     cli_no_init.auth_refresh()
 
-    assert any("Token refreshed" in c for c in calls)
+    assert "Token refreshed" in _rendered(sink)
 
 
-def test_auth_refresh_without_expiry(monkeypatch, cli_no_init):
+def test_auth_refresh_without_expiry(monkeypatch, cli_no_init, sink):
     """auth_refresh with no expiry data should still display a message."""
-    monkeypatch.setattr(main, "refresh_cached_token", lambda: {"some_key": "val"})
-    calls = []
-    monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+    monkeypatch.setattr(spotify_manager, "refresh_cached_token", lambda: {"some_key": "val"})
 
     cli_no_init.auth_refresh()
 
-    assert any("Token refreshed" in c for c in calls)
+    assert "Token refreshed" in _rendered(sink)
 
 
 def test_auth_manager_warns_on_localhost_redirect_uri(monkeypatch, caplog):

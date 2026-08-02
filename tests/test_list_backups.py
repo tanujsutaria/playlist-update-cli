@@ -1,81 +1,68 @@
-from unittest.mock import MagicMock, patch
+"""Tests for the list-backups command.
+
+Hermetic via the ``config.project_root`` seam; output asserted through the
+``ui.set_output_sink`` capture (the choke point every ui helper funnels
+through), so the assertions survive the command body moving out of main.py.
+"""
+
+from io import StringIO
 
 import pytest
+from rich.console import Console
 
-import main
+import config
+import ui
+from main import PlaylistCLI
+
+
+@pytest.fixture
+def root(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "project_root", lambda: tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def cli(root):
+    cli = PlaylistCLI.__new__(PlaylistCLI)
+    cli._db = None
+    cli._spotify = None
+    cli._rotation_managers = {}
+    return cli
+
+
+@pytest.fixture
+def sink():
+    captured = []
+    ui.set_output_sink(captured.append)
+    yield captured
+    ui.set_output_sink(None)
+
+
+def _rendered(captured, width: int = 120) -> str:
+    buf = StringIO()
+    console = Console(file=buf, width=width)
+    for renderable in captured:
+        console.print(renderable)
+    return buf.getvalue()
 
 
 class TestListBackups:
     """Tests for the list_backups command"""
 
-    def test_no_backups_directory(self, tmp_path, monkeypatch):
-        """Test when backups directory doesn't exist"""
-        calls = []
-        monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
+    def test_no_backups_directory(self, cli, root, sink):
+        cli.list_backups()
+        assert "No backups directory" in _rendered(sink)
 
-        cli = main.PlaylistCLI.__new__(main.PlaylistCLI)
-        cli._db = None
-        cli._spotify = None
-        cli._rotation_managers = {}
+    def test_empty_backups_directory(self, cli, root, sink):
+        (root / "backups").mkdir()
+        cli.list_backups()
+        out = _rendered(sink)
+        assert "No backups found" in out or "No backup folders" in out
 
-        with patch.object(main.Path, "__new__", return_value=tmp_path / "src" / "main.py"):
-            # Point project_root to a temp dir without a backups subfolder
-            with patch("main.Path") as MockPath:
-                mock_file = MagicMock()
-                mock_file.parent.parent = tmp_path
-                MockPath.__file__ = mock_file
-                MockPath.return_value = mock_file
-                # Directly call with a patched project_root
-                project_root = tmp_path
-                backups_dir = project_root / "backups"
-                assert not backups_dir.exists()
-
-        # Call the real method after patching Path(__file__)
-        with patch("main.Path") as MockPath:
-            mock_path_instance = MagicMock()
-            mock_path_instance.parent.parent = tmp_path
-            MockPath.return_value = mock_path_instance
-
-            cli.list_backups()
-
-        assert any("No backups directory" in c for c in calls)
-
-    def test_empty_backups_directory(self, tmp_path, monkeypatch):
-        """Test when backups directory exists but is empty"""
-        calls = []
-        monkeypatch.setattr(main, "info", lambda msg: calls.append(msg))
-
-        backups_dir = tmp_path / "backups"
+    def test_list_backups_with_data(self, cli, root, sink):
+        backups_dir = root / "backups"
         backups_dir.mkdir()
 
-        cli = main.PlaylistCLI.__new__(main.PlaylistCLI)
-        cli._db = None
-        cli._spotify = None
-        cli._rotation_managers = {}
-
-        with patch("main.Path") as MockPath:
-            mock_path_instance = MagicMock()
-            mock_path_instance.parent.parent = tmp_path
-            MockPath.return_value = mock_path_instance
-
-            cli.list_backups()
-
-        assert any("No backups found" in c or "No backup folders" in c for c in calls)
-
-    def test_list_backups_with_data(self, tmp_path, monkeypatch):
-        """Test listing backups with actual backup folders"""
-        info_calls = []
-        table_calls = []
-        monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
-        monkeypatch.setattr(main, "section", lambda *a, **kw: None)
-        monkeypatch.setattr(
-            main, "table", lambda headers, rows: table_calls.append((headers, rows))
-        )
-
-        backups_dir = tmp_path / "backups"
-        backups_dir.mkdir()
-
-        # Create mock backup folders
         backup1 = backups_dir / "20240101_120000"
         backup1.mkdir()
         (backup1 / "test_file.txt").write_text("test content 1")
@@ -85,116 +72,54 @@ class TestListBackups:
         (backup2 / "test_file.txt").write_text("test content 2 with more data")
         (backup2 / "another_file.pkl").write_bytes(b"x" * 1000)
 
-        cli = main.PlaylistCLI.__new__(main.PlaylistCLI)
-        cli._db = None
-        cli._spotify = None
-        cli._rotation_managers = {}
+        cli.list_backups()
 
-        with patch("main.Path") as MockPath:
-            mock_path_instance = MagicMock()
-            mock_path_instance.parent.parent = tmp_path
-            MockPath.return_value = mock_path_instance
+        out = _rendered(sink)
+        assert "20240101_120000" in out
+        assert "my_backup" in out
+        assert "Total backups: 2" in out
 
-            cli.list_backups()
-
-        # Verify table was called with backup data
-        assert len(table_calls) == 1
-        headers, rows = table_calls[0]
-        assert "Backup Name" in headers
-        assert "Size" in headers
-        assert len(rows) == 2
-
-        # Verify info messages
-        assert any("Total backups: 2" in c for c in info_calls)
-
-    def test_list_backups_ignores_files(self, tmp_path, monkeypatch):
-        """Test that non-directory items in backups folder are ignored"""
-        info_calls = []
-        table_calls = []
-        monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
-        monkeypatch.setattr(main, "section", lambda *a, **kw: None)
-        monkeypatch.setattr(
-            main, "table", lambda headers, rows: table_calls.append((headers, rows))
-        )
-
-        backups_dir = tmp_path / "backups"
+    def test_list_backups_ignores_files(self, cli, root, sink):
+        backups_dir = root / "backups"
         backups_dir.mkdir()
 
-        # Create a backup folder
         backup1 = backups_dir / "real_backup"
         backup1.mkdir()
         (backup1 / "data.txt").write_text("backup data")
 
-        # Create a file (not a directory) in backups
+        # A file (not a directory) in backups must not be listed as a backup.
         (backups_dir / "not_a_backup.txt").write_text("this is just a file")
 
-        cli = main.PlaylistCLI.__new__(main.PlaylistCLI)
-        cli._db = None
-        cli._spotify = None
-        cli._rotation_managers = {}
+        cli.list_backups()
 
-        with patch("main.Path") as MockPath:
-            mock_path_instance = MagicMock()
-            mock_path_instance.parent.parent = tmp_path
-            MockPath.return_value = mock_path_instance
-
-            cli.list_backups()
-
-        # Only 1 directory backup should be listed
-        assert len(table_calls) == 1
-        _, rows = table_calls[0]
-        assert len(rows) == 1
-        assert rows[0][0] == "real_backup"
+        out = _rendered(sink)
+        assert "real_backup" in out
+        assert "not_a_backup.txt" not in out
+        assert "Total backups: 1" in out
 
 
 class TestListBackupsIntegration:
     """Integration tests for list_backups that test the actual method"""
 
-    def test_list_backups_output_format(self, tmp_path, monkeypatch):
-        """Test the actual output format of list_backups"""
-        info_calls = []
-        table_calls = []
-        section_calls = []
-        monkeypatch.setattr(main, "info", lambda msg: info_calls.append(msg))
-        monkeypatch.setattr(main, "section", lambda *a, **kw: section_calls.append(a))
-        monkeypatch.setattr(
-            main, "table", lambda headers, rows: table_calls.append((headers, rows))
-        )
-
-        # Create backups directory with test data
-        backups_dir = tmp_path / "backups"
+    def test_list_backups_output_format(self, cli, root, sink):
+        backups_dir = root / "backups"
         backups_dir.mkdir()
 
         backup = backups_dir / "test_backup"
         backup.mkdir()
         (backup / "songs.pkl").write_bytes(b"x" * 2048)  # 2KB file
 
-        cli = main.PlaylistCLI.__new__(main.PlaylistCLI)
-        cli._db = None
-        cli._spotify = None
-        cli._rotation_managers = {}
+        cli.list_backups()
 
-        with patch("main.Path") as MockPath:
-            mock_path_instance = MagicMock()
-            mock_path_instance.parent.parent = tmp_path
-            MockPath.return_value = mock_path_instance
-
-            cli.list_backups()
-
-        # Verify section header
-        assert any("Available Backups" in str(a) for a in section_calls)
-
-        # Verify table output
-        assert len(table_calls) == 1
-        headers, rows = table_calls[0]
-        assert headers == ["Backup Name", "Size", "Created"]
-        assert len(rows) == 1
-        assert rows[0][0] == "test_backup"
-        assert "MB" in rows[0][1]
-
-        # Verify info messages
-        assert any("Total backups: 1" in c for c in info_calls)
-        assert any("restore" in c.lower() for c in info_calls)
+        out = _rendered(sink)
+        assert "Available Backups" in out
+        assert "Backup Name" in out
+        assert "Size" in out
+        assert "Created" in out
+        assert "test_backup" in out
+        assert "MB" in out
+        assert "Total backups: 1" in out
+        assert "restore" in out.lower()
 
 
 if __name__ == "__main__":

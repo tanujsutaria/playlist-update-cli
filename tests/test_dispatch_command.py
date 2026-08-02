@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import doctor
 import main as main_module
 from main import PlaylistCLI, dispatch_command
 
@@ -557,7 +558,7 @@ class TestDispatchDoctor:
         storage property opens the TUNR_DB_PATH tmp database, no Spotify is
         touched, and a healthy DB exits 0. The backups dir is sandboxed so the
         check never reads the repo's real backups/ state dir."""
-        monkeypatch.setattr(main_module, "default_backups_dir", lambda: tmp_path / "backups")
+        monkeypatch.setattr(doctor, "default_backups_dir", lambda: tmp_path / "backups")
         args = _make_args(json=False)
         rc = dispatch_command(cli, "doctor", args)
         assert rc == 0
