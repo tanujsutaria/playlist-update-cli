@@ -48,6 +48,16 @@ def _rendered(captured, width: int = 400) -> str:
     return buf.getvalue()
 
 
+def _row(out: str, label: str, value: str) -> bool:
+    """True iff some rendered line pairs ``label`` with ``value``.
+
+    key_value_table renders one row per line at width 400, so pairing the two
+    on a single line pins the label→value association — a label/value swap
+    between rows must fail, which independent substring checks cannot catch.
+    """
+    return any(label in line and value in line for line in out.splitlines())
+
+
 def test_auth_status_no_token(monkeypatch, cli_no_init, sink):
     """auth_status with no cached token should display a message via UI info()."""
     monkeypatch.setattr(spotify_manager, "get_cached_token_info", lambda: None)
@@ -66,12 +76,9 @@ def test_auth_status_with_token(monkeypatch, cli_no_init, sink):
 
     out = _rendered(sink)
     expected_expires = datetime.fromtimestamp(ts).isoformat()
-    assert "Expires at" in out
-    assert expected_expires in out
-    assert "Expires in (seconds)" in out
-    assert "3600" in out
-    assert "Scopes" in out
-    assert "playlist-read-private" in out
+    assert _row(out, "Expires at", expected_expires)
+    assert _row(out, "Expires in (seconds)", "3600")
+    assert _row(out, "Scopes", "playlist-read-private")
 
 
 def _auth_status_output(monkeypatch, cli, sink, token_info):
@@ -81,13 +88,20 @@ def _auth_status_output(monkeypatch, cli, sink, token_info):
     return _rendered(sink)
 
 
+def _verdict_line(out: str) -> str:
+    """The single rendered Verdict row — exactly one must exist."""
+    lines = [line for line in out.splitlines() if "Verdict" in line]
+    assert len(lines) == 1, f"expected exactly one Verdict row, got {len(lines)}"
+    return lines[0]
+
+
 def test_auth_status_verdict_full_scopes(monkeypatch, cli_no_init, sink):
     """A token granting every required scope gets a clean verdict."""
     token_info = {"expires_in": 3600, "scope": " ".join(SPOTIFY_SCOPES)}
     out = _auth_status_output(monkeypatch, cli_no_init, sink, token_info)
-    assert "Verdict" in out
-    assert "missing scopes" not in out
-    assert "all required scopes" in out
+    verdict = _verdict_line(out)
+    assert "missing scopes" not in verdict
+    assert "all required scopes" in verdict
 
 
 def test_auth_status_verdict_missing_scopes(monkeypatch, cli_no_init, sink):
@@ -95,18 +109,20 @@ def test_auth_status_verdict_missing_scopes(monkeypatch, cli_no_init, sink):
     granted = [s for s in SPOTIFY_SCOPES if not s.startswith("user-")]
     token_info = {"expires_in": 3600, "scope": " ".join(granted)}
     out = _auth_status_output(monkeypatch, cli_no_init, sink, token_info)
-    assert "missing scopes: " in out
-    assert "user-read-recently-played" in out
-    assert "user-top-read" in out
-    assert "run /auth-reset" in out
+    verdict = _verdict_line(out)
+    assert "missing scopes: " in verdict
+    assert "user-read-recently-played" in verdict
+    assert "user-top-read" in verdict
+    assert "run /auth-reset" in verdict
 
 
 def test_auth_status_verdict_token_without_scope_field(monkeypatch, cli_no_init, sink):
     """A token whose scope field is absent counts as missing everything."""
     out = _auth_status_output(monkeypatch, cli_no_init, sink, {"expires_in": 3600})
-    assert "missing scopes" in out
+    verdict = _verdict_line(out)
+    assert "missing scopes" in verdict
     for scope in SPOTIFY_SCOPES:
-        assert scope in out
+        assert scope in verdict
 
 
 def test_auth_status_no_token_still_short_circuits(monkeypatch, cli_no_init, sink):
