@@ -145,7 +145,7 @@ def _assert_matches_snapshot(name: str, payload) -> None:
     assert payload is not None, f"{name} returned None — expected a payload dict"
     actual = sorted(_structure(payload))
     snapshot_path = SNAPSHOT_DIR / f"payload_{name}.json"
-    if os.getenv("UPDATE_SNAPSHOTS"):
+    if os.getenv("UPDATE_SNAPSHOTS", "0") not in ("", "0"):
         SNAPSHOT_DIR.mkdir(exist_ok=True)
         snapshot_path.write_text(json.dumps(actual, indent=2) + "\n", encoding="utf-8")
     expected = json.loads(snapshot_path.read_text(encoding="utf-8"))

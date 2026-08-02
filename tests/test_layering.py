@@ -18,9 +18,12 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent.parent / "src"
 
 # Modules whose job is rendering, or that legitimately drive rendering today.
+# commands/ is the command layer — handlers render by design, so the whole
+# package is exempt (the rule gates DOMAIN modules only).
 RENDER_LAYER = {
     "ui",
     "main",
+    "commands",
     "interactive_app",
     "dashboard",
     "results_screen",

@@ -11,31 +11,30 @@ from __future__ import annotations
 
 import fnmatch
 import importlib
-import re
 from pathlib import Path
+
+try:
+    import tomllib  # py311+
+except ModuleNotFoundError:  # py39/py310: tomli ships with pytest
+    import tomli as tomllib  # type: ignore[no-redef]
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 PYPROJECT = SRC.parent / "pyproject.toml"
 
+IGNORED_DIRS = {"__pycache__"}
 
-def _pyproject_text() -> str:
-    return PYPROJECT.read_text(encoding="utf-8")
+
+def _pyproject() -> dict:
+    with PYPROJECT.open("rb") as fh:
+        return tomllib.load(fh)
 
 
 def _declared_py_modules() -> set:
-    match = re.search(r"py-modules = \[(.*?)\]", _pyproject_text(), re.S)
-    assert match, "py-modules list not found in pyproject.toml"
-    return set(re.findall(r'"([A-Za-z_0-9]+)"', match.group(1)))
+    return set(_pyproject()["tool"]["setuptools"]["py-modules"])
 
 
 def _declared_package_patterns() -> list:
-    match = re.search(
-        r"\[tool\.setuptools\.packages\.find\].*?include = \[(.*?)\]",
-        _pyproject_text(),
-        re.S,
-    )
-    assert match, "packages.find include list not found in pyproject.toml"
-    return re.findall(r'"([A-Za-z_0-9*]+)"', match.group(1))
+    return list(_pyproject()["tool"]["setuptools"]["packages"]["find"]["include"])
 
 
 def test_every_top_level_module_is_declared():
@@ -50,11 +49,25 @@ def test_every_top_level_module_is_declared():
     assert not stale, f"py-modules declares modules that do not exist in src/: {stale}"
 
 
-def test_every_package_matches_an_include_pattern():
+def test_every_package_dir_is_packaged():
+    """Every directory under src/ must be a real, declared package.
+
+    Two failure modes are caught: a directory matching no packages.find
+    pattern, and a directory with no __init__.py at all — setuptools'
+    packages.find skips namespace dirs silently, so such a directory would
+    pass CI (pythonpath imports it fine) yet be absent from the wheel.
+    """
     patterns = _declared_package_patterns()
-    packages = sorted(p.name for p in SRC.iterdir() if p.is_dir() and (p / "__init__.py").exists())
-    assert packages, "expected at least storage/, nextgen/, commands/ under src/"
-    undeclared = [pkg for pkg in packages if not any(fnmatch.fnmatch(pkg, pat) for pat in patterns)]
+    dirs = sorted(p for p in SRC.iterdir() if p.is_dir() and p.name not in IGNORED_DIRS)
+    assert dirs, "expected at least storage/, nextgen/, commands/ under src/"
+
+    missing_init = [d.name for d in dirs if not (d / "__init__.py").exists()]
+    assert not missing_init, (
+        f"src/ directories without __init__.py: {missing_init} — packages.find "
+        "skips namespace dirs, so these would ship in no wheel. Add __init__.py."
+    )
+
+    undeclared = [d.name for d in dirs if not any(fnmatch.fnmatch(d.name, pat) for pat in patterns)]
     assert not undeclared, (
         f"src/ packages not covered by packages.find include {patterns}: {undeclared}"
     )
