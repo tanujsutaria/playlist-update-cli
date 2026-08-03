@@ -63,6 +63,7 @@ py-modules = [
     "openai_web_score_wrapper",
     "completions",
     "llm_json",
+    "playlist_resolver",
     "results_screen",
     "scopes",
 ]
