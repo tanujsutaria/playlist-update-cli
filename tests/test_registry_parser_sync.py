@@ -30,3 +30,16 @@ def test_every_parser_command_has_a_handler():
 def test_every_handler_has_a_parser_command():
     missing = sorted(set(main._COMMAND_HANDLERS) - _parser_subcommands())
     assert not missing, f"_COMMAND_HANDLERS entries with no parser subcommand: {missing}"
+
+
+def test_registry_is_the_same_object_in_main_and_dispatch():
+    """main re-exports the registry as an ALIAS, never a copy.
+
+    tests (and the bdd suite) mutate the registry via
+    monkeypatch.setitem(main._COMMAND_HANDLERS, ...) while dispatch_command
+    reads commands.dispatch._COMMAND_HANDLERS — a copy would make those
+    patches silent no-ops."""
+    import commands.dispatch
+
+    assert main._COMMAND_HANDLERS is commands.dispatch._COMMAND_HANDLERS
+    assert main.dispatch_command is commands.dispatch.dispatch_command

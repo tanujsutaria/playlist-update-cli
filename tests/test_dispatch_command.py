@@ -638,7 +638,8 @@ class TestDispatchExceptionHandling:
             raise KeyError("kaboom")
 
         monkeypatch.setitem(main_module._COMMAND_HANDLERS, "boom-test", _boom)
-        with caplog.at_level(logging.ERROR, logger="main"):
+        # dispatch_command lives in commands.dispatch now; its logger moved with it.
+        with caplog.at_level(logging.ERROR, logger="commands.dispatch"):
             rc = dispatch_command(cli, "boom-test", _make_args())
 
         assert rc == 1  # the rc contract is unchanged
