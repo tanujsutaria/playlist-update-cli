@@ -19,11 +19,14 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 # Modules whose job is rendering, or that legitimately drive rendering today.
 # commands/ is the command layer — handlers render by design, so the whole
-# package is exempt (the rule gates DOMAIN modules only).
+# package is exempt (the rule gates DOMAIN modules only). playlist_resolver
+# is the shared miss/warn renderer for every playlist-taking command — its
+# whole job is the actionable error panel, so it sits in the command layer.
 RENDER_LAYER = {
     "ui",
     "main",
     "commands",
+    "playlist_resolver",
     "interactive_app",
     "dashboard",
     "results_screen",

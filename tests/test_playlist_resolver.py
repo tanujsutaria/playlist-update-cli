@@ -16,8 +16,8 @@ import pytest
 from rich.console import Console
 
 import ui
-from main import (
-    PlaylistCLI,
+from main import PlaylistCLI
+from playlist_resolver import (
     collect_playlist_names,
     playlist_not_found_message,
     report_playlist_miss,
