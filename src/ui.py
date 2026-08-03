@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from rich import box
 from rich.align import Align
@@ -206,6 +207,54 @@ def emit_json(payload: object) -> None:
     wrapped, styled, or routed to a TUI sink — it stays valid JSON for `| jq`.
     """
     print(json.dumps(payload, indent=2, default=str))
+
+
+@contextmanager
+def json_payload(enabled: bool) -> Iterator[Dict[str, Any]]:
+    """The command handlers' ``--json`` contract as one reusable block.
+
+    Enables json mode for the with-body, then in ALL exits — return, fall-through,
+    or exception — emits the payload (when enabled) and resets json mode. This is
+    the exact try/finally shape the handlers copy-pasted: the payload captured so
+    far still emits on a crash (``None`` renders as JSON ``null``) and the mode
+    can never leak into the next command. Mutate the yielded holder::
+
+        with json_payload(json_mode) as out:
+            out["payload"] = cli.show_stats(playlist)
+
+    Handlers whose emission depends on late state (/search) or that flip the
+    mode mid-body (/find) keep their explicit form; those sites migrate with
+    their verticals.
+    """
+    holder: Dict[str, Any] = {"payload": None}
+    set_json_mode(enabled)
+    try:
+        yield holder
+    finally:
+        if enabled:
+            emit_json(holder["payload"])
+        set_json_mode(False)
+
+
+def spotify_track_url(raw: Optional[str]) -> str:
+    """Offline: a stored ``tracks.spotify_id`` value -> an open.spotify.com URL.
+
+    Accepts the three shapes the column actually holds — a full http(s) URL,
+    a ``spotify:track:...`` URI, or a bare track id — and returns "" for
+    anything else (album/playlist URIs, empty values), so callers can feed
+    the result straight to ``link_text`` unguarded. Pure; never the network.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("http"):
+        return raw
+    if raw.startswith("spotify:track:"):
+        tail = raw.split(":")[-1]
+        return f"https://open.spotify.com/track/{tail}" if tail else ""
+    if ":" not in raw and "/" not in raw:
+        return f"https://open.spotify.com/track/{raw}"
+    return ""
 
 
 def set_output_sink(sink: Optional[Callable[[RenderableType], None]]) -> None:
